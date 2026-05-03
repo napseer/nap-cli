@@ -1,0 +1,53 @@
+"""Isolated terminal primitives for the gateway remote terminal path."""
+
+from .protocol import (
+    TERMINAL_CLOSE,
+    TERMINAL_DATA,
+    TERMINAL_DETACH,
+    TERMINAL_ERROR,
+    TERMINAL_OPEN,
+    TERMINAL_OPENED,
+    TERMINAL_OUTPUT,
+    TERMINAL_REPLAY_GAP,
+    TERMINAL_RESIZE,
+)
+from .pty_manager import (
+    AttachResult,
+    OutputChunk,
+    PtySessionManager,
+    TerminalInfo,
+    TerminalSession,
+    close,
+    default_manager,
+    list,
+    open,
+    resize,
+    subscribe,
+    write,
+    attach,
+)
+
+__all__ = [
+    "TERMINAL_CLOSE",
+    "TERMINAL_DATA",
+    "TERMINAL_DETACH",
+    "TERMINAL_ERROR",
+    "TERMINAL_OPEN",
+    "TERMINAL_OPENED",
+    "TERMINAL_OUTPUT",
+    "TERMINAL_REPLAY_GAP",
+    "TERMINAL_RESIZE",
+    "AttachResult",
+    "OutputChunk",
+    "PtySessionManager",
+    "TerminalInfo",
+    "TerminalSession",
+    "attach",
+    "close",
+    "default_manager",
+    "list",
+    "open",
+    "resize",
+    "subscribe",
+    "write",
+]

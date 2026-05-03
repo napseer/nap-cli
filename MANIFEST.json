@@ -1,0 +1,12 @@
+{
+  "name": "nap-cli",
+  "source": "backend-split-import",
+  "contract_version": "2026-05-03",
+  "owned_surface": [
+    "nap installer",
+    "project commands",
+    "local MCP wrapper",
+    "gateway command facade"
+  ],
+  "migration_status": "initial source import from backend resources/scripts"
+}
