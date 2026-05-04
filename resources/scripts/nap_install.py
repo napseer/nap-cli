@@ -15,6 +15,7 @@ Usage:
 """
 
 import json
+import hashlib
 import os
 import pathlib
 import shutil
@@ -54,6 +55,10 @@ CLI_DISTRIBUTION_CONTRACT_VERSION = "2026-05-03"
 CLI_GENERATED_SOURCE_REPO = os.environ.get("NAPSEER_CLI_SOURCE_REPO", "https://github.com/napseer/nap-cli")
 CLI_GENERATED_SOURCE_REVISION = os.environ.get("NAPSEER_CLI_SOURCE_REVISION", "unresolved")
 CLI_GENERATED_SOURCE_REVISION_STATUS = os.environ.get("NAPSEER_CLI_SOURCE_REVISION_STATUS", "unresolved")
+GITHUB_SOURCE_REPOS = {
+    "https://github.com/napseer/nap-cli",
+    "https://github.com/napseer/gateway",
+}
 
 
 def chmod_best_effort(path, mode):
@@ -101,23 +106,74 @@ def api_urlopen(request, timeout):
     return opener.open(request, timeout=timeout)
 
 
-def fetch_script(name):
-    request = urllib.request.Request(
-        f"{BASE_URL}/v1/scripts/{name}",
-        headers={"User-Agent": "nap-install-python/0.1"},
-        method="GET",
-    )
+def read_url_bytes(url, user_agent, label):
+    request = urllib.request.Request(url, headers={"User-Agent": user_agent}, method="GET")
     try:
         with api_urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+            return response.read()
     except (TimeoutError, socket.timeout) as exc:
-        raise RuntimeError(f"GET /v1/scripts/{name} timed out after {HTTP_TIMEOUT_SECONDS}s") from exc
+        raise RuntimeError(f"{label} timed out after {HTTP_TIMEOUT_SECONDS}s") from exc
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8")
-        raise RuntimeError(f"GET /v1/scripts/{name} failed: HTTP {exc.code}: {body}") from exc
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{label} failed: HTTP {exc.code}: {body}") from exc
+
+
+def github_raw_script_url(source_repo, source_revision, filename):
+    if not isinstance(source_repo, str) or source_repo.rstrip("/") not in GITHUB_SOURCE_REPOS:
+        return None
+    if source_revision_status_for(source_revision) != "resolved":
+        return None
+    parsed = urllib.parse.urlparse(source_repo.rstrip("/"))
+    parts = parsed.path.strip("/").split("/")
+    if parsed.scheme != "https" or parsed.netloc != "github.com" or len(parts) != 2:
+        return None
+    owner, repo = (urllib.parse.quote(part, safe="") for part in parts)
+    revision = urllib.parse.quote(str(source_revision).strip(), safe="")
+    script_path = "/".join(urllib.parse.quote(part, safe="") for part in str(filename).split("/"))
+    return f"https://raw.githubusercontent.com/{owner}/{repo}/{revision}/resources/scripts/{script_path}"
+
+
+def content_from_declared_source(name, payload, backend_content):
+    source_repo = payload.get("source_repo")
+    source_revision = payload.get("source_revision")
+    source_revision_status = payload.get("source_revision_status") or source_revision_status_for(source_revision)
+    normalized_repo = source_repo.rstrip("/") if isinstance(source_repo, str) else ""
+    if normalized_repo not in GITHUB_SOURCE_REPOS:
+        return backend_content
+    if source_revision_status != "resolved":
+        raise RuntimeError(f"{name} declares GitHub source but does not have a resolved source revision")
+    raw_url = github_raw_script_url(normalized_repo, source_revision, payload.get("filename") or name)
+    if not raw_url:
+        raise RuntimeError(f"{name} declares an unsupported GitHub source location")
+    source_bytes = read_url_bytes(raw_url, "nap-install-python/0.1", f"GET {raw_url}")
+    try:
+        source_content = source_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"{name} GitHub source is not valid UTF-8") from exc
+    expected_sha256 = payload.get("sha256")
+    if isinstance(expected_sha256, str) and expected_sha256.strip():
+        actual_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        if actual_sha256 != expected_sha256.lower():
+            raise RuntimeError(
+                f"{name} GitHub source sha256 mismatch: expected {expected_sha256.lower()}, got {actual_sha256}"
+            )
+    return source_content
+
+
+def fetch_script(name):
+    try:
+        body = read_url_bytes(
+            f"{BASE_URL}/v1/scripts/{name}",
+            "nap-install-python/0.1",
+            f"GET /v1/scripts/{name}",
+        )
+        payload = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{name} response was not valid JSON") from exc
     content = payload.get("content")
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError(f"{name} response did not include script content")
+    content = content_from_declared_source(name, payload, content)
     return payload, content
 
 
