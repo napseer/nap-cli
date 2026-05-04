@@ -222,10 +222,6 @@ SCRIPT_NAME = SCRIPT_PATH.name
 SCRIPT_DEPENDENCY_NAMES = ("napseer_spake2.py",)
 CONTRACT_VERSION = "napseer.mcp.contract.v1"
 TELEMETRY_DISABLED_VALUES = {"0", "false", "no", "off", "disabled"}
-GITHUB_SOURCE_REPOS = {
-    "https://github.com/napseer/nap-cli",
-    "https://github.com/napseer/gateway",
-}
 TELEMETRY_ALLOWED_FIELDS = {
     "anonymous_install_id",
     "event",
@@ -4840,69 +4836,6 @@ def public_json(path):
         raise RuntimeError(f"GET {path} timed out after {HTTP_TIMEOUT_SECONDS}s") from exc
 
 
-def public_url_bytes(url, label):
-    request = urllib.request.Request(url, headers={"User-Agent": "napseer-mcp-python/0.1"}, method="GET")
-    try:
-        with api_urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
-            return response.read()
-    except (TimeoutError, socket.timeout) as exc:
-        raise RuntimeError(f"{label} timed out after {HTTP_TIMEOUT_SECONDS}s") from exc
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"{label} failed: HTTP {exc.code}: {body}") from exc
-
-
-def source_revision_status_for(value):
-    if not isinstance(value, str):
-        return "unresolved"
-    revision = value.strip()
-    if not revision or revision in ("unresolved", "unknown", "null"):
-        return "unresolved"
-    return "resolved"
-
-
-def github_raw_script_url(source_repo, source_revision, filename):
-    if not isinstance(source_repo, str) or source_repo.rstrip("/") not in GITHUB_SOURCE_REPOS:
-        return None
-    if source_revision_status_for(source_revision) != "resolved":
-        return None
-    parsed = urllib.parse.urlparse(source_repo.rstrip("/"))
-    parts = parsed.path.strip("/").split("/")
-    if parsed.scheme != "https" or parsed.netloc != "github.com" or len(parts) != 2:
-        return None
-    owner, repo = (urllib.parse.quote(part, safe="") for part in parts)
-    revision = urllib.parse.quote(str(source_revision).strip(), safe="")
-    script_path = "/".join(urllib.parse.quote(part, safe="") for part in str(filename).split("/"))
-    return f"https://raw.githubusercontent.com/{owner}/{repo}/{revision}/resources/scripts/{script_path}"
-
-
-def apply_declared_source_content(script_name, remote):
-    source_repo = remote.get("source_repo")
-    source_revision = remote.get("source_revision")
-    source_revision_status = remote.get("source_revision_status") or source_revision_status_for(source_revision)
-    normalized_repo = source_repo.rstrip("/") if isinstance(source_repo, str) else ""
-    if normalized_repo not in GITHUB_SOURCE_REPOS:
-        return remote
-    if source_revision_status != "resolved":
-        raise RuntimeError(f"{script_name} declares GitHub source but does not have a resolved source revision")
-    raw_url = github_raw_script_url(normalized_repo, source_revision, remote.get("filename") or script_name)
-    if not raw_url:
-        raise RuntimeError(f"{script_name} declares an unsupported GitHub source location")
-    source_bytes = public_url_bytes(raw_url, f"GET {raw_url}")
-    try:
-        source_content = source_bytes.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise RuntimeError(f"{script_name} GitHub source is not valid UTF-8") from exc
-    declared_sha256 = remote.get("sha256")
-    if is_sha256_hex(declared_sha256):
-        actual_sha256 = sha256_bytes(source_bytes)
-        if actual_sha256 != declared_sha256.lower():
-            raise RuntimeError(
-                f"{script_name} GitHub source sha256 mismatch: expected {declared_sha256.lower()}, got {actual_sha256}"
-            )
-    return {**remote, "content": source_content, "content_source_url": raw_url}
-
-
 def fetch_remote_script(script_name=SCRIPT_NAME):
     if SCRIPT_NAME != "napseer_mcp_server.py":
         raise RuntimeError(f"unsupported wrapper filename for self-update: {SCRIPT_NAME}")
@@ -4910,7 +4843,7 @@ def fetch_remote_script(script_name=SCRIPT_NAME):
     content = remote.get("content")
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError("remote script response did not include content")
-    return apply_declared_source_content(script_name, remote)
+    return remote
 
 
 def sha256_bytes(content):
@@ -4970,7 +4903,7 @@ def update_status(remote=None):
     return {
         "script_path": str(SCRIPT_PATH),
         "script_name": SCRIPT_NAME,
-        "remote_url": remote.get("content_source_url") or f"{BASE_URL}/v1/scripts/{SCRIPT_NAME}",
+        "remote_url": f"{BASE_URL}/v1/scripts/{SCRIPT_NAME}",
         "remote_version": remote.get("version"),
         "remote_build_commit": remote.get("build_commit"),
         "remote_published_at": remote.get("published_at"),
