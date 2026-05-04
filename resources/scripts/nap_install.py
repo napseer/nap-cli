@@ -248,6 +248,13 @@ def install_assets(update_project=False):
                     write_file(candidate, content, executable=script_name.endswith(".py"))
                     updated_project_paths.append(str(candidate))
 
+    installer_payload = fetched["nap_install.py"][0]
+    cli_source_revision = installer_payload.get("source_revision") or CLI_GENERATED_SOURCE_REVISION
+    cli_source_revision_status = (
+        installer_payload.get("source_revision_status")
+        or CLI_GENERATED_SOURCE_REVISION_STATUS
+        or source_revision_status_for(cli_source_revision)
+    )
     result = {
         "status": "installed",
         "message": "Napseer CLI and runtime scripts are installed.",
@@ -256,13 +263,11 @@ def install_assets(update_project=False):
         "scripts": scripts,
         "cli_distribution": {
             "contract_version": CLI_DISTRIBUTION_CONTRACT_VERSION,
-            "source_repo": CLI_GENERATED_SOURCE_REPO,
+            "source_repo": installer_payload.get("source_repo") or CLI_GENERATED_SOURCE_REPO,
             "source_revision": None
-            if source_revision_status_for(CLI_GENERATED_SOURCE_REVISION) == "unresolved"
-            else CLI_GENERATED_SOURCE_REVISION,
-            "source_revision_status": source_revision_status_for(CLI_GENERATED_SOURCE_REVISION)
-            if CLI_GENERATED_SOURCE_REVISION_STATUS == "unresolved"
-            else CLI_GENERATED_SOURCE_REVISION_STATUS,
+            if source_revision_status_for(cli_source_revision) == "unresolved"
+            else cli_source_revision,
+            "source_revision_status": cli_source_revision_status,
         },
         "updated_project_paths": updated_project_paths,
         "path_warning": path_warning(),
