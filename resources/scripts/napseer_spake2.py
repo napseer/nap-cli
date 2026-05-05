@@ -194,18 +194,20 @@ def spake2_gateway_finish(secret, spake2_context, browser_message):
 
 def relay_key_from_secret(secret, spake2_context, direction):
     context = canonical_json(spake2_context)
+    relay_lane = str(spake2_context.get("relay_lane") or spake2_context.get("relay_socket") or "terminal")
     salt = hashlib.sha256(context.encode("utf-8")).digest()
-    return hkdf_sha256(secret, salt, f"napseer-relay-aes-gcm:{direction}")
+    return hkdf_sha256(secret, salt, f"napseer-relay-aes-gcm:{relay_lane}:{direction}")
 
 
 def relay_context_hash(spake2_context):
     return base64.b64encode(hashlib.sha256(canonical_json(spake2_context).encode("utf-8")).digest()).decode("ascii")
 
 
-def relay_aad(session_id, context_hash, direction, seq):
+def relay_aad(session_id, context_hash, relay_lane, direction, seq):
     return canonical_json({
         "context_hash": context_hash,
         "direction": direction,
+        "relay_lane": relay_lane,
         "seq": seq,
         "session_id": session_id,
     }).encode("utf-8")
