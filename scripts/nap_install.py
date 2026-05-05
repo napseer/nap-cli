@@ -607,6 +607,23 @@ def service_logs(kind, args):
 def handle_gateway(args):
     subcommand = args[0] if args else "ls"
     rest = args[1:] if args else []
+    if subcommand in {"help", "-h", "--help"}:
+        print("Usage: nap gateway [start|stop|status|logs|configure|setup|unlock|lock|restart|kill|vault|terminal|schedule|service]")
+        print("  nap gateway start [--port PORT]       Start the local gateway service.")
+        print("  nap gateway status                    Show the managed gateway process.")
+        print("  nap gateway configure [--command CMD] Configure the local gateway command.")
+        print("  nap gateway setup                     Create or unlock the encrypted gateway vault.")
+        print("  nap gateway vault                     Show gateway vault status and pending setup requests.")
+        print("  nap gateway vault process             Complete pending setup requests.")
+        print("  nap gateway vault rotate-secret --kind chat|tabs|gateway")
+        return 0
+    if subcommand in {"vault", "vault-setup", "vault_setup", "project-vault"} and rest and rest[0] in {"help", "-h", "--help"}:
+        print("Usage: nap gateway vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway] [--all] [--project-id ID]")
+        print("  status        Show configured/locked state and pending setup requests.")
+        print("  process       Generate local secret material and send encrypted envelopes only.")
+        print("  rotate-secret Rotate one encrypted project secret.")
+        print("  vault-setup   Deprecated alias for vault.")
+        return 0
     if subcommand == "start":
         return print_json(start_service("gateway", ["--no-browser", *rest])) or 0
     if subcommand == "stop":
@@ -617,9 +634,9 @@ def handle_gateway(args):
         return print_json(service_logs("gateway", rest)) or 0
     if subcommand in {"configure", "config"}:
         return run_wrapper("gateway", ["configure", *rest])
-    if subcommand in {"setup", "unlock", "lock", "restart", "kill"}:
+    if subcommand in {"setup", "unlock", "lock", "restart", "kill", "vault", "vault-setup", "vault_setup", "project-vault", "terminal", "schedule", "service"}:
         return run_wrapper("gateway", [subcommand, *rest])
-    raise RuntimeError("unknown gateway command; use nap gateway start|stop|configure|setup|unlock|lock|restart|kill|logs|status")
+    raise RuntimeError("unknown gateway command; use nap gateway start|stop|configure|setup|unlock|lock|restart|kill|logs|status|vault|terminal|schedule|service")
 
 
 def print_json(value):
@@ -680,11 +697,13 @@ def main(argv):
         print("Usage: nap [auth|project|gateway|agent|feedback|status|update|where|install]")
         print("  auth        Auth commands: login-local, status.")
         print("              Example: nap auth login-local")
-        print("  project     Project commands: create, status, encryption, plaintext, encrypted.")
-        print("              Examples: nap project create, nap project status, nap project encryption set plaintext")
-        print("  gateway     Gateway commands: start, stop, configure, setup, unlock, lock, restart, kill, logs, status.")
+        print("  project     Project commands: create, status, encryption, encrypted, plaintext.")
+        print("              Examples: nap project create --encrypted, nap project encrypted, nap project plaintext")
+        print("              Project encryption uses a project passphrase; use --passphrase or NAPSEER_PROJECT_PASSPHRASE for automation.")
+        print("              Equivalent explicit form: nap project encryption set encrypted|plaintext")
+        print("  gateway     Gateway commands: start, stop, configure, setup, unlock, lock, restart, kill, logs, status, vault.")
         print("              Start auto-selects a local port; use --port to pin one.")
-        print("              Examples: nap gateway start, nap gateway start --port 8767, nap gateway logs")
+        print("              Examples: nap gateway start, nap gateway vault, nap gateway vault rotate-secret --kind chat")
         print("  agent       Agent commands: list, workspaces, create, show, edit.")
         print("              list shows registered project agents; workspaces shows /agents folders.")
         print("  feedback    Feedback commands: list, global, status, resolve.")

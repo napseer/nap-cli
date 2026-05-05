@@ -477,6 +477,7 @@ GATEWAY_SCHEDULES_SCHEMA = "napseer.gateway-schedules.v1"
 CONTAINER_IDENTITY_SCHEMA = "napseer.container-identity.v1"
 GATEWAY_RELAY_SECRET_ITERATIONS = int(os.environ.get("NAPSEER_GATEWAY_RELAY_SECRET_ITERATIONS", "210000"))
 VAULT_KDF_ITERATIONS = int(os.environ.get("NAPSEER_VAULT_KDF_ITERATIONS", "600000"))
+PROJECT_KEY_KDF_ITERATIONS = int(os.environ.get("NAPSEER_PROJECT_KEY_KDF_ITERATIONS", "600000"))
 GATEWAY_IDLE_TIMEOUT_SECONDS = int(os.environ.get("NAPSEER_GATEWAY_IDLE_TIMEOUT_SECONDS", "900"))
 GATEWAY_MAX_LOG_BYTES = int(os.environ.get("NAPSEER_GATEWAY_MAX_LOG_BYTES", str(5 * 1024 * 1024)))
 GATEWAY_PROJECT_SECRET_KINDS = ("chat", "tabs", "gateway")
@@ -679,6 +680,23 @@ def read_master_passphrase(create=False):
         second = getpass.getpass("Confirm master passphrase: ")
         if first != second:
             raise RuntimeError("master passphrases did not match")
+    return first
+
+
+def read_project_passphrase(create=False):
+    value = os.environ.get("NAPSEER_PROJECT_PASSPHRASE") or os.environ.get("NAPSEER_MASTER_PASSPHRASE")
+    if value:
+        return value
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "Project encryption needs a local wrapping passphrase. "
+            "Pass --passphrase TEXT or set NAPSEER_PROJECT_PASSPHRASE."
+        )
+    first = getpass.getpass("Create project encryption passphrase: " if create else "Project encryption passphrase: ")
+    if create:
+        second = getpass.getpass("Confirm project encryption passphrase: ")
+        if first != second:
+            raise RuntimeError("project encryption passphrases did not match")
     return first
 
 
@@ -3042,6 +3060,46 @@ def gateway_vault_master_wrap_aad(project_id, credential_id):
     return f"napseer.vault-master-wrap.v1:{project_id}:{credential_id}".encode("utf-8")
 
 
+def project_key_wrap_aad(project_id, credential_id):
+    return f"napseer.project-key-wrap.v1:{project_id}:{credential_id}".encode("utf-8")
+
+
+def local_wrapped_project_key(project_id, passphrase=None, project_key=None):
+    project_id = str(project_id or current_project_id()).strip()
+    if not project_id:
+        raise RuntimeError("project_id is required")
+    passphrase = passphrase or read_project_passphrase(create=True)
+    if not isinstance(passphrase, str) or not passphrase:
+        raise RuntimeError("project encryption passphrase is required")
+    project_key = project_key or secrets.token_bytes(32)
+    credential_id = f"local-passphrase:{AUTH.get('agent_id') or 'local'}"
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(12)
+    wrapping_key = hashlib.pbkdf2_hmac(
+        "sha256",
+        passphrase.encode("utf-8"),
+        salt,
+        PROJECT_KEY_KDF_ITERATIONS,
+        dklen=32,
+    )
+    aad = project_key_wrap_aad(project_id, credential_id)
+    packed = aes_gcm_encrypt(wrapping_key, nonce, aad, project_key)
+    return {
+        "credential_id": credential_id,
+        "wrapped_project_key_b64": base64.b64encode(packed).decode("ascii"),
+        "wrap_alg": "AES-GCM-256",
+        "kdf_alg": "PBKDF2-SHA256",
+        "salt_b64": base64.b64encode(salt).decode("ascii"),
+        "kdf_params": {
+            "source": "local_passphrase",
+            "iterations": PROJECT_KEY_KDF_ITERATIONS,
+            "aad_hash": hashlib.sha256(aad).hexdigest(),
+            "nonce_b64": base64.b64encode(nonce).decode("ascii"),
+            "runtime": "nap-cli",
+        },
+    }
+
+
 def gateway_project_secret_envelope(project_id, secret_kind, version, vault_master_secret, secret_material):
     nonce = secrets.token_bytes(12)
     aad = gateway_project_secret_aad(project_id, secret_kind, version)
@@ -3138,6 +3196,27 @@ def gateway_vault_setup_requests(args=None):
     return request_json("GET", f"/v1/projects/{project_id}/vault/setup-requests")
 
 
+def gateway_vault_status(args=None):
+    args = args or {}
+    project_id = args.get("project_id") or current_project_id()
+    requests = gateway_vault_setup_requests({"project_id": project_id})
+    items = requests.get("items", [])
+    pending = [item for item in items if item.get("status") == "pending"]
+    return {
+        "status": "ok",
+        "project_id": project_id,
+        "locked": not gateway_is_unlocked(),
+        "vault_configured": vault_exists(),
+        "pending_setup_requests": len(pending),
+        "items": items,
+        "message": (
+            "No pending gateway vault setup requests."
+            if not pending
+            else f"{len(pending)} pending gateway vault setup request(s). Run `nap gateway vault process` to complete them."
+        ),
+    }
+
+
 def gateway_complete_vault_setup_request(setup_request, project_id=None):
     require_unlocked("completing project vault setup")
     project_id = str(project_id or setup_request.get("project_id") or current_project_id())
@@ -3164,12 +3243,22 @@ def gateway_complete_vault_setup_request(setup_request, project_id=None):
 
 def gateway_process_vault_setup_requests(args=None):
     args = args or {}
-    require_unlocked("processing project vault setup requests")
     project_id = args.get("project_id") or current_project_id()
     items = gateway_vault_setup_requests({"project_id": project_id}).get("items", [])
+    pending = [item for item in items if item.get("status") == "pending"]
+    if not pending:
+        return {
+            "status": "noop",
+            "project_id": project_id,
+            "completed_count": 0,
+            "completed": [],
+            "skipped": [{"id": item.get("id"), "status": item.get("status")} for item in items if item.get("status") != "pending"],
+            "message": "No pending gateway vault setup requests.",
+        }
+    require_unlocked("processing project vault setup requests")
     completed = []
     skipped = []
-    for item in items:
+    for item in pending:
         if item.get("status") != "pending":
             skipped.append({"id": item.get("id"), "status": item.get("status")})
             continue
@@ -5863,10 +5952,11 @@ def bootstrap_project(args):
     project, project_status, message = create_project_with_state(args)
     encryption_state = "plaintext"
     if encryption == "encrypted":
+        wrapped_project_key = local_wrapped_project_key(project["id"], passphrase=args.get("passphrase"))
         status = request_project_write(
             "POST",
             f"/v1/projects/{project['id']}/encryption/enable",
-            {"state": "encrypted"},
+            {"state": "encrypted", "wrapped_project_key": wrapped_project_key},
             project["id"],
             "enable project encryption",
         )
@@ -5915,6 +6005,8 @@ def project_encryption_transition(args=None):
     project_id = resolve_project_id(args)
     operation = "enable" if desired == "encrypted" else "disable"
     payload = {"state": desired}
+    if desired == "encrypted":
+        payload["wrapped_project_key"] = local_wrapped_project_key(project_id, passphrase=args.get("passphrase"))
     result = request_project_write(
         "POST",
         f"/v1/projects/{project_id}/encryption/{operation}",
@@ -9666,17 +9758,26 @@ def cli_main(argv):
             if action == "set":
                 if len(argv) <= 4:
                     raise RuntimeError("nap project encryption set requires plaintext or encrypted")
-                print(json.dumps(project_encryption_transition({"state": argv[4]}), indent=2))
+                print(json.dumps(project_encryption_transition({
+                    "state": argv[4],
+                    "passphrase": cli_option(argv[5:], "--passphrase", default=None),
+                }), indent=2))
                 return
-            print(json.dumps(project_encryption_transition({"state": action}), indent=2))
+            print(json.dumps(project_encryption_transition({
+                "state": action,
+                "passphrase": cli_option(argv[4:], "--passphrase", default=None),
+            }), indent=2))
             return
         if subcommand in {"plaintext", "plain", "unencrypt", "decrypt", "disable-encryption"}:
             print(json.dumps(project_encryption_transition({"state": "plaintext"}), indent=2))
             return
         if subcommand in {"encrypted", "encrypt", "enable-encryption"}:
-            print(json.dumps(project_encryption_transition({"state": "encrypted"}), indent=2))
+            print(json.dumps(project_encryption_transition({
+                "state": "encrypted",
+                "passphrase": cli_option(argv[3:], "--passphrase", default=None),
+            }), indent=2))
             return
-        print("Usage: napseer_mcp_server.py project [create [slug] [--name NAME] [--description TEXT] [--encrypted|--encryption plaintext|encrypted] [--passphrase TEXT]|claim [--no-browser] [--timeout SECONDS] [--return-url URL]|status|encryption [status|set plaintext|set encrypted|plaintext|encrypted]|plaintext|encrypted]")
+        print("Usage: napseer_mcp_server.py project [create [slug] [--name NAME] [--description TEXT] [--encrypted|--encryption plaintext|encrypted] [--passphrase TEXT]|claim [--no-browser] [--timeout SECONDS] [--return-url URL]|status|encryption [status|set plaintext|set encrypted|plaintext|encrypted] [--passphrase TEXT]|plaintext|encrypted [--passphrase TEXT]]")
         return
     if command == "gateway":
         subcommand = argv[2] if len(argv) > 2 else "status"
@@ -9809,16 +9910,19 @@ def cli_main(argv):
                 gateway_service_run(payload)
                 return
             raise RuntimeError("unknown gateway service action; use preregister|activate|run")
-        if subcommand in {"vault-setup", "vault_setup", "project-vault"}:
-            action = args[0] if args else "process"
+        if subcommand in {"vault", "vault-setup", "vault_setup", "project-vault"}:
+            action = args[0] if args else "status"
             vault_args = args[1:] if args else []
+            if action in {"help", "-h", "--help"}:
+                print("Usage: napseer_mcp_server.py gateway vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway] [--all] [--project-id ID]")
+                return
             payload = {
                 "project_id": cli_option(vault_args, "--project-id", default=None),
                 "secret_kind": cli_option(vault_args, "--secret-kind", "--kind", default=None),
                 "complete_all": cli_flag(vault_args, "--all", "--complete-all"),
             }
             if action in {"list", "ls", "status"}:
-                print(json.dumps(gateway_vault_setup_requests(payload), indent=2))
+                print(json.dumps(gateway_vault_status(payload), indent=2))
                 return
             if action in {"process", "complete", "run"}:
                 print(json.dumps(gateway_process_vault_setup_requests(payload), indent=2))
@@ -9828,7 +9932,7 @@ def cli_main(argv):
                     payload["secret_kind"] = vault_args[0] if vault_args and not vault_args[0].startswith("-") else "chat"
                 print(json.dumps(gateway_rotate_project_vault_secret(payload), indent=2))
                 return
-            raise RuntimeError("unknown gateway vault-setup action; use list|process")
+            raise RuntimeError("unknown gateway vault action; use status|list|process|rotate-secret")
         if subcommand == "setup":
             print(json.dumps(gateway_setup({
                 "passphrase": cli_option(args, "--passphrase", default=None),
@@ -9846,7 +9950,7 @@ def cli_main(argv):
         if subcommand == "lock":
             print(json.dumps(gateway_lock(), indent=2))
             return
-        print("Usage: napseer_mcp_server.py gateway [status|configure [--command CMD] [--target session:window.pane]|vault-setup [list|process] [--all]|terminal [list|create|close|capture|input]|schedule [list|create|update|delete|run]|restart [--passphrase TEXT]|kill [--passphrase TEXT]|setup|rotate-passphrase --new-passphrase TEXT|unlock|lock]")
+        print("Usage: napseer_mcp_server.py gateway [status|configure [--command CMD] [--target session:window.pane]|vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway] [--all]|terminal [list|create|close|capture|input]|schedule [list|create|update|delete|run]|restart [--passphrase TEXT]|kill [--passphrase TEXT]|setup|rotate-passphrase --new-passphrase TEXT|unlock|lock]")
         return
     if command == "feedback":
         subcommand = argv[2] if len(argv) > 2 else "list"
@@ -9943,4 +10047,8 @@ def main():
 
 
 if __name__ == "__main__":
-    cli_main(sys.argv)
+    try:
+        cli_main(sys.argv)
+    except Exception as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, indent=2), file=sys.stderr)
+        sys.exit(1)
