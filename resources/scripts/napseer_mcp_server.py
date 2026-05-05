@@ -6326,10 +6326,56 @@ def get_node_by_path(args, allow_agent=False):
     path = args["path"]
     if not allow_agent:
         reject_agent_namespace_path(path)
-    return request_json(
-        "GET",
+    params = {"path": path}
+    if args.get("view"):
+        params["view"] = args["view"]
+    return request_json("GET", f"/v1/projects/{project_id}/nodes/by-path?{urllib.parse.urlencode(params)}")
+
+
+def node_get(args):
+    view = args.get("view", "edit")
+    if view not in {"render", "edit", "json"}:
+        raise RuntimeError("view must be render, edit, or json")
+    return get_node_by_path({"path": args["path"], "view": view})
+
+
+def guarded_node_patch(args):
+    reject_agent_namespace_path(args["path"])
+    project_id = resolve_project_id(args)
+    precondition = args.get("precondition") or {}
+    if not args.get("dry_run"):
+        if not precondition.get("revision") or not precondition.get("read_fingerprint"):
+            raise RuntimeError("precondition.revision and precondition.read_fingerprint are required for nap_node_patch")
+    payload = {"precondition": precondition}
+    for key in [
+        "mode",
+        "set",
+        "merge_metadata",
+        "remove_metadata_keys",
+        "link_ops",
+        "tag_ops",
+        "alias_ops",
+        "content_op",
+        "dry_run",
+        "idempotency_key",
+        "allow_dangling_links",
+    ]:
+        if key in args:
+            payload[key] = args[key]
+    path = normalize_node_path(args["path"])
+    result = request_project_write(
+        "PATCH",
         f"/v1/projects/{project_id}/nodes/by-path?{urllib.parse.urlencode({'path': path})}",
+        payload,
+        project_id,
+        f"guarded patch node {path}",
+        "path",
+        path,
     )
+    node = ((result.get("data") or {}).get("node") or {}) if isinstance(result, dict) else {}
+    if node:
+        index_node(node)
+    return result
 
 
 def try_get_node_by_path(path, allow_agent=False):
