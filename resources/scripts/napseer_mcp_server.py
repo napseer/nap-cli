@@ -347,6 +347,7 @@ GATEWAY_VAULT_KEYS = {
     "gateway_managed_window",
     "gateway_remote_enabled",
     "gateway_relay_url",
+    "project_vaults",
     "service_activation_token",
 }
 AUTH_FILE_KEYS = (PUBLIC_AUTH_KEYS | SECRET_AUTH_KEYS) - GATEWAY_VAULT_KEYS
@@ -358,6 +359,9 @@ PUBLIC_TOOLS = {
     "nap_gateway_unlock",
     "nap_gateway_lock",
     "nap_gateway_configure",
+    "nap_gateway_vault_setup_ls",
+    "nap_gateway_vault_setup_process",
+    "nap_gateway_vault_secret_rotate",
     "nap_gateway_restart",
     "nap_gateway_kill",
     "nap_login",
@@ -468,9 +472,10 @@ GATEWAY_RELAY_STATE_SCHEMA = "napseer.gateway-relay-state.v1"
 GATEWAY_SCHEDULES_SCHEMA = "napseer.gateway-schedules.v1"
 CONTAINER_IDENTITY_SCHEMA = "napseer.container-identity.v1"
 GATEWAY_RELAY_SECRET_ITERATIONS = int(os.environ.get("NAPSEER_GATEWAY_RELAY_SECRET_ITERATIONS", "210000"))
-VAULT_KDF_ITERATIONS = int(os.environ.get("NAPSEER_VAULT_KDF_ITERATIONS", "390000"))
+VAULT_KDF_ITERATIONS = int(os.environ.get("NAPSEER_VAULT_KDF_ITERATIONS", "600000"))
 GATEWAY_IDLE_TIMEOUT_SECONDS = int(os.environ.get("NAPSEER_GATEWAY_IDLE_TIMEOUT_SECONDS", "900"))
 GATEWAY_MAX_LOG_BYTES = int(os.environ.get("NAPSEER_GATEWAY_MAX_LOG_BYTES", str(5 * 1024 * 1024)))
+GATEWAY_PROJECT_SECRET_KINDS = ("chat", "tabs", "gateway")
 
 VAULT_SECRETS = {}
 VAULT_KEY = None
@@ -489,6 +494,7 @@ GATEWAY_LISTENER_LAST_ERROR_AT = None
 GATEWAY_LISTENER_ACTIVE_LANES = set()
 GATEWAY_LISTENER_UNSTABLE_UNTIL = 0.0
 GATEWAY_LISTENER_STABILITY_LOCK = threading.RLock()
+GATEWAY_VAULT_SETUP_THREAD_STARTED = False
 GATEWAY_PERIODIC_LOG_STATE = {}
 WS_CLOSE_DETAILS = {}
 
@@ -2488,11 +2494,11 @@ def relay_base_url():
     return str(state.get("relay_url") or VAULT_SECRETS.get("gateway_relay_url") or BASE_URL).rstrip("/")
 
 
-def relay_ws_url(project_id, session_id, ticket):
+def relay_ws_url(project_id, session_id, ticket, socket="terminal"):
     parsed = urllib.parse.urlparse(relay_base_url())
     scheme = "wss" if parsed.scheme == "https" else "ws"
     netloc = parsed.netloc
-    return f"{scheme}://{netloc}/v1/projects/{project_id}/gateway-sessions/{session_id}/relay?{urllib.parse.urlencode({'ticket': ticket})}"
+    return f"{scheme}://{netloc}/v1/projects/{project_id}/gateway-sessions/{session_id}/relay/{socket}?{urllib.parse.urlencode({'ticket': ticket})}"
 
 
 def gateway_listener_ws_url(project_id, agent_id):
@@ -2989,10 +2995,11 @@ if (op === 'decrypt') {
     return result.stdout
 
 
-def decrypt_relay_frame(key, frame_text, context_hash, expected_direction, expected_seq):
+def decrypt_relay_frame(key, frame_text, context_hash, relay_lane, expected_direction, expected_seq):
     envelope = json.loads(frame_text)
     if (
         envelope.get("context_hash") != context_hash
+        or envelope.get("relay_lane") != relay_lane
         or envelope.get("direction") != expected_direction
         or envelope.get("seq") != expected_seq
     ):
@@ -3000,26 +3007,260 @@ def decrypt_relay_frame(key, frame_text, context_hash, expected_direction, expec
     plaintext = relay_node_crypto(
         "decrypt",
         key,
-        relay_aad(envelope["session_id"], context_hash, expected_direction, expected_seq),
+        relay_aad(envelope["session_id"], context_hash, relay_lane, expected_direction, expected_seq),
         base64.b64decode(envelope["nonce"]),
         ciphertext=base64.b64decode(envelope["ciphertext"]),
     )
     return json.loads(plaintext)
 
 
-def encrypt_relay_frame(key, session_id, payload, context_hash, direction, seq):
+def encrypt_relay_frame(key, session_id, payload, context_hash, relay_lane, direction, seq):
     nonce = secrets.token_bytes(12)
-    ciphertext = relay_node_crypto("encrypt", key, relay_aad(session_id, context_hash, direction, seq), nonce, payload=payload)
+    ciphertext = relay_node_crypto("encrypt", key, relay_aad(session_id, context_hash, relay_lane, direction, seq), nonce, payload=payload)
     return json.dumps({
         "type": "encrypted",
         "alg": "AES-GCM-256",
         "session_id": session_id,
         "context_hash": context_hash,
+        "relay_lane": relay_lane,
         "direction": direction,
         "seq": seq,
         "nonce": base64.b64encode(nonce).decode("ascii"),
         "ciphertext": ciphertext,
     }, separators=(",", ":"))
+
+
+def gateway_project_secret_aad(project_id, secret_kind, version):
+    return f"napseer.project-secret.v1:{project_id}:{secret_kind}:{int(version)}".encode("utf-8")
+
+
+def gateway_vault_master_wrap_aad(project_id, credential_id):
+    return f"napseer.vault-master-wrap.v1:{project_id}:{credential_id}".encode("utf-8")
+
+
+def gateway_project_secret_envelope(project_id, secret_kind, version, vault_master_secret, secret_material):
+    nonce = secrets.token_bytes(12)
+    aad = gateway_project_secret_aad(project_id, secret_kind, version)
+    packed = aes_gcm_encrypt(vault_master_secret, nonce, aad, secret_material)
+    return {
+        "schema_version": 1,
+        "alg": "AES-GCM-256",
+        "nonce_b64": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext_b64": base64.b64encode(packed).decode("ascii"),
+        "payload_size_bytes": len(packed),
+        "key_id": f"vault-master:{project_id}:v1",
+        "content_type": f"application/vnd.napseer.project-secret.{secret_kind}+bytes",
+        "aad_hash": hashlib.sha256(aad).hexdigest(),
+        "ciphertext_sha256": hashlib.sha256(packed).hexdigest(),
+    }
+
+
+def gateway_wrapped_vault_master_secret(project_id, vault_master_secret):
+    if not VAULT_KEY:
+        raise RuntimeError("gateway is locked; unlock before wrapping project vault secrets")
+    credential_id = f"gateway-vault:{AUTH.get('agent_id') or 'local'}"
+    nonce = secrets.token_bytes(12)
+    aad = gateway_vault_master_wrap_aad(project_id, credential_id)
+    packed = aes_gcm_encrypt(VAULT_KEY, nonce, aad, vault_master_secret)
+    return {
+        "credential_id": credential_id,
+        "wrapped_project_key_b64": base64.b64encode(packed).decode("ascii"),
+        "wrap_alg": "AES-GCM-256",
+        "kdf_alg": "PBKDF2-SHA256",
+        "kdf_params": {
+            "source": "gateway_vault",
+            "iterations": VAULT_KDF_ITERATIONS,
+            "aad_hash": hashlib.sha256(aad).hexdigest(),
+            "nonce_b64": base64.b64encode(nonce).decode("ascii"),
+            "runtime": "gateway",
+        },
+    }
+
+
+def gateway_project_vault_state():
+    state = VAULT_SECRETS.get("project_vaults")
+    if isinstance(state, dict):
+        return state
+    state = {}
+    VAULT_SECRETS["project_vaults"] = state
+    return state
+
+
+def gateway_generate_project_vault_setup_payload(project_id, setup_request_id):
+    project_id = str(project_id or current_project_id()).strip()
+    if not project_id:
+        raise RuntimeError("project_id is required")
+    vault_master_secret = secrets.token_bytes(32)
+    project_secret_records = {}
+    project_secrets = []
+    for secret_kind in GATEWAY_PROJECT_SECRET_KINDS:
+        secret_material = secrets.token_bytes(32)
+        project_secret_records[secret_kind] = {
+            "version": 1,
+            "secret_b64": base64.b64encode(secret_material).decode("ascii"),
+            "created_at": iso_now(),
+        }
+        project_secrets.append({
+            "secret_kind": secret_kind,
+            "encrypted_secret_envelope": gateway_project_secret_envelope(
+                project_id,
+                secret_kind,
+                1,
+                vault_master_secret,
+                secret_material,
+            ),
+        })
+    project_vaults = gateway_project_vault_state()
+    project_vaults[project_id] = {
+        "version": 1,
+        "setup_request_id": str(setup_request_id or ""),
+        "vault_master_secret_b64": base64.b64encode(vault_master_secret).decode("ascii"),
+        "project_secrets": project_secret_records,
+        "created_at": iso_now(),
+        "updated_at": iso_now(),
+    }
+    persist_vault_secrets()
+    return {
+        "wrapped_master_secret": gateway_wrapped_vault_master_secret(project_id, vault_master_secret),
+        "project_secrets": project_secrets,
+    }
+
+
+def gateway_vault_setup_requests(args=None):
+    args = args or {}
+    project_id = args.get("project_id") or current_project_id()
+    if not project_id:
+        raise RuntimeError("project_id is required")
+    return request_json("GET", f"/v1/projects/{project_id}/vault/setup-requests")
+
+
+def gateway_complete_vault_setup_request(setup_request, project_id=None):
+    require_unlocked("completing project vault setup")
+    project_id = str(project_id or setup_request.get("project_id") or current_project_id())
+    request_id = str(setup_request.get("id") or "").strip()
+    if not request_id:
+        raise RuntimeError("vault setup request id is required")
+    payload = gateway_generate_project_vault_setup_payload(project_id, request_id)
+    result = request_project_write(
+        "POST",
+        f"/v1/projects/{project_id}/vault/setup-requests/{urllib.parse.quote(request_id, safe='')}/complete",
+        payload,
+        project_id,
+        "complete gateway-owned project vault setup",
+        scope_type="encryption",
+    )
+    gateway_log(
+        "project_vault_setup_completed",
+        project_id=project_id,
+        setup_request_id=request_id,
+        secret_kinds=[item.get("secret_kind") for item in payload.get("project_secrets", [])],
+    )
+    return result
+
+
+def gateway_process_vault_setup_requests(args=None):
+    args = args or {}
+    require_unlocked("processing project vault setup requests")
+    project_id = args.get("project_id") or current_project_id()
+    items = gateway_vault_setup_requests({"project_id": project_id}).get("items", [])
+    completed = []
+    skipped = []
+    for item in items:
+        if item.get("status") != "pending":
+            skipped.append({"id": item.get("id"), "status": item.get("status")})
+            continue
+        try:
+            completed.append(gateway_complete_vault_setup_request(item, project_id=project_id))
+        except Exception as exc:
+            gateway_log(
+                "project_vault_setup_completion_failed",
+                level="error",
+                project_id=project_id,
+                setup_request_id=item.get("id"),
+                error=str(exc),
+            )
+            raise
+        if not args.get("complete_all"):
+            break
+    return {
+        "status": "processed",
+        "project_id": project_id,
+        "completed_count": len(completed),
+        "completed": completed,
+        "skipped": skipped,
+    }
+
+
+def gateway_rotate_project_vault_secret(args=None):
+    args = args or {}
+    require_unlocked("rotating project vault secret")
+    project_id = str(args.get("project_id") or current_project_id()).strip()
+    secret_kind = str(args.get("secret_kind") or args.get("kind") or "chat").strip().lower()
+    if secret_kind not in GATEWAY_PROJECT_SECRET_KINDS:
+        raise RuntimeError("secret_kind must be chat, tabs, or gateway")
+    project_vault = gateway_project_vault_state().get(project_id)
+    if not isinstance(project_vault, dict):
+        raise RuntimeError("project vault is not initialized on this gateway")
+    vault_master_secret = base64.b64decode(project_vault.get("vault_master_secret_b64") or "", validate=True)
+    if len(vault_master_secret) != 32:
+        raise RuntimeError("project vault master secret is invalid")
+    project_secrets = project_vault.setdefault("project_secrets", {})
+    current = project_secrets.get(secret_kind) if isinstance(project_secrets, dict) else {}
+    current_version = int((current or {}).get("version") or 1)
+    next_version = current_version + 1
+    secret_material = secrets.token_bytes(32)
+    envelope = gateway_project_secret_envelope(project_id, secret_kind, next_version, vault_master_secret, secret_material)
+    result = request_project_write(
+        "POST",
+        f"/v1/projects/{project_id}/vault/secrets/{urllib.parse.quote(secret_kind, safe='')}/rotate",
+        {"encrypted_secret_envelope": envelope},
+        project_id,
+        f"rotate {secret_kind} project secret",
+        scope_type="encryption",
+    )
+    project_secrets[secret_kind] = {
+        "version": int(result.get("version") or next_version),
+        "secret_b64": base64.b64encode(secret_material).decode("ascii"),
+        "created_at": iso_now(),
+        "rotated_from_version": current_version,
+    }
+    project_vault["updated_at"] = iso_now()
+    project_vault["last_rotation_at"] = iso_now()
+    persist_vault_secrets()
+    gateway_log(
+        "project_vault_secret_rotated",
+        project_id=project_id,
+        secret_kind=secret_kind,
+        version=project_secrets[secret_kind]["version"],
+    )
+    return result
+
+
+def gateway_vault_setup_loop():
+    interval = max(10, min(int(os.environ.get("NAPSEER_GATEWAY_VAULT_SETUP_POLL_SECONDS", "30")), 300))
+    gateway_log("gateway_vault_setup_thread_started", project_id=current_project_id())
+    while True:
+        try:
+            if gateway_remote_should_run() and gateway_is_unlocked():
+                gateway_process_vault_setup_requests({})
+        except Exception as exc:
+            gateway_periodic_log(
+                "gateway_vault_setup_loop_error",
+                60,
+                "gateway_vault_setup_loop_error",
+                level="warn",
+                project_id=current_project_id(),
+                error=str(exc),
+            )
+        time.sleep(interval)
+
+
+def start_gateway_vault_setup_thread():
+    global GATEWAY_VAULT_SETUP_THREAD_STARTED
+    if GATEWAY_VAULT_SETUP_THREAD_STARTED:
+        return
+    GATEWAY_VAULT_SETUP_THREAD_STARTED = True
+    threading.Thread(target=gateway_vault_setup_loop, name="napseer-gateway-vault-setup", daemon=True).start()
 
 
 def handle_gateway_relay_session(connect_request, listener_sock=None):
@@ -3050,8 +3291,9 @@ def handle_gateway_relay_session(connect_request, listener_sock=None):
             )
             raise RuntimeError("gateway relay secret is missing; run nap gateway configure or nap gateway unlock once")
         spake2_context = connect_request.get("spake2_context") or {}
-        sock = ws_connect(relay_ws_url(project_id, session_id, connect_request["relay_ticket"]))
-        gateway_log("relay_session_socket_connected", project_id=project_id, session_id=session_id, request_id=request_id)
+        relay_socket = str(connect_request.get("relay_socket") or connect_request.get("relay_lane") or spake2_context.get("relay_socket") or spake2_context.get("relay_lane") or "terminal")
+        sock = ws_connect(relay_ws_url(project_id, session_id, connect_request["relay_ticket"], relay_socket))
+        gateway_log("relay_session_socket_connected", project_id=project_id, session_id=session_id, request_id=request_id, relay_socket=relay_socket)
         if listener_sock is not None:
             with GATEWAY_LISTENER_SEND_LOCK:
                 ws_send_text(listener_sock, json.dumps({
@@ -3176,6 +3418,7 @@ def handle_gateway_relay_session(connect_request, listener_sock=None):
         send_key = relay_key_from_secret(spake2_finished["secret"], spake2_context, "gateway_to_client")
         receive_key = relay_key_from_secret(spake2_finished["secret"], spake2_context, "client_to_gateway")
         context_hash = relay_context_hash(spake2_context)
+        relay_lane = str(spake2_context.get("relay_lane") or spake2_context.get("relay_socket") or relay_socket or "terminal")
         send_seq = {"value": 0}
         receive_seq = 0
         relay_send_lock = threading.Lock()
@@ -3197,7 +3440,7 @@ def handle_gateway_relay_session(connect_request, listener_sock=None):
             with relay_send_lock:
                 seq = send_seq["value"]
                 try:
-                    ws_send_text(sock, encrypt_relay_frame(send_key, session_id, payload, context_hash, "gateway_to_client", seq))
+                    ws_send_text(sock, encrypt_relay_frame(send_key, session_id, payload, context_hash, relay_lane, "gateway_to_client", seq))
                 except (BrokenPipeError, ConnectionError, OSError, ssl.SSLError) as exc:
                     relay_closed.set()
                     gateway_log(
@@ -3560,7 +3803,7 @@ def handle_gateway_relay_session(connect_request, listener_sock=None):
                 continue
             if parsed.get("direction") != "client_to_gateway":
                 continue
-            frame = decrypt_relay_frame(receive_key, frame_text, context_hash, "client_to_gateway", receive_seq)
+            frame = decrypt_relay_frame(receive_key, frame_text, context_hash, relay_lane, "client_to_gateway", receive_seq)
             receive_seq += 1
             if frame.get("source") == "gateway":
                 continue
@@ -5735,6 +5978,8 @@ def cli_positionals(args):
         "--container-uuid",
         "--image",
         "--image-ref",
+        "--secret-kind",
+        "--kind",
         "--root-path",
         "--name",
         "--target",
@@ -7157,6 +7402,7 @@ def start_local_ui(args):
     start_gateway_log_compactor_thread()
     start_gateway_relay_thread()
     start_gateway_schedule_thread()
+    start_gateway_vault_setup_thread()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
@@ -7427,6 +7673,12 @@ def start_local_ui(args):
                 return gateway_setup(payload)
             if route == "/local-api/gateway/configure":
                 return gateway_tmux_configure(payload)
+            if route == "/local-api/gateway/vault-setup/list":
+                return gateway_vault_setup_requests(payload)
+            if route == "/local-api/gateway/vault-setup/process":
+                return gateway_process_vault_setup_requests(payload)
+            if route == "/local-api/gateway/vault-secret/rotate":
+                return gateway_rotate_project_vault_secret(payload)
             if route == "/local-api/gateway/terminal/input":
                 return gateway_terminal_input(payload)
             if route == "/local-api/gateway/terminal/key":
@@ -7946,6 +8198,40 @@ def raw_tools():
             },
         },
         {
+            "name": "nap_gateway_vault_setup_ls",
+            "description": "List project vault setup requests assigned to this gateway worker. Does not reveal secret material.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"project_id": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "nap_gateway_vault_setup_process",
+            "description": "Complete pending project vault setup requests assigned to this unlocked gateway by generating local secret material and sending only encrypted envelopes to Napseer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project_id": {"type": "string"},
+                    "complete_all": {"type": "boolean"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "nap_gateway_vault_secret_rotate",
+            "description": "Rotate one project secret version from the unlocked gateway local vault and submit only the encrypted envelope to Napseer.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["secret_kind"],
+                "properties": {
+                    "project_id": {"type": "string"},
+                    "secret_kind": {"type": "string", "enum": ["chat", "tabs", "gateway"]},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "nap_gateway_unlock",
             "description": "Unlock the encrypted local gateway vault with the master passphrase.",
             "inputSchema": {
@@ -8360,6 +8646,51 @@ def raw_tools():
             },
         },
         {
+            "name": "nap_node_get",
+            "description": "Read one node by path with optional edit/json view. Use view='edit' before nap_node_patch to get revision and read_fingerprint.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "view": {"type": "string", "enum": ["render", "edit", "json"], "default": "edit"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "nap_node_patch",
+            "description": "Fingerprint-guarded object-first node patch. Non-dry-run calls require precondition.revision and precondition.read_fingerprint from nap_node_get.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["object_patch", "replace_editable_fields"], "default": "object_patch"},
+                    "precondition": {
+                        "type": "object",
+                        "required": ["revision", "read_fingerprint"],
+                        "properties": {
+                            "revision": {"type": "string"},
+                            "read_fingerprint": {"type": "string"},
+                        },
+                        "additionalProperties": False,
+                    },
+                    "set": {"type": "object"},
+                    "merge_metadata": {"type": "object"},
+                    "remove_metadata_keys": {"type": "array", "items": {"type": "string"}},
+                    "link_ops": {"type": "array", "items": {"type": "object"}},
+                    "tag_ops": {"type": "object"},
+                    "alias_ops": {"type": "object"},
+                    "content_op": {"type": "object"},
+                    "dry_run": {"type": "boolean", "default": False},
+                    "idempotency_key": {"type": "string"},
+                    "allow_dangling_links": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "nap_rm",
             "description": "Archive an existing node by full path using an auto-acquired project lock.",
             "inputSchema": {
@@ -8644,6 +8975,7 @@ TOOL_CATEGORIES = {
         "nap_du",
         "nap_lint",
         "nap_doctor",
+        "nap_node_get",
         "nap_cat",
         "nap_backlinks",
         "nap_ls",
@@ -8652,6 +8984,7 @@ TOOL_CATEGORIES = {
     "update": [
         "nap_tee",
         "nap_patch",
+        "nap_node_patch",
         "nap_rm",
         "nap_ln",
         "nap_mv",
@@ -8674,6 +9007,9 @@ TOOL_CATEGORIES = {
         "nap_gateway_status",
         "nap_gateway_setup",
         "nap_gateway_configure",
+        "nap_gateway_vault_setup_ls",
+        "nap_gateway_vault_setup_process",
+        "nap_gateway_vault_secret_rotate",
         "nap_gateway_unlock",
         "nap_gateway_restart",
         "nap_gateway_kill",
@@ -8724,6 +9060,7 @@ READ_ONLY_TOOLS = {
     "nap_feedback_admin_ls",
     "nap_ls_tags",
     "nap_cat",
+    "nap_node_get",
     "nap_backlinks",
     "nap_ls",
     "nap_agent_ls",
@@ -8736,6 +9073,8 @@ LOCAL_FILE_TOOLS = {
     "nap_index_clear",
     "nap_gateway_setup",
     "nap_gateway_configure",
+    "nap_gateway_vault_setup_process",
+    "nap_gateway_vault_secret_rotate",
     "nap_gateway_unlock",
     "nap_gateway_lock",
 }
@@ -8747,6 +9086,7 @@ AUTO_LOCK_TOOLS = {
     "nap_create_node",
     "nap_tee",
     "nap_patch",
+    "nap_node_patch",
     "nap_rm",
     "nap_ln",
     "nap_mv",
@@ -8786,7 +9126,7 @@ def tool_auth_mode(name):
 
 def tool_contract_metadata(name):
     side_effect = tool_side_effect(name)
-    dry_run_supported = name in {"nap_rm", "nap_mv", "nap_mv_folder", "nap_bulk"}
+    dry_run_supported = name in {"nap_rm", "nap_mv", "nap_mv_folder", "nap_bulk", "nap_node_patch"}
     return {
         "contract_version": CONTRACT_VERSION,
         "category": tool_category(name),
@@ -8994,6 +9334,12 @@ def call_tool_impl(name, args):
         return gateway_setup(args)
     if name == "nap_gateway_configure":
         return mcp_gateway_configure(args)
+    if name == "nap_gateway_vault_setup_ls":
+        return gateway_vault_setup_requests(args)
+    if name == "nap_gateway_vault_setup_process":
+        return gateway_process_vault_setup_requests(args)
+    if name == "nap_gateway_vault_secret_rotate":
+        return gateway_rotate_project_vault_secret(args)
     if name == "nap_gateway_unlock":
         return gateway_unlock(args.get("passphrase", ""))
     if name == "nap_gateway_restart":
@@ -9088,6 +9434,10 @@ def call_tool_impl(name, args):
         return upsert_node(args)
     if name == "nap_patch":
         return update_node_by_path(args)
+    if name == "nap_node_get":
+        return node_get(args)
+    if name == "nap_node_patch":
+        return guarded_node_patch(args)
     if name == "nap_rm":
         return archive_node_by_path(args)
     if name == "nap_cat":
@@ -9409,6 +9759,26 @@ def cli_main(argv):
                 gateway_service_run(payload)
                 return
             raise RuntimeError("unknown gateway service action; use preregister|activate|run")
+        if subcommand in {"vault-setup", "vault_setup", "project-vault"}:
+            action = args[0] if args else "process"
+            vault_args = args[1:] if args else []
+            payload = {
+                "project_id": cli_option(vault_args, "--project-id", default=None),
+                "secret_kind": cli_option(vault_args, "--secret-kind", "--kind", default=None),
+                "complete_all": cli_flag(vault_args, "--all", "--complete-all"),
+            }
+            if action in {"list", "ls", "status"}:
+                print(json.dumps(gateway_vault_setup_requests(payload), indent=2))
+                return
+            if action in {"process", "complete", "run"}:
+                print(json.dumps(gateway_process_vault_setup_requests(payload), indent=2))
+                return
+            if action in {"rotate", "rotate-secret"}:
+                if not payload.get("secret_kind"):
+                    payload["secret_kind"] = vault_args[0] if vault_args and not vault_args[0].startswith("-") else "chat"
+                print(json.dumps(gateway_rotate_project_vault_secret(payload), indent=2))
+                return
+            raise RuntimeError("unknown gateway vault-setup action; use list|process")
         if subcommand == "setup":
             print(json.dumps(gateway_setup({
                 "passphrase": cli_option(args, "--passphrase", default=None),
@@ -9426,7 +9796,7 @@ def cli_main(argv):
         if subcommand == "lock":
             print(json.dumps(gateway_lock(), indent=2))
             return
-        print("Usage: napseer_mcp_server.py gateway [status|configure [--command CMD] [--target session:window.pane]|terminal [list|create|close|capture|input]|schedule [list|create|update|delete|run]|restart [--passphrase TEXT]|kill [--passphrase TEXT]|setup|rotate-passphrase --new-passphrase TEXT|unlock|lock]")
+        print("Usage: napseer_mcp_server.py gateway [status|configure [--command CMD] [--target session:window.pane]|vault-setup [list|process] [--all]|terminal [list|create|close|capture|input]|schedule [list|create|update|delete|run]|restart [--passphrase TEXT]|kill [--passphrase TEXT]|setup|rotate-passphrase --new-passphrase TEXT|unlock|lock]")
         return
     if command == "feedback":
         subcommand = argv[2] if len(argv) > 2 else "list"
