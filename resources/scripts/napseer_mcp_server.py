@@ -8018,7 +8018,6 @@ def ui_safe_return(value):
 
 def start_local_ui(args):
     csrf_token = secrets.token_urlsafe(32)
-    cloud_gateway_tokens = set()
     gateway_log(
         "local_service_starting",
         requested_port=args.get("port", 0),
@@ -8050,32 +8049,6 @@ def start_local_ui(args):
         def log_message(self, format, *args):
             return
 
-        def cloud_gateway_route(self):
-            return urllib.parse.urlparse(self.path).path.startswith("/gateway/cloud/")
-
-        def cloud_gateway_ws_route(self):
-            return urllib.parse.urlparse(self.path).path == "/gateway/cloud/ws"
-
-        def cloud_origin_allowed(self):
-            origin = self.headers.get("Origin", "")
-            if not origin:
-                return False
-            parsed = urllib.parse.urlparse(origin)
-            host = (parsed.hostname or "").lower()
-            return parsed.scheme in {"http", "https"} and (
-                host in {"napseer.com", "www.napseer.com", "localhost", "127.0.0.1"}
-                or host.endswith(".napseer.com")
-            )
-
-        def send_cors_headers(self):
-            origin = self.headers.get("Origin", "")
-            if self.cloud_origin_allowed():
-                self.send_header("Access-Control-Allow-Origin", origin)
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Napseer-CSRF")
-                self.send_header("Access-Control-Max-Age", "600")
-                self.send_header("Vary", "Origin")
-
         def validate_local_request(self):
             host = self.headers.get("Host", "")
             allowed_hosts = {
@@ -8087,17 +8060,8 @@ def start_local_ui(args):
             if self.command == "POST":
                 origin = self.headers.get("Origin")
                 allowed_origins = {f"http://{host}" for host in allowed_hosts}
-                if self.cloud_gateway_route() and self.cloud_origin_allowed():
-                    return
                 if origin and origin not in allowed_origins:
                     raise RuntimeError("invalid Origin header")
-
-        def validate_cloud_ws_request(self):
-            self.validate_local_request()
-            if not self.cloud_origin_allowed():
-                raise RuntimeError("invalid Origin header")
-            if self.headers.get("Upgrade", "").lower() != "websocket":
-                raise RuntimeError("expected websocket upgrade")
 
         def validate_csrf(self, payload=None, form=None):
             header_token = self.headers.get("X-Napseer-CSRF", "")
@@ -8119,7 +8083,6 @@ def start_local_ui(args):
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
-            self.send_cors_headers()
             self.end_headers()
             self.wfile.write(json.dumps(payload).encode("utf-8"))
 
@@ -8140,7 +8103,6 @@ def start_local_ui(args):
             self.send_header("Content-Type", asset.get("content_type") or "text/plain; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store" if route == "/" else "public, max-age=31536000, immutable")
-            self.send_cors_headers()
             self.end_headers()
             self.wfile.write(body)
             return True
@@ -8148,12 +8110,7 @@ def start_local_ui(args):
         def do_OPTIONS(self):
             try:
                 self.validate_local_request()
-                if not self.cloud_gateway_route():
-                    self.send_response(404)
-                    self.end_headers()
-                    return
-                self.send_response(204)
-                self.send_cors_headers()
+                self.send_response(404)
                 self.end_headers()
             except Exception as exc:
                 self.send_json(400, {"error": str(exc)})
@@ -8384,162 +8341,15 @@ def start_local_ui(args):
                 return update_self({"confirm": payload.get("confirm", "")})
             raise ValueError(f"unknown local api route: {route}")
 
-        def validate_cloud_gateway_token(self, payload):
-            token = str((payload or {}).get("token") or "")
-            if not token or token not in cloud_gateway_tokens:
-                raise RuntimeError("gateway cloud console is not connected")
-            return token
-
-        def validate_cloud_gateway_project(self, payload):
-            expected_project_id = str((payload or {}).get("project_id") or "").strip()
-            if not expected_project_id:
-                return
-            actual_project_id = current_project_id()
-            if actual_project_id == expected_project_id:
-                return
-            status = gateway_status()
-            configured = actual_project_id or "no project"
-            raise RuntimeError(
-                "local gateway is running for a different project "
-                f"({configured}) from {status.get('cwd')}. "
-                "Stop that gateway and start nap gateway from the selected project."
-            )
-
-        def cloud_gateway_connect(self, payload):
-            self.validate_cloud_gateway_project(payload)
-            passphrase = str((payload or {}).get("passphrase") or "")
-            if not passphrase:
-                raise RuntimeError("gateway passphrase is required")
-            if not gateway_is_unlocked():
-                gateway_unlock(passphrase)
-            default_command = str((payload or {}).get("default_command") or "").strip()
-            if default_command:
-                gateway_tmux_configure({"default_command": default_command})
-            try:
-                touch_project_agent()
-            except Exception:
-                pass
-            captured = gateway_terminal_capture({})
-            token = secrets.token_urlsafe(32)
-            cloud_gateway_tokens.add(token)
-            return {
-                "status": "connected",
-                "token": token,
-                "gateway": gateway_status(),
-                "tmux_target": captured.get("tmux_target"),
-                "output": captured.get("output") or "",
-            }
-
-        def handle_cloud_gateway_post(self, route, payload):
-            if route == "/gateway/cloud/connect":
-                return self.cloud_gateway_connect(payload)
-            if route == "/gateway/cloud/input":
-                self.validate_cloud_gateway_token(payload)
-                return gateway_terminal_input(payload or {})
-            if route == "/gateway/cloud/capture":
-                self.validate_cloud_gateway_token(payload)
-                return gateway_terminal_capture(payload or {})
-            if route == "/gateway/cloud/disconnect":
-                token = self.validate_cloud_gateway_token(payload)
-                cloud_gateway_tokens.discard(token)
-                return {"status": "disconnected"}
-            raise ValueError(f"unknown gateway cloud route: {route}")
-
-        def ws_send_json(self, payload):
-            self.ws_send_text(json.dumps(payload, separators=(",", ":")))
-
-        def ws_send_text(self, text):
-            data = text.encode("utf-8")
-            header = bytearray([0x81])
-            if len(data) < 126:
-                header.append(len(data))
-            elif len(data) < 65536:
-                header.extend([126, (len(data) >> 8) & 0xff, len(data) & 0xff])
-            else:
-                header.append(127)
-                header.extend(len(data).to_bytes(8, "big"))
-            self.wfile.write(bytes(header) + data)
-            self.wfile.flush()
-
-        def ws_read_frame(self):
-            header = self.rfile.read(2)
-            if len(header) < 2:
-                return None, None
-            first, second = header
-            opcode = first & 0x0F
-            masked = bool(second & 0x80)
-            length = second & 0x7F
-            if length == 126:
-                length = int.from_bytes(self.rfile.read(2), "big")
-            elif length == 127:
-                length = int.from_bytes(self.rfile.read(8), "big")
-            mask = self.rfile.read(4) if masked else b""
-            payload = self.rfile.read(length) if length else b""
-            if masked:
-                payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
-            return opcode, payload
-
-        def handle_cloud_gateway_ws(self):
-            self.validate_cloud_ws_request()
-            key = self.headers.get("Sec-WebSocket-Key", "")
-            if not key:
-                raise RuntimeError("missing websocket key")
-            accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()).decode("ascii")
-            self.send_response(101)
-            self.send_header("Upgrade", "websocket")
-            self.send_header("Connection", "Upgrade")
-            self.send_header("Sec-WebSocket-Accept", accept)
-            self.send_cors_headers()
-            self.end_headers()
-            connected = False
-            token = ""
-            try:
-                while True:
-                    opcode, payload = self.ws_read_frame()
-                    if opcode is None or opcode == 0x8:
-                        break
-                    if opcode == 0x9:
-                        self.wfile.write(b"\x8a\x00")
-                        self.wfile.flush()
-                        continue
-                    if opcode != 0x1:
-                        continue
-                    try:
-                        message = json.loads(payload.decode("utf-8"))
-                        message_type = str(message.get("type") or "")
-                        if message_type == "connect":
-                            result = self.cloud_gateway_connect(message)
-                            token = str(result.get("token") or "")
-                            connected = True
-                            self.ws_send_json({"type": "terminal.status", **result})
-                            continue
-                        if not connected:
-                            raise RuntimeError("gateway cloud websocket is not connected")
-                        if message_type == "terminal.input":
-                            result = gateway_terminal_input({**message, "token": token})
-                            self.ws_send_json({"type": "terminal.output", **result})
-                            continue
-                        if message_type == "terminal.capture":
-                            result = gateway_terminal_capture(message)
-                            self.ws_send_json({"type": "terminal.output", **result})
-                            continue
-                        if message_type == "heartbeat":
-                            self.ws_send_json({"type": "heartbeat", "status": "ok"})
-                            continue
-                        raise RuntimeError(f"unknown gateway websocket message: {message_type}")
-                    except Exception as exc:
-                        self.ws_send_json({"type": "terminal.error", "error": str(exc)})
-            finally:
-                if token:
-                    cloud_gateway_tokens.discard(token)
-                self.close_connection = True
-
         def do_GET(self):
             try:
                 self.validate_local_request()
                 parsed_path = urllib.parse.urlparse(self.path)
-                if parsed_path.path == "/gateway/cloud/ws":
-                    self.handle_cloud_gateway_ws()
+                path_parts = parsed_path.path.split("/", 3)
+                if len(path_parts) >= 3 and path_parts[1:3] == ["gateway", "cloud"]:
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b"not found")
                     return
                 if parsed_path.path == "/gateway/status":
                     self.send_json(200, gateway_status())
@@ -8664,13 +8474,11 @@ def start_local_ui(args):
             try:
                 self.validate_local_request()
                 parsed_path = urllib.parse.urlparse(self.path)
-                if parsed_path.path.startswith("/gateway/cloud/"):
-                    try:
-                        payload = self.read_json()
-                        result = self.handle_cloud_gateway_post(parsed_path.path, payload)
-                        self.send_json(200, result or {"ok": True})
-                    except Exception as exc:
-                        self.send_json(400, {"error": str(exc)})
+                path_parts = parsed_path.path.split("/", 3)
+                if len(path_parts) >= 3 and path_parts[1:3] == ["gateway", "cloud"]:
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b"not found")
                     return
                 if parsed_path.path.startswith("/local-api/"):
                     try:
