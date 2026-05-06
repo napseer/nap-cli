@@ -615,12 +615,12 @@ def handle_gateway(args):
         print("  nap gateway setup                     Create or unlock the encrypted gateway vault.")
         print("  nap gateway vault                     Show gateway vault status and pending setup requests.")
         print("  nap gateway vault process             Complete pending setup requests.")
-        print("  nap gateway vault rotate-secret --kind chat|tabs|gateway")
+        print("  nap gateway vault rotate-secret --kind chat|tabs|gateway|memory")
         return 0
     if subcommand in {"vault", "vault-setup", "vault_setup", "project-vault"} and rest and rest[0] in {"help", "-h", "--help"}:
-        print("Usage: nap gateway vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway] [--all] [--project-id ID]")
+        print("Usage: nap gateway vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway|memory] [--all] [--project-id ID]")
         print("  status        Show configured/locked state and pending setup requests.")
-        print("  process       Generate local secret material and send encrypted envelopes only.")
+        print("  process       Upload opaque client-wrapped key bundle records for backend-owned HashiCorp storage.")
         print("  rotate-secret Rotate one encrypted project secret.")
         print("  vault-setup   Deprecated alias for vault.")
         return 0

@@ -302,6 +302,7 @@ LOCAL_UI_ASSETS = {
 
 PUBLIC_AUTH_KEYS = {
     "base_url",
+    "account_id",
     "project_id",
     "project_slug",
     "project_name",
@@ -347,7 +348,6 @@ GATEWAY_VAULT_KEYS = {
     "gateway_managed_window",
     "gateway_remote_enabled",
     "gateway_relay_url",
-    "project_vaults",
     "service_activation_token",
 }
 AUTH_FILE_KEYS = (PUBLIC_AUTH_KEYS | SECRET_AUTH_KEYS) - GATEWAY_VAULT_KEYS
@@ -477,10 +477,21 @@ GATEWAY_SCHEDULES_SCHEMA = "napseer.gateway-schedules.v1"
 CONTAINER_IDENTITY_SCHEMA = "napseer.container-identity.v1"
 GATEWAY_RELAY_SECRET_ITERATIONS = int(os.environ.get("NAPSEER_GATEWAY_RELAY_SECRET_ITERATIONS", "210000"))
 VAULT_KDF_ITERATIONS = int(os.environ.get("NAPSEER_VAULT_KDF_ITERATIONS", "600000"))
-PROJECT_KEY_KDF_ITERATIONS = int(os.environ.get("NAPSEER_PROJECT_KEY_KDF_ITERATIONS", "600000"))
 GATEWAY_IDLE_TIMEOUT_SECONDS = int(os.environ.get("NAPSEER_GATEWAY_IDLE_TIMEOUT_SECONDS", "900"))
 GATEWAY_MAX_LOG_BYTES = int(os.environ.get("NAPSEER_GATEWAY_MAX_LOG_BYTES", str(5 * 1024 * 1024)))
-GATEWAY_PROJECT_SECRET_KINDS = ("chat", "tabs", "gateway")
+GATEWAY_PROJECT_SECRET_KINDS = ("chat", "tabs", "gateway", "memory")
+MEMORY_SECRET_KIND = "memory"
+WRAPPED_PROJECT_KEY_BUNDLE_SCHEMA = "napseer.wrapped-project-key-bundle.v1"
+PROJECT_DATA_KEY_BUNDLE_SCHEMA = "napseer.project-data-key-bundle.v1"
+PROJECT_BUNDLE_KDF_ITERATIONS = int(os.environ.get("NAPSEER_PROJECT_BUNDLE_KDF_ITERATIONS", "600000"))
+PROJECT_BUNDLE_KDF_OUTPUT_LEN = 32
+PROJECT_BUNDLE_AEAD_ALG = "AES-256-GCM"
+MEMORY_ENCRYPTED_CONTENT_KINDS = {"node_content", "node_metadata"}
+MEMORY_NODE_HKDF_INFO_PREFIX = "napseer-memory-node-v1"
+MEMORY_NODE_LEGACY_HKDF_INFO_PREFIX = "napseer-memory-local-mcp-v1"
+MEMORY_SECRET_CACHE = {}
+ACTIVE_MEMORY_SECRET_VERSIONS = {}
+GATEWAY_PROJECT_BUNDLE_PASSPHRASE = None
 
 VAULT_SECRETS = {}
 VAULT_KEY = None
@@ -683,23 +694,6 @@ def read_master_passphrase(create=False):
     return first
 
 
-def read_project_passphrase(create=False):
-    value = os.environ.get("NAPSEER_PROJECT_PASSPHRASE") or os.environ.get("NAPSEER_MASTER_PASSPHRASE")
-    if value:
-        return value
-    if not sys.stdin.isatty():
-        raise RuntimeError(
-            "Project encryption needs a local wrapping passphrase. "
-            "Pass --passphrase TEXT or set NAPSEER_PROJECT_PASSPHRASE."
-        )
-    first = getpass.getpass("Create project encryption passphrase: " if create else "Project encryption passphrase: ")
-    if create:
-        second = getpass.getpass("Confirm project encryption passphrase: ")
-        if first != second:
-            raise RuntimeError("project encryption passphrases did not match")
-    return first
-
-
 def vault_exists():
     return VAULT_PATH.exists()
 
@@ -731,6 +725,8 @@ def read_vault(passphrase, return_key=False):
     envelope = json.loads(VAULT_PATH.read_text(encoding="utf-8"))
     if envelope.get("schema") != VAULT_SCHEMA:
         raise ValueError("gateway unlock failed")
+    if envelope.get("format") == "plaintext-local" or "payload" in envelope:
+        raise ValueError("plaintext local gateway vault is unsupported; rerun gateway setup with a passphrase")
     kdf = envelope.get("kdf") or {}
     cipher = envelope.get("cipher") or {}
     if kdf.get("name") != "pbkdf2-sha256" or cipher.get("name") != "chacha20-poly1305":
@@ -1044,10 +1040,13 @@ def touch_gateway():
 
 
 def gateway_lock():
-    global VAULT_SECRETS, VAULT_KEY, GATEWAY_UNLOCKED, GATEWAY_LAST_USED_AT, AUTH, TOKEN, TOKEN_EXPIRES_AT
+    global VAULT_SECRETS, VAULT_KEY, GATEWAY_UNLOCKED, GATEWAY_LAST_USED_AT, AUTH, TOKEN, TOKEN_EXPIRES_AT, GATEWAY_PROJECT_BUNDLE_PASSPHRASE
     with GATEWAY_LOCK:
         VAULT_SECRETS = {}
         VAULT_KEY = None
+        GATEWAY_PROJECT_BUNDLE_PASSPHRASE = None
+        MEMORY_SECRET_CACHE.clear()
+        ACTIVE_MEMORY_SECRET_VERSIONS.clear()
         GATEWAY_UNLOCKED = False
         GATEWAY_LAST_USED_AT = None
         AUTH = load_auth()
@@ -1156,7 +1155,7 @@ def apply_vault_secrets(secrets_payload):
 
 
 def gateway_unlock(passphrase):
-    global VAULT_SECRETS, VAULT_KEY, GATEWAY_UNLOCKED, AUTH, BASE_URL, TOKEN, DEFAULT_PROJECT_ID, TOKEN_EXPIRES_AT
+    global VAULT_SECRETS, VAULT_KEY, GATEWAY_UNLOCKED, AUTH, BASE_URL, TOKEN, DEFAULT_PROJECT_ID, TOKEN_EXPIRES_AT, GATEWAY_PROJECT_BUNDLE_PASSPHRASE
     if not vault_exists():
         raise RuntimeError("gateway vault is not configured")
     try:
@@ -1193,6 +1192,7 @@ def gateway_unlock(passphrase):
         TOKEN = AUTH["token"]
         DEFAULT_PROJECT_ID = AUTH["project_id"]
         TOKEN_EXPIRES_AT = AUTH["token_expires_at"]
+        GATEWAY_PROJECT_BUNDLE_PASSPHRASE = str(passphrase)
         write_gateway_relay_secret(passphrase)
         persist_vault_secrets()
         touch_gateway()
@@ -3017,6 +3017,601 @@ if (op === 'decrypt') {
     return result.stdout
 
 
+def hkdf_sha256(ikm, salt, info, length):
+    if length <= 0:
+        raise RuntimeError("HKDF length must be positive")
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    output = b""
+    previous = b""
+    counter = 1
+    while len(output) < length:
+        previous = hmac.new(prk, previous + info + bytes([counter]), hashlib.sha256).digest()
+        output += previous
+        counter += 1
+    return output[:length]
+
+
+def stable_json_bytes(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def sha256_hex(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_token(data):
+    return f"sha256:{sha256_hex(data)}"
+
+
+def current_account_id():
+    account_id = str(AUTH.get("account_id") or AUTH.get("claimed_account_id") or "").strip()
+    if account_id:
+        return account_id
+    response = request_json("GET", "/v1/account")
+    account_id = str(response.get("id") or "").strip()
+    if not account_id:
+        raise RuntimeError("account_id is required for project key bundle wrapping")
+    AUTH["account_id"] = account_id
+    return account_id
+
+
+def project_bundle_passphrase():
+    if GATEWAY_PROJECT_BUNDLE_PASSPHRASE:
+        return GATEWAY_PROJECT_BUNDLE_PASSPHRASE
+    value = os.environ.get("NAPSEER_MASTER_PASSPHRASE")
+    if value:
+        return value
+    raise RuntimeError("gateway is locked; unlock before handling project key bundles")
+
+
+def project_bundle_hkdf_info(project_id, secret_kind, wrapping_epoch, bundle_version, data_key_epoch):
+    return (
+        "napseer.project-key-bundle.aead.v1"
+        f":project:{project_id}"
+        f":kind:{secret_kind}"
+        f":wrapping:{int(wrapping_epoch)}"
+        f":bundle:{int(bundle_version)}"
+        f":data-key:{int(data_key_epoch)}"
+    )
+
+
+def derive_project_bundle_aead_key(passphrase, salt, iterations, hkdf_info, kdf_output_len=PROJECT_BUNDLE_KDF_OUTPUT_LEN):
+    iterations = int(iterations)
+    if iterations < 600000:
+        raise RuntimeError("wrapped project key bundle KDF iterations are too low")
+    root = hashlib.pbkdf2_hmac("sha256", str(passphrase).encode("utf-8"), salt, iterations, dklen=int(kdf_output_len))
+    return hkdf_sha256(root, b"napseer.project-key-bundle.hkdf-salt.v1", str(hkdf_info).encode("utf-8"), 32)
+
+
+def project_bundle_aad(record):
+    return stable_json_bytes({
+        "schema": record["schema"],
+        "project_id": record["project_id"],
+        "account_id": record["account_id"],
+        "bundle_id": record["bundle_id"],
+        "wrapping_epoch": int(record["wrapping_epoch"]),
+        "bundle_version": int(record["bundle_version"]),
+        "data_key_epoch": int(record["data_key_epoch"]),
+        "created_by_client_id": record["created_by_client_id"],
+        "kdf": record["kdf"],
+        "kdf_params": record["kdf_params"],
+        "salt_b64": record["salt_b64"],
+        "kdf_output_len": int(record["kdf_output_len"]),
+        "expansion": record["expansion"],
+        "hkdf_info": record["hkdf_info"],
+        "aead_alg": record["aead_alg"],
+        "nonce_b64": record["nonce_b64"],
+        "aad_canonicalization": record["aad_canonicalization"],
+    })
+
+
+def generate_project_data_key_bundle(project_id, account_id, data_key_epoch=1, existing_bundle=None, rotate_kind=None):
+    now = iso_now()
+    bundle_id = str(uuid.uuid4())
+    keys = {}
+    existing_keys = (existing_bundle or {}).get("keys") if isinstance(existing_bundle, dict) else {}
+    for kind in GATEWAY_PROJECT_SECRET_KINDS:
+        kind_state = existing_keys.get(kind) if isinstance(existing_keys, dict) else None
+        if isinstance(kind_state, dict) and kind != rotate_kind:
+            keys[kind] = kind_state
+            continue
+        version = int(data_key_epoch)
+        key_id = f"{kind}:v{version}"
+        keys[kind] = {
+            "active_version": version,
+            "versions": {
+                str(version): {
+                    "key_id": key_id,
+                    "data_key_epoch": version,
+                    "alg": "AES-256-GCM",
+                    "key_b64": base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
+                    "created_at": now,
+                    "status": "active",
+                }
+            },
+        }
+    return {
+        "schema": PROJECT_DATA_KEY_BUNDLE_SCHEMA,
+        "project_id": str(project_id),
+        "account_id": str(account_id),
+        "bundle_id": bundle_id,
+        "data_key_epoch": int(data_key_epoch),
+        "keys": keys,
+    }
+
+
+def wrapped_project_key_bundle_record(
+    project_id,
+    account_id,
+    secret_kind,
+    plaintext_bundle,
+    wrapping_epoch=1,
+    bundle_version=1,
+    data_key_epoch=1,
+    salt=None,
+    nonce=None,
+    created_at=None,
+):
+    if secret_kind not in GATEWAY_PROJECT_SECRET_KINDS:
+        raise RuntimeError("secret_kind must be chat, tabs, gateway, or memory")
+    salt = salt if salt is not None else secrets.token_bytes(16)
+    nonce = nonce if nonce is not None else secrets.token_bytes(12)
+    if len(salt) < 16 or len(nonce) != 12:
+        raise RuntimeError("invalid project key bundle wrapping parameters")
+    hkdf_info = project_bundle_hkdf_info(project_id, secret_kind, wrapping_epoch, bundle_version, data_key_epoch)
+    record = {
+        "schema": WRAPPED_PROJECT_KEY_BUNDLE_SCHEMA,
+        "project_id": str(project_id),
+        "account_id": str(account_id),
+        "bundle_id": str(plaintext_bundle.get("bundle_id") or uuid.uuid4()),
+        "wrapping_epoch": int(wrapping_epoch),
+        "bundle_version": int(bundle_version),
+        "data_key_epoch": int(data_key_epoch),
+        "created_at": created_at or iso_now(),
+        "created_by_client_id": str(AUTH.get("agent_id") or AUTH.get("worker_id") or "gateway"),
+        "kdf": "PBKDF2-HMAC-SHA256",
+        "kdf_params": {"iterations": int(PROJECT_BUNDLE_KDF_ITERATIONS)},
+        "salt_b64": base64.b64encode(salt).decode("ascii"),
+        "kdf_output_len": PROJECT_BUNDLE_KDF_OUTPUT_LEN,
+        "expansion": "HKDF-SHA256",
+        "hkdf_info": hkdf_info,
+        "aead_alg": PROJECT_BUNDLE_AEAD_ALG,
+        "nonce_b64": base64.b64encode(nonce).decode("ascii"),
+        "aad_canonicalization": "json-sorted-keys-v1",
+        "status": "active",
+    }
+    aad = project_bundle_aad(record)
+    record["aad_hash"] = sha256_token(aad)
+    plaintext = stable_json_bytes(plaintext_bundle)
+    key = derive_project_bundle_aead_key(
+        project_bundle_passphrase(),
+        salt,
+        PROJECT_BUNDLE_KDF_ITERATIONS,
+        hkdf_info,
+        PROJECT_BUNDLE_KDF_OUTPUT_LEN,
+    )
+    ciphertext = aes_gcm_encrypt(key, nonce, aad, plaintext)
+    record["ciphertext_b64"] = base64.b64encode(ciphertext).decode("ascii")
+    record["ciphertext_sha256"] = sha256_token(ciphertext)
+    return record
+
+
+def unwrap_project_key_bundle(record):
+    if not isinstance(record, dict) or record.get("schema") != WRAPPED_PROJECT_KEY_BUNDLE_SCHEMA:
+        raise RuntimeError("wrapped project key bundle is unavailable")
+    if record.get("aead_alg") != "AES-256-GCM":
+        raise RuntimeError("wrapped project key bundle AEAD is unsupported")
+    aad = project_bundle_aad(record)
+    aad_hash = str(record.get("aad_hash") or "")
+    if aad_hash and aad_hash not in {sha256_hex(aad), sha256_token(aad)}:
+        raise RuntimeError("wrapped project key bundle is unavailable")
+    try:
+        salt = base64.b64decode(str(record.get("salt_b64") or ""), validate=True)
+        nonce = base64.b64decode(str(record.get("nonce_b64") or ""), validate=True)
+        ciphertext = base64.b64decode(str(record.get("ciphertext_b64") or ""), validate=True)
+    except Exception as exc:
+        raise RuntimeError("wrapped project key bundle is unavailable") from exc
+    ciphertext_hash = str(record.get("ciphertext_sha256") or "")
+    if ciphertext_hash and ciphertext_hash not in {sha256_hex(ciphertext), sha256_token(ciphertext)}:
+        raise RuntimeError("wrapped project key bundle is unavailable")
+    key = derive_project_bundle_aead_key(
+        project_bundle_passphrase(),
+        salt,
+        int((record.get("kdf_params") or {}).get("iterations") or 0),
+        str(record.get("hkdf_info") or ""),
+        int(record.get("kdf_output_len") or PROJECT_BUNDLE_KDF_OUTPUT_LEN),
+    )
+    plaintext = aes_gcm_decrypt(key, nonce, aad, ciphertext)
+    bundle = json.loads(plaintext.decode("utf-8"))
+    if not isinstance(bundle, dict) or bundle.get("schema") != PROJECT_DATA_KEY_BUNDLE_SCHEMA:
+        raise RuntimeError("wrapped project key bundle is unavailable")
+    return bundle
+
+
+def project_data_key_from_bundle(bundle, secret_kind, data_key_epoch):
+    keys = bundle.get("keys") if isinstance(bundle, dict) else None
+    kind_state = keys.get(secret_kind) if isinstance(keys, dict) else None
+    versions = kind_state.get("versions") if isinstance(kind_state, dict) else None
+    active_version = int(data_key_epoch or kind_state.get("active_version") or 0)
+    key_record = versions.get(str(active_version)) if isinstance(versions, dict) else None
+    if not isinstance(key_record, dict):
+        raise RuntimeError("project data key is unavailable")
+    try:
+        key = base64.b64decode(str(key_record.get("key_b64") or ""), validate=True)
+    except Exception as exc:
+        raise RuntimeError("project data key is unavailable") from exc
+    if len(key) < 32:
+        raise RuntimeError("project data key is unavailable")
+    return key
+
+
+def memory_legacy_envelope_subject(context):
+    full_path = str(context.get("full_path") or "").strip()
+    if full_path:
+        return {"full_path": normalize_node_path(full_path)}
+    node_id = str(context.get("node_id") or context.get("id") or "").strip()
+    if node_id:
+        return {"node_id": node_id}
+    raise RuntimeError("memory node encryption requires full_path or node id")
+
+
+def normalize_memory_aad_subject(subject):
+    if isinstance(subject, str):
+        subject = subject.strip()
+        if subject:
+            return subject
+    if isinstance(subject, dict):
+        node_id = str(subject.get("node_id") or subject.get("id") or "").strip()
+        if node_id:
+            return f"node_id:{node_id}"
+        encryption_id = str(subject.get("encryption_id") or "").strip()
+        if encryption_id:
+            return f"encryption_id:{encryption_id}"
+        full_path = str(subject.get("full_path") or "").strip()
+        if full_path:
+            return f"full_path:{normalize_node_path(full_path)}"
+    raise RuntimeError("encrypted memory AAD subject is unavailable")
+
+
+def memory_envelope_subject_for_write(context):
+    node_id = str(context.get("node_id") or context.get("id") or "").strip()
+    if node_id:
+        return f"node_id:{node_id}"
+    encryption_id = str(context.get("encryption_id") or "").strip()
+    if encryption_id:
+        return f"encryption_id:{encryption_id}"
+    return f"encryption_id:{uuid.uuid4()}"
+
+
+def memory_envelope_subject_for_read(envelope, context):
+    subject = envelope.get("aad_subject") if isinstance(envelope, dict) else None
+    if subject:
+        return normalize_memory_aad_subject(subject)
+    return memory_legacy_envelope_subject(context)
+
+
+def memory_aad(project_id, version, content_kind, subject):
+    if content_kind not in MEMORY_ENCRYPTED_CONTENT_KINDS:
+        raise RuntimeError("unsupported memory content kind")
+    return stable_json_bytes({
+        "project_id": str(project_id),
+        "secret_kind": MEMORY_SECRET_KIND,
+        "version": int(version),
+        "content_kind": content_kind,
+        "aad_subject": normalize_memory_aad_subject(subject),
+    })
+
+
+def legacy_memory_aad(project_id, version, content_kind, subject):
+    if content_kind not in MEMORY_ENCRYPTED_CONTENT_KINDS:
+        raise RuntimeError("unsupported memory content kind")
+    if not isinstance(subject, dict):
+        raise RuntimeError("encrypted memory AAD subject is unavailable")
+    aad = {
+        "project_id": str(project_id),
+        "secret_kind": MEMORY_SECRET_KIND,
+        "version": int(version),
+        "content_kind": content_kind,
+    }
+    node_id = str(subject.get("node_id") or subject.get("id") or "").strip()
+    encryption_id = str(subject.get("encryption_id") or "").strip()
+    full_path = str(subject.get("full_path") or "").strip()
+    if node_id:
+        aad["node_id"] = node_id
+    elif encryption_id:
+        aad["encryption_id"] = encryption_id
+    elif full_path:
+        aad["full_path"] = normalize_node_path(full_path)
+    else:
+        raise RuntimeError("encrypted memory AAD subject is unavailable")
+    return stable_json_bytes(aad)
+
+
+def derive_memory_aes_key(project_id, version, secret_bytes, content_kind, info_prefix=MEMORY_NODE_HKDF_INFO_PREFIX):
+    if len(secret_bytes) < 32:
+        raise RuntimeError("active memory secret is unavailable")
+    salt = f"napseer:{project_id}:memory:v{int(version)}".encode("utf-8")
+    info = f"{info_prefix}:{content_kind}".encode("utf-8")
+    return hkdf_sha256(secret_bytes, salt, info, 32)
+
+
+def memory_secret_cache_key(project_id):
+    return str(project_id or current_project_id()).strip()
+
+
+def memory_secret_cache_slot(project_id, version, wrapping_epoch, bundle_version, data_key_epoch):
+    project_id = memory_secret_cache_key(project_id)
+    return (
+        project_id,
+        MEMORY_SECRET_KIND,
+        int(version),
+        int(wrapping_epoch),
+        int(bundle_version),
+        int(data_key_epoch),
+    )
+
+
+def find_memory_secret_cache_slot(project_id, version):
+    project_id = memory_secret_cache_key(project_id)
+    version = int(version or 0)
+    for slot in MEMORY_SECRET_CACHE:
+        if len(slot) == 6 and slot[0] == project_id and slot[1] == MEMORY_SECRET_KIND and int(slot[2]) == version:
+            return slot
+    return None
+
+
+def normalize_memory_secret_response(project_id, response, unavailable_message):
+    if response.get("secret_kind") != MEMORY_SECRET_KIND:
+        raise RuntimeError(unavailable_message)
+    version = int(response.get("version") or response.get("project_secret_version") or 0)
+    if version <= 0:
+        raise RuntimeError(unavailable_message)
+    wrapping_epoch = int(response.get("wrapping_epoch") or 0)
+    bundle_version = int(response.get("bundle_version") or 0)
+    data_key_epoch = int(response.get("data_key_epoch") or 0)
+    if wrapping_epoch <= 0 or bundle_version <= 0 or data_key_epoch <= 0:
+        raise RuntimeError(unavailable_message)
+    wrapped_bundle = response.get("wrapped_key_bundle")
+    if not isinstance(wrapped_bundle, dict):
+        raise RuntimeError(unavailable_message)
+    if (
+        str(wrapped_bundle.get("project_id") or "") != str(project_id)
+        or int(wrapped_bundle.get("wrapping_epoch") or 0) != wrapping_epoch
+        or int(wrapped_bundle.get("bundle_version") or 0) != bundle_version
+        or int(wrapped_bundle.get("data_key_epoch") or 0) != data_key_epoch
+    ):
+        raise RuntimeError(unavailable_message)
+    try:
+        bundle = unwrap_project_key_bundle(wrapped_bundle)
+        secret_bytes = project_data_key_from_bundle(bundle, MEMORY_SECRET_KIND, data_key_epoch)
+    except Exception as exc:
+        raise RuntimeError(unavailable_message) from exc
+    return {
+        "project_id": project_id,
+        "secret_kind": MEMORY_SECRET_KIND,
+        "version": version,
+        "wrapping_epoch": wrapping_epoch,
+        "bundle_version": bundle_version,
+        "data_key_epoch": data_key_epoch,
+        "secret_bytes": secret_bytes,
+        "created_at": response.get("created_at") or "",
+        "last_rotated_at": response.get("last_rotated_at") or "",
+    }
+
+
+def active_memory_secret(project_id, force_refresh=False):
+    project_id = memory_secret_cache_key(project_id)
+    if not project_id:
+        raise RuntimeError("project_id is required")
+    active_slot = ACTIVE_MEMORY_SECRET_VERSIONS.get(project_id)
+    cached = MEMORY_SECRET_CACHE.get(active_slot) if active_slot else None
+    if cached and not force_refresh:
+        return cached
+    response = request_json(
+        "GET",
+        f"/v1/projects/{project_id}/vault/secrets/{MEMORY_SECRET_KIND}/active",
+    )
+    secret = normalize_memory_secret_response(project_id, response, "active memory secret is unavailable")
+    slot = memory_secret_cache_slot(project_id, secret["version"], secret["wrapping_epoch"], secret["bundle_version"], secret["data_key_epoch"])
+    MEMORY_SECRET_CACHE[slot] = secret
+    ACTIVE_MEMORY_SECRET_VERSIONS[project_id] = slot
+    return secret
+
+
+def versioned_memory_secret(project_id, version):
+    project_id = memory_secret_cache_key(project_id)
+    version = int(version or 0)
+    if version <= 0:
+        raise RuntimeError("encrypted memory content is unavailable: missing memory secret version")
+    cached_slot = find_memory_secret_cache_slot(project_id, version)
+    cached = MEMORY_SECRET_CACHE.get(cached_slot) if cached_slot else None
+    if cached:
+        return cached
+    response = request_json(
+        "GET",
+        f"/v1/projects/{project_id}/vault/secrets/{MEMORY_SECRET_KIND}/versions/{version}",
+    )
+    secret = normalize_memory_secret_response(project_id, response, "versioned memory secret is unavailable")
+    if int(secret["version"]) != version:
+        raise RuntimeError("versioned memory secret is unavailable")
+    slot = memory_secret_cache_slot(project_id, version, secret["wrapping_epoch"], secret["bundle_version"], secret["data_key_epoch"])
+    MEMORY_SECRET_CACHE[slot] = secret
+    return secret
+
+
+def memory_secret_for_read(project_id, version):
+    project_id = memory_secret_cache_key(project_id)
+    version = int(version or 0)
+    if version <= 0:
+        raise RuntimeError("encrypted memory content is unavailable: missing memory secret version")
+    cached_slot = find_memory_secret_cache_slot(project_id, version)
+    cached = MEMORY_SECRET_CACHE.get(cached_slot) if cached_slot else None
+    if cached:
+        return cached
+    active = active_memory_secret(project_id)
+    if int(active["version"]) == version:
+        return active
+    return versioned_memory_secret(project_id, version)
+
+
+def project_encryption_state_strict(project_id):
+    return request_json("GET", f"/v1/projects/{project_id}/encryption/status").get("state") or "plaintext"
+
+
+def project_memory_encryption_active(project_id):
+    return project_encryption_state_strict(project_id) == "encrypted"
+
+
+def encrypt_memory_bytes(project_id, secret, content_kind, plaintext_bytes, context, content_type):
+    if not plaintext_bytes:
+        plaintext_bytes = b""
+    if context.get("nonce_b64"):
+        nonce = base64.b64decode(str(context.get("nonce_b64")), validate=True)
+    else:
+        nonce = secrets.token_bytes(12)
+    if len(nonce) != 12:
+        raise RuntimeError("encrypted memory content is unavailable")
+    aad_subject = memory_envelope_subject_for_write(context)
+    aad = memory_aad(project_id, secret["version"], content_kind, aad_subject)
+    key = derive_memory_aes_key(project_id, secret["version"], secret["secret_bytes"], content_kind)
+    ciphertext = aes_gcm_encrypt(key, nonce, aad, plaintext_bytes)
+    return {
+        "schema_version": 1,
+        "alg": "AES-GCM-256",
+        "nonce_b64": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext_b64": base64.b64encode(ciphertext).decode("ascii"),
+        "payload_size_bytes": len(ciphertext),
+        "active_project_secret_version": secret["version"],
+        "key_id": f"memory:v{secret['version']}:{content_kind}",
+        "content_type": content_type,
+        "aad_subject": aad_subject,
+        "aad_hash": hashlib.sha256(aad).hexdigest(),
+        "ciphertext_sha256": hashlib.sha256(ciphertext).hexdigest(),
+    }
+
+
+def decrypt_memory_envelope(project_id, secret, content_kind, envelope, context):
+    if not isinstance(envelope, dict):
+        raise RuntimeError("encrypted memory content is unavailable")
+    if envelope.get("schema_version") != 1 or envelope.get("alg") != "AES-GCM-256":
+        raise RuntimeError("encrypted memory content is unavailable")
+    if int(envelope.get("active_project_secret_version") or 0) != int(secret["version"]):
+        raise RuntimeError("encrypted memory content is unavailable")
+    try:
+        nonce = base64.b64decode(str(envelope.get("nonce_b64") or ""), validate=True)
+        ciphertext = base64.b64decode(str(envelope.get("ciphertext_b64") or ""), validate=True)
+    except Exception as exc:
+        raise RuntimeError("encrypted memory content is unavailable") from exc
+    if len(nonce) != 12 or not ciphertext:
+        raise RuntimeError("encrypted memory content is unavailable")
+    ciphertext_hash = envelope.get("ciphertext_sha256")
+    if isinstance(ciphertext_hash, str) and ciphertext_hash and ciphertext_hash != hashlib.sha256(ciphertext).hexdigest():
+        raise RuntimeError("encrypted memory content is unavailable")
+    attempts = [(memory_aad(project_id, secret["version"], content_kind, memory_envelope_subject_for_read(envelope, context)), MEMORY_NODE_HKDF_INFO_PREFIX)]
+    if isinstance(envelope.get("aad_subject"), dict):
+        attempts.append((legacy_memory_aad(project_id, secret["version"], content_kind, envelope["aad_subject"]), MEMORY_NODE_LEGACY_HKDF_INFO_PREFIX))
+    elif not envelope.get("aad_subject"):
+        attempts.append((legacy_memory_aad(project_id, secret["version"], content_kind, memory_legacy_envelope_subject(context)), MEMORY_NODE_LEGACY_HKDF_INFO_PREFIX))
+    aad_hash = envelope.get("aad_hash")
+    for aad, info_prefix in attempts:
+        if isinstance(aad_hash, str) and aad_hash and aad_hash != hashlib.sha256(aad).hexdigest():
+            continue
+        try:
+            key = derive_memory_aes_key(project_id, secret["version"], secret["secret_bytes"], content_kind, info_prefix=info_prefix)
+            return aes_gcm_decrypt(key, nonce, aad, ciphertext)
+        except Exception:
+            continue
+    raise RuntimeError("encrypted memory content is unavailable")
+
+
+def memory_node_context_from_payload(payload, existing=None):
+    if isinstance(existing, dict) and existing.get("id"):
+        return {"node_id": existing["id"]}
+    folder_path = payload.get("folder_path")
+    name = payload.get("name")
+    if name:
+        full_path = f"{str(folder_path or '/').rstrip('/')}/{name}".replace("//", "/")
+        return {"full_path": full_path}
+    if payload.get("path"):
+        return {"full_path": payload["path"]}
+    if isinstance(existing, dict) and existing.get("id"):
+        return {"node_id": existing["id"]}
+    raise RuntimeError("memory node encryption requires node path context")
+
+
+def encrypt_node_payload_for_write(project_id, payload, existing=None):
+    if not project_memory_encryption_active(project_id):
+        return payload
+    secret = active_memory_secret(project_id)
+    encrypted = dict(payload)
+    context = memory_node_context_from_payload(encrypted, existing=existing)
+    if "content_text" in encrypted:
+        plaintext = str(encrypted.get("content_text") or "").encode("utf-8")
+        encrypted["encrypted_content_envelope"] = encrypt_memory_bytes(
+            project_id,
+            secret,
+            "node_content",
+            plaintext,
+            context,
+            "text/plain; charset=utf-8",
+        )
+        encrypted["content_text"] = ""
+    elif not existing:
+        encrypted["encrypted_content_envelope"] = encrypt_memory_bytes(
+            project_id,
+            secret,
+            "node_content",
+            b"",
+            context,
+            "text/plain; charset=utf-8",
+        )
+        encrypted["content_text"] = ""
+    if "metadata" in encrypted and encrypted.get("metadata"):
+        metadata_bytes = stable_json_bytes(encrypted.get("metadata") or {})
+        encrypted["encrypted_metadata_envelope"] = encrypt_memory_bytes(
+            project_id,
+            secret,
+            "node_metadata",
+            metadata_bytes,
+            context,
+            "application/json; charset=utf-8",
+        )
+    encrypted["metadata"] = {}
+    encrypted["encryption_state"] = "encrypted"
+    encrypted["project_secret_version"] = secret["version"]
+    encrypted["wrapping_epoch"] = secret["wrapping_epoch"]
+    encrypted["bundle_version"] = secret["bundle_version"]
+    encrypted["data_key_epoch"] = secret["data_key_epoch"]
+    return encrypted
+
+
+def decrypt_node_for_return(node, project_id=None):
+    if not isinstance(node, dict) or node.get("encryption_state") != "encrypted":
+        return node
+    project_id = str(project_id or node.get("project_id") or current_project_id() or "").strip()
+    if not project_id:
+        raise RuntimeError("project_id is required to decrypt encrypted memory node")
+    secret_version = node.get("project_secret_version")
+    if not secret_version and isinstance(node.get("encrypted_content_envelope"), dict):
+        secret_version = node["encrypted_content_envelope"].get("active_project_secret_version")
+    secret = memory_secret_for_read(project_id, secret_version)
+    context = {"full_path": node.get("full_path")} if node.get("full_path") else {"node_id": node.get("id")}
+    decrypted = dict(node)
+    content_envelope = decrypted.get("encrypted_content_envelope")
+    if content_envelope:
+        content = decrypt_memory_envelope(project_id, secret, "node_content", content_envelope, context)
+        decrypted["content_text"] = content.decode("utf-8")
+    metadata_envelope = decrypted.get("encrypted_metadata_envelope")
+    if metadata_envelope:
+        metadata = decrypt_memory_envelope(project_id, secret, "node_metadata", metadata_envelope, context)
+        decrypted["metadata"] = json.loads(metadata.decode("utf-8"))
+    return decrypted
+
+
+def decrypt_nodes_for_return(nodes, project_id=None):
+    return [decrypt_node_for_return(node, project_id=project_id) for node in (nodes or [])]
+
+
 def decrypt_relay_frame(key, frame_text, context_hash, relay_lane, expected_direction, expected_seq):
     envelope = json.loads(frame_text)
     if (
@@ -3052,140 +3647,27 @@ def encrypt_relay_frame(key, session_id, payload, context_hash, relay_lane, dire
     }, separators=(",", ":"))
 
 
-def gateway_project_secret_aad(project_id, secret_kind, version):
-    return f"napseer.project-secret.v1:{project_id}:{secret_kind}:{int(version)}".encode("utf-8")
-
-
-def gateway_vault_master_wrap_aad(project_id, credential_id):
-    return f"napseer.vault-master-wrap.v1:{project_id}:{credential_id}".encode("utf-8")
-
-
-def project_key_wrap_aad(project_id, credential_id):
-    return f"napseer.project-key-wrap.v1:{project_id}:{credential_id}".encode("utf-8")
-
-
-def local_wrapped_project_key(project_id, passphrase=None, project_key=None):
-    project_id = str(project_id or current_project_id()).strip()
-    if not project_id:
-        raise RuntimeError("project_id is required")
-    passphrase = passphrase or read_project_passphrase(create=True)
-    if not isinstance(passphrase, str) or not passphrase:
-        raise RuntimeError("project encryption passphrase is required")
-    project_key = project_key or secrets.token_bytes(32)
-    credential_id = f"local-passphrase:{AUTH.get('agent_id') or 'local'}"
-    salt = secrets.token_bytes(16)
-    nonce = secrets.token_bytes(12)
-    wrapping_key = hashlib.pbkdf2_hmac(
-        "sha256",
-        passphrase.encode("utf-8"),
-        salt,
-        PROJECT_KEY_KDF_ITERATIONS,
-        dklen=32,
-    )
-    aad = project_key_wrap_aad(project_id, credential_id)
-    packed = aes_gcm_encrypt(wrapping_key, nonce, aad, project_key)
-    return {
-        "credential_id": credential_id,
-        "wrapped_project_key_b64": base64.b64encode(packed).decode("ascii"),
-        "wrap_alg": "AES-GCM-256",
-        "kdf_alg": "PBKDF2-SHA256",
-        "salt_b64": base64.b64encode(salt).decode("ascii"),
-        "kdf_params": {
-            "source": "local_passphrase",
-            "iterations": PROJECT_KEY_KDF_ITERATIONS,
-            "aad_hash": hashlib.sha256(aad).hexdigest(),
-            "nonce_b64": base64.b64encode(nonce).decode("ascii"),
-            "runtime": "nap-cli",
-        },
-    }
-
-
-def gateway_project_secret_envelope(project_id, secret_kind, version, vault_master_secret, secret_material):
-    nonce = secrets.token_bytes(12)
-    aad = gateway_project_secret_aad(project_id, secret_kind, version)
-    packed = aes_gcm_encrypt(vault_master_secret, nonce, aad, secret_material)
-    return {
-        "schema_version": 1,
-        "alg": "AES-GCM-256",
-        "nonce_b64": base64.b64encode(nonce).decode("ascii"),
-        "ciphertext_b64": base64.b64encode(packed).decode("ascii"),
-        "payload_size_bytes": len(packed),
-        "key_id": f"vault-master:{project_id}:v1",
-        "content_type": f"application/vnd.napseer.project-secret.{secret_kind}+bytes",
-        "aad_hash": hashlib.sha256(aad).hexdigest(),
-        "ciphertext_sha256": hashlib.sha256(packed).hexdigest(),
-    }
-
-
-def gateway_wrapped_vault_master_secret(project_id, vault_master_secret):
-    if not VAULT_KEY:
-        raise RuntimeError("gateway is locked; unlock before wrapping project vault secrets")
-    credential_id = f"gateway-vault:{AUTH.get('agent_id') or 'local'}"
-    nonce = secrets.token_bytes(12)
-    aad = gateway_vault_master_wrap_aad(project_id, credential_id)
-    packed = aes_gcm_encrypt(VAULT_KEY, nonce, aad, vault_master_secret)
-    return {
-        "credential_id": credential_id,
-        "wrapped_project_key_b64": base64.b64encode(packed).decode("ascii"),
-        "wrap_alg": "AES-GCM-256",
-        "kdf_alg": "PBKDF2-SHA256",
-        "kdf_params": {
-            "source": "gateway_vault",
-            "iterations": VAULT_KDF_ITERATIONS,
-            "aad_hash": hashlib.sha256(aad).hexdigest(),
-            "nonce_b64": base64.b64encode(nonce).decode("ascii"),
-            "runtime": "gateway",
-        },
-    }
-
-
-def gateway_project_vault_state():
-    state = VAULT_SECRETS.get("project_vaults")
-    if isinstance(state, dict):
-        return state
-    state = {}
-    VAULT_SECRETS["project_vaults"] = state
-    return state
-
-
 def gateway_generate_project_vault_setup_payload(project_id, setup_request_id):
     project_id = str(project_id or current_project_id()).strip()
     if not project_id:
         raise RuntimeError("project_id is required")
-    vault_master_secret = secrets.token_bytes(32)
-    project_secret_records = {}
+    account_id = current_account_id()
+    plaintext_bundle = generate_project_data_key_bundle(project_id, account_id, data_key_epoch=1)
     project_secrets = []
     for secret_kind in GATEWAY_PROJECT_SECRET_KINDS:
-        secret_material = secrets.token_bytes(32)
-        project_secret_records[secret_kind] = {
-            "version": 1,
-            "secret_b64": base64.b64encode(secret_material).decode("ascii"),
-            "created_at": iso_now(),
-        }
         project_secrets.append({
             "secret_kind": secret_kind,
-            "encrypted_secret_envelope": gateway_project_secret_envelope(
+            "wrapped_key_bundle": wrapped_project_key_bundle_record(
                 project_id,
+                account_id,
                 secret_kind,
-                1,
-                vault_master_secret,
-                secret_material,
+                plaintext_bundle,
+                wrapping_epoch=1,
+                bundle_version=1,
+                data_key_epoch=1,
             ),
         })
-    project_vaults = gateway_project_vault_state()
-    project_vaults[project_id] = {
-        "version": 1,
-        "setup_request_id": str(setup_request_id or ""),
-        "vault_master_secret_b64": base64.b64encode(vault_master_secret).decode("ascii"),
-        "project_secrets": project_secret_records,
-        "created_at": iso_now(),
-        "updated_at": iso_now(),
-    }
-    persist_vault_secrets()
-    return {
-        "wrapped_master_secret": gateway_wrapped_vault_master_secret(project_id, vault_master_secret),
-        "project_secrets": project_secrets,
-    }
+    return {"project_secrets": project_secrets}
 
 
 def gateway_vault_setup_requests(args=None):
@@ -3290,41 +3772,52 @@ def gateway_rotate_project_vault_secret(args=None):
     project_id = str(args.get("project_id") or current_project_id()).strip()
     secret_kind = str(args.get("secret_kind") or args.get("kind") or "chat").strip().lower()
     if secret_kind not in GATEWAY_PROJECT_SECRET_KINDS:
-        raise RuntimeError("secret_kind must be chat, tabs, or gateway")
-    project_vault = gateway_project_vault_state().get(project_id)
-    if not isinstance(project_vault, dict):
-        raise RuntimeError("project vault is not initialized on this gateway")
-    vault_master_secret = base64.b64decode(project_vault.get("vault_master_secret_b64") or "", validate=True)
-    if len(vault_master_secret) != 32:
-        raise RuntimeError("project vault master secret is invalid")
-    project_secrets = project_vault.setdefault("project_secrets", {})
-    current = project_secrets.get(secret_kind) if isinstance(project_secrets, dict) else {}
-    current_version = int((current or {}).get("version") or 1)
-    next_version = current_version + 1
-    secret_material = secrets.token_bytes(32)
-    envelope = gateway_project_secret_envelope(project_id, secret_kind, next_version, vault_master_secret, secret_material)
+        raise RuntimeError("secret_kind must be chat, tabs, gateway, or memory")
+    current = request_json("GET", f"/v1/projects/{project_id}/vault/secrets/{urllib.parse.quote(secret_kind, safe='')}/active")
+    if current.get("secret_kind") != secret_kind:
+        raise RuntimeError("active project secret is unavailable")
+    account_id = current_account_id()
+    current_bundle = unwrap_project_key_bundle(current.get("wrapped_key_bundle"))
+    wrapping_epoch = int(current.get("wrapping_epoch") or 0)
+    bundle_version = int(current.get("bundle_version") or 0) + 1
+    data_key_epoch = int(current.get("data_key_epoch") or 0) + 1
+    if wrapping_epoch <= 0 or bundle_version <= 1 or data_key_epoch <= 1:
+        raise RuntimeError("active project secret is unavailable")
+    plaintext_bundle = generate_project_data_key_bundle(
+        project_id,
+        account_id,
+        data_key_epoch=data_key_epoch,
+        existing_bundle=current_bundle,
+        rotate_kind=secret_kind,
+    )
     result = request_project_write(
         "POST",
         f"/v1/projects/{project_id}/vault/secrets/{urllib.parse.quote(secret_kind, safe='')}/rotate",
-        {"encrypted_secret_envelope": envelope},
+        {
+            "wrapped_key_bundle": wrapped_project_key_bundle_record(
+                project_id,
+                account_id,
+                secret_kind,
+                plaintext_bundle,
+                wrapping_epoch=wrapping_epoch,
+                bundle_version=bundle_version,
+                data_key_epoch=data_key_epoch,
+            ),
+        },
         project_id,
         f"rotate {secret_kind} project secret",
         scope_type="encryption",
     )
-    project_secrets[secret_kind] = {
-        "version": int(result.get("version") or next_version),
-        "secret_b64": base64.b64encode(secret_material).decode("ascii"),
-        "created_at": iso_now(),
-        "rotated_from_version": current_version,
-    }
-    project_vault["updated_at"] = iso_now()
-    project_vault["last_rotation_at"] = iso_now()
-    persist_vault_secrets()
+    if secret_kind == MEMORY_SECRET_KIND:
+        ACTIVE_MEMORY_SECRET_VERSIONS.pop(project_id, None)
+        for slot in list(MEMORY_SECRET_CACHE):
+            if len(slot) >= 2 and slot[0] == project_id and slot[1] == MEMORY_SECRET_KIND:
+                MEMORY_SECRET_CACHE.pop(slot, None)
     gateway_log(
         "project_vault_secret_rotated",
         project_id=project_id,
         secret_kind=secret_kind,
-        version=project_secrets[secret_kind]["version"],
+        version=result.get("version"),
     )
     return result
 
@@ -4465,6 +4958,7 @@ def load_auth(public_override=None, secret_override=None):
     merged = {**data, **secrets_map}
     return {
         "base_url": os.environ.get("NAPSEER_BASE_URL") or merged.get("base_url") or "https://api.napseer.com",
+        "account_id": os.environ.get("NAPSEER_ACCOUNT_ID") or merged.get("account_id") or merged.get("claimed_account_id"),
         "token": os.environ.get("NAPSEER_TOKEN") or merged.get("token") or merged.get("access_token"),
         "token_expires_at": merged.get("token_expires_at"),
         "local_auth_secret": os.environ.get("NAPSEER_LOCAL_AUTH_SECRET") or merged.get("local_auth_secret"),
@@ -4808,7 +5302,9 @@ def index_node(node):
             tags = node.get("tags") or []
             aliases = node.get("aliases") or []
             links = node.get("links") or []
-            metadata = node.get("metadata") or {}
+            encrypted = node.get("encryption_state") == "encrypted"
+            metadata = {} if encrypted else (node.get("metadata") or {})
+            content_text = "" if encrypted else (node.get("content_text") or "")
             conn.execute(
                 """
                 INSERT INTO local_index_nodes (
@@ -4858,7 +5354,7 @@ def index_node(node):
                     " ".join(aliases),
                     " ".join(flatten_index_values(links)),
                     " ".join(flatten_index_values(metadata)),
-                    node.get("content_text") or "",
+                    content_text,
                 ),
             )
     finally:
@@ -5947,20 +6443,13 @@ def bootstrap_project(args):
     encryption = str(args.get("encryption") or "plaintext").strip().lower()
     if encryption not in {"plaintext", "encrypted"}:
         raise RuntimeError("encryption must be plaintext or encrypted")
-    if encryption == "encrypted" and not str(args.get("passphrase") or "").strip():
-        raise RuntimeError("project passphrase is required when encryption is enabled")
+    if encryption == "encrypted":
+        raise RuntimeError(
+            "CLI direct project encryption enable is disabled for backend-owned HashiCorp project secrets. "
+            "Use the backend/gateway setup-request flow when available."
+        )
     project, project_status, message = create_project_with_state(args)
     encryption_state = "plaintext"
-    if encryption == "encrypted":
-        wrapped_project_key = local_wrapped_project_key(project["id"], passphrase=args.get("passphrase"))
-        status = request_project_write(
-            "POST",
-            f"/v1/projects/{project['id']}/encryption/enable",
-            {"state": "encrypted", "wrapped_project_key": wrapped_project_key},
-            project["id"],
-            "enable project encryption",
-        )
-        encryption_state = status.get("state") or "encrypted"
     return {
         "status": project_status,
         "message": message,
@@ -6002,11 +6491,14 @@ def project_encryption_transition(args=None):
     desired = aliases.get(requested)
     if desired is None:
         raise RuntimeError("project encryption mode must be plaintext or encrypted")
-    project_id = resolve_project_id(args)
-    operation = "enable" if desired == "encrypted" else "disable"
-    payload = {"state": desired}
     if desired == "encrypted":
-        payload["wrapped_project_key"] = local_wrapped_project_key(project_id, passphrase=args.get("passphrase"))
+        raise RuntimeError(
+            "CLI direct project encryption enable is disabled for backend-owned HashiCorp project secrets. "
+            "Use the backend/gateway setup-request flow when available."
+        )
+    project_id = resolve_project_id(args)
+    operation = "disable"
+    payload = {"state": desired}
     result = request_project_write(
         "POST",
         f"/v1/projects/{project_id}/encryption/{operation}",
@@ -6421,7 +6913,8 @@ def get_node_by_path(args, allow_agent=False):
     params = {"path": path}
     if args.get("view"):
         params["view"] = args["view"]
-    return request_json("GET", f"/v1/projects/{project_id}/nodes/by-path?{urllib.parse.urlencode(params)}")
+    node = request_json("GET", f"/v1/projects/{project_id}/nodes/by-path?{urllib.parse.urlencode(params)}")
+    return decrypt_node_for_return(node, project_id=project_id)
 
 
 def node_get(args):
@@ -6438,6 +6931,12 @@ def guarded_node_patch(args):
     if not args.get("dry_run"):
         if not precondition.get("revision") or not precondition.get("read_fingerprint"):
             raise RuntimeError("precondition.revision and precondition.read_fingerprint are required for nap_node_patch")
+    if project_memory_encryption_active(project_id):
+        set_fields = args.get("set") if isinstance(args.get("set"), dict) else {}
+        if args.get("content_op") or args.get("merge_metadata") or args.get("remove_metadata_keys") or "metadata" in set_fields:
+            raise RuntimeError(
+                "nap_node_patch cannot safely patch encrypted content or metadata; use nap_tee or nap_patch with replacement fields"
+            )
     payload = {"precondition": precondition}
     for key in [
         "mode",
@@ -6518,26 +7017,26 @@ def upsert_node(args):
         updated = request_project_write(
             "PATCH",
             f"/v1/projects/{project_id}/nodes/{existing['id']}",
-            node_payload_from_args(args, existing=existing),
+            encrypt_node_payload_for_write(project_id, node_payload_from_args(args, existing=existing), existing=existing),
             project_id,
             f"update node {existing['full_path']}",
             "path",
             existing["full_path"],
         )
         index_node(updated)
-        return {"created": False, "node": updated}
+        return {"created": False, "node": decrypt_node_for_return(updated, project_id=project_id)}
     write_path = normalize_node_path(args["path"])
     created = request_project_write(
         "POST",
         f"/v1/projects/{project_id}/nodes",
-        node_payload_from_args(args),
+        encrypt_node_payload_for_write(project_id, node_payload_from_args(args)),
         project_id,
         f"create node {args['path']}",
         "path",
         write_path,
     )
     index_node(created)
-    return {"created": True, "node": created}
+    return {"created": True, "node": decrypt_node_for_return(created, project_id=project_id)}
 
 
 def update_node_by_path(args):
@@ -6547,14 +7046,14 @@ def update_node_by_path(args):
     updated = request_project_write(
         "PATCH",
         f"/v1/projects/{project_id}/nodes/{existing['id']}",
-        node_payload_from_args(args, existing=existing),
+        encrypt_node_payload_for_write(project_id, node_payload_from_args(args, existing=existing), existing=existing),
         project_id,
         f"update node {existing['full_path']}",
         "path",
         existing["full_path"],
     )
     index_node(updated)
-    return {"updated": True, "node": updated}
+    return {"updated": True, "node": decrypt_node_for_return(updated, project_id=project_id)}
 
 
 def archive_node_by_path(args):
@@ -6667,7 +7166,7 @@ def list_project_nodes(args):
             query["limit"] = max(1, limit - len(unique_nodes(collected)))
             suffix = f"?{urllib.parse.urlencode(query)}"
             page = request_json("GET", f"/v1/projects/{project_id}/nodes{suffix}")
-            items = filter_project_nodes(page.get("items", []))
+            items = decrypt_nodes_for_return(filter_project_nodes(page.get("items", [])), project_id=project_id)
             diagnostics["server_queries"].append({"q": server_query, "matched": len(items)})
             for node in items:
                 node = dict(node)
@@ -6682,7 +7181,7 @@ def list_project_nodes(args):
     query = urllib.parse.urlencode(base_query)
     suffix = f"?{query}" if query else ""
     result = request_json("GET", f"/v1/projects/{project_id}/nodes{suffix}")
-    result["items"] = filter_project_nodes(result.get("items", []))
+    result["items"] = decrypt_nodes_for_return(filter_project_nodes(result.get("items", [])), project_id=project_id)
     return result
 
 
@@ -7163,6 +7662,7 @@ def bulk_upsert_nodes(args):
             reject_agent_namespace_path(path)
             existing = try_get_node_by_path(path)
             payload = node_payload_from_args(item, existing=existing)
+            payload = encrypt_node_payload_for_write(project_id, payload, existing=existing)
             if existing:
                 saved = request_json("PATCH", f"/v1/projects/{project_id}/nodes/{existing['id']}", payload, extra_headers=headers)
                 created = False
@@ -7170,7 +7670,7 @@ def bulk_upsert_nodes(args):
                 saved = request_json("POST", f"/v1/projects/{project_id}/nodes", payload, extra_headers=headers)
                 created = True
             index_node(saved)
-            results.append({"created": created, "node": saved})
+            results.append({"created": created, "node": decrypt_node_for_return(saved, project_id=project_id)})
     finally:
         try:
             release_project_lock({"lock_id": lock["id"], "lease_token": lock["lease_token"]})
@@ -8302,7 +8802,7 @@ def raw_tools():
         },
         {
             "name": "nap_gateway_status",
-            "description": "Show whether the local gateway vault is configured and unlocked. Does not reveal secrets.",
+            "description": "Show whether the encrypted local gateway vault is configured and unlocked. Does not reveal secrets.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
         {
@@ -8350,7 +8850,7 @@ def raw_tools():
         },
         {
             "name": "nap_gateway_vault_setup_process",
-            "description": "Complete pending project vault setup requests assigned to this unlocked gateway by generating local secret material and sending only encrypted envelopes to Napseer.",
+            "description": "Complete pending project vault setup requests assigned to this unlocked gateway by uploading opaque client-wrapped key bundle records for backend-owned HashiCorp storage.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -8362,13 +8862,13 @@ def raw_tools():
         },
         {
             "name": "nap_gateway_vault_secret_rotate",
-            "description": "Rotate one project secret version from the unlocked gateway local vault and submit only the encrypted envelope to Napseer.",
+            "description": "Rotate one project secret version from the unlocked gateway by uploading an opaque client-wrapped key bundle record for backend-owned HashiCorp storage.",
             "inputSchema": {
                 "type": "object",
                 "required": ["secret_kind"],
                 "properties": {
                     "project_id": {"type": "string"},
-                    "secret_kind": {"type": "string", "enum": ["chat", "tabs", "gateway"]},
+                    "secret_kind": {"type": "string", "enum": ["chat", "tabs", "gateway", "memory"]},
                 },
                 "additionalProperties": False,
             },
@@ -8525,7 +9025,7 @@ def raw_tools():
         },
         {
             "name": "nap_grep_local",
-            "description": "Search the local SQLite FTS index, including decrypted private fields that only exist on this machine.",
+            "description": "Search the local SQLite FTS index. Encrypted nodes are indexed by safe path, name, tags, aliases, and links only.",
             "inputSchema": {
                 "type": "object",
                 "required": ["q"],
@@ -8548,7 +9048,7 @@ def raw_tools():
         },
         {
             "name": "nap_grep",
-            "description": "Preferred search tool. Hybrid search over server-indexed fields and local SQLite FTS private-content index.",
+            "description": "Preferred search tool. Hybrid search over server-indexed fields and the local SQLite FTS safe metadata index.",
             "inputSchema": {
                 "type": "object",
                 "required": ["q"],
@@ -9554,24 +10054,25 @@ def call_tool_impl(name, args):
         project_id = resolve_project_id(args)
         folder_path = args.get("folder_path", "/agent/memory")
         reject_agent_namespace_path(f"{folder_path}/{args['name']}")
+        payload = {
+            "folder_path": folder_path,
+            "name": args["name"],
+            "type": args.get("type", "note"),
+            "tags": args.get("tags", []),
+            "aliases": args.get("aliases", []),
+            "links": args.get("links", []),
+            "metadata": args.get("metadata", {}),
+            "content_text": args["content_text"],
+        }
         node = request_project_write(
             "POST",
             f"/v1/projects/{project_id}/nodes",
-            {
-                "folder_path": folder_path,
-                "name": args["name"],
-                "type": args.get("type", "note"),
-                "tags": args.get("tags", []),
-                "aliases": args.get("aliases", []),
-                "links": args.get("links", []),
-                "metadata": args.get("metadata", {}),
-                "content_text": args["content_text"],
-            },
+            encrypt_node_payload_for_write(project_id, payload),
             project_id,
             f"create node {folder_path}/{args['name']}",
         )
         index_node(node)
-        return node
+        return decrypt_node_for_return(node, project_id=project_id)
     if name == "nap_tee":
         return upsert_node(args)
     if name == "nap_patch":
@@ -9914,7 +10415,7 @@ def cli_main(argv):
             action = args[0] if args else "status"
             vault_args = args[1:] if args else []
             if action in {"help", "-h", "--help"}:
-                print("Usage: napseer_mcp_server.py gateway vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway] [--all] [--project-id ID]")
+                print("Usage: napseer_mcp_server.py gateway vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway|memory] [--all] [--project-id ID]")
                 return
             payload = {
                 "project_id": cli_option(vault_args, "--project-id", default=None),
@@ -9950,7 +10451,7 @@ def cli_main(argv):
         if subcommand == "lock":
             print(json.dumps(gateway_lock(), indent=2))
             return
-        print("Usage: napseer_mcp_server.py gateway [status|configure [--command CMD] [--target session:window.pane]|vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway] [--all]|terminal [list|create|close|capture|input]|schedule [list|create|update|delete|run]|restart [--passphrase TEXT]|kill [--passphrase TEXT]|setup|rotate-passphrase --new-passphrase TEXT|unlock|lock]")
+        print("Usage: napseer_mcp_server.py gateway [status|configure [--command CMD] [--target session:window.pane]|vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway|memory] [--all]|terminal [list|create|close|capture|input]|schedule [list|create|update|delete|run]|restart [--passphrase TEXT]|kill [--passphrase TEXT]|setup|rotate-passphrase --new-passphrase TEXT|unlock|lock]")
         return
     if command == "feedback":
         subcommand = argv[2] if len(argv) > 2 else "list"
