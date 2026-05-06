@@ -82,12 +82,15 @@ KNOWN_LIFECYCLE_STATUSES = {
 }
 SUMMARY_METADATA_KEYS = {
     "/plans": ["status", "priority", "scope", "owner", "agent_owner", "implementation_allowed", "blocked_by"],
+    "/kanban": ["status", "column", "priority", "owner", "assignee", "blocked", "blocked_by", "lifecycle_state", "rank", "order", "due_date"],
     "/decisions": ["status", "date", "decision_category", "decision_area", "supersedes", "superseded_by"],
     "/implementation-notes": ["status", "date", "repos", "verification_summary"],
     "/reviews": ["status", "date", "severity_counts"],
     "/rules": ["status", "scope", "source"],
     "/tasks": ["status", "priority", "blocked_by", "owner", "assignee"],
 }
+KANBAN_DONE_STATUSES = {"done", "cancelled", "archived"}
+DEFAULT_KANBAN_COLUMNS = ["backlog", "todo", "doing", "review", "done"]
 
 from napseer_spake2 import (
     relay_aad,
@@ -7380,6 +7383,410 @@ def list_project_nodes(args):
     )
 
 
+def list_active_plans(args):
+    view, _warnings = normalize_discovery_view(args)
+    if view == "full":
+        raise RuntimeError("nap_plan_list_active supports paths, summary, or metadata views; use nap_cat for full plan bodies")
+    query = {
+        **args,
+        "folder_path": args.get("folder_path") or "/plans",
+        "active_only": True,
+        "include_archived": False,
+        "archived_only": False,
+        "view": view,
+        "limit": normalize_int(args.get("limit"), 25, 1, 100),
+    }
+    return list_project_nodes(query)
+
+
+def kanban_column_from_path(full_path):
+    normalized = normalize_node_path(full_path)
+    parts = [part for part in normalized.strip("/").split("/") if part]
+    if len(parts) >= 2 and parts[0] == "kanban":
+        return parts[1]
+    return None
+
+
+def kanban_column(node):
+    metadata = node_metadata(node)
+    value = metadata.get("column") or kanban_column_from_path(node.get("full_path") or "")
+    return str(value).strip() if value not in (None, "") else None
+
+
+def kanban_owner(node):
+    metadata = node_metadata(node)
+    value = metadata.get("owner") or metadata.get("assignee")
+    return str(value).strip() if value not in (None, "") else None
+
+
+def kanban_priority(node):
+    value = node_metadata(node).get("priority")
+    return str(value).strip() if value not in (None, "") else None
+
+
+def kanban_blocked(node):
+    metadata = node_metadata(node)
+    return as_bool(metadata.get("blocked") if "blocked" in metadata else metadata.get("blocking"), False)
+
+
+def kanban_lifecycle_state(node):
+    metadata = node_metadata(node)
+    value = metadata.get("lifecycle_state") or metadata.get("state")
+    return str(value).strip() if value not in (None, "") else None
+
+
+def kanban_text_matches(node, query):
+    query = str(query or "").strip().lower()
+    if not query:
+        return True
+    haystack = " ".join(
+        str(value or "")
+        for value in [
+            node.get("full_path"),
+            node.get("name"),
+            node.get("type"),
+            " ".join(node.get("tags") or []),
+            json.dumps(node_metadata(node), sort_keys=True),
+            node.get("content_text"),
+            node.get("preview"),
+            node.get("snippet"),
+        ]
+    ).lower()
+    return query in haystack
+
+
+def kanban_card_active(node):
+    if node_archived(node):
+        return False
+    status = node_status(node)
+    column = kanban_column(node)
+    lifecycle_state = kanban_lifecycle_state(node)
+    return not any(value in KANBAN_DONE_STATUSES for value in [status, column, lifecycle_state] if value)
+
+
+def list_kanban_cards(args):
+    project_id = resolve_project_id(args)
+    view, view_warnings = normalize_discovery_view(args)
+    if view == "full":
+        raise RuntimeError("nap_kanban_list supports paths, summary, or metadata views; use nap_cat for full card bodies")
+    limit = normalize_int(args.get("limit"), 25, 1, 100)
+    preview_chars = normalize_int(args.get("preview_chars"), 240, 80, 1000)
+    active_only = as_bool(args.get("active_only"), True)
+    column_filter = set(normalize_string_list(args.get("column") or args.get("columns")))
+    status_filter = set(normalize_string_list(args.get("status")))
+    priority_filter = set(normalize_string_list(args.get("priority")))
+    owner_filter = set(normalize_string_list(args.get("owner") or args.get("assignee")))
+    blocked_filter = args.get("blocked")
+    if blocked_filter is None:
+        blocked_filter = args.get("blocking")
+    group_by = str(args.get("group_by") or "column").strip().lower()
+    if group_by not in {"column", "status", "priority", "owner", "blocked"}:
+        raise RuntimeError("group_by must be column, status, priority, owner, or blocked")
+
+    source_args = {
+        "q": "/kanban",
+        "limit": limit,
+        "view": "full",
+        "active_only": False,
+        "include_archived": not active_only,
+        "archived_only": False,
+    }
+    raw = list_project_nodes(source_args)
+    items = []
+    for node in raw.get("items", []):
+        full_path = normalize_node_path(node.get("full_path") or "")
+        if not full_path.startswith("/kanban/"):
+            continue
+        column = kanban_column(node)
+        status = node_status(node)
+        priority = kanban_priority(node)
+        owner = kanban_owner(node)
+        blocked = kanban_blocked(node)
+        if active_only and not kanban_card_active(node):
+            continue
+        if column_filter and column not in column_filter:
+            continue
+        if status_filter and status not in status_filter:
+            continue
+        if priority_filter and priority not in priority_filter:
+            continue
+        if owner_filter and owner not in owner_filter:
+            continue
+        if blocked_filter is not None and blocked != as_bool(blocked_filter, False):
+            continue
+        if not kanban_text_matches(node, args.get("q")):
+            continue
+        enriched = dict(node)
+        enriched["column"] = column
+        if priority is not None:
+            enriched["priority"] = priority
+        if owner is not None:
+            enriched["owner"] = owner
+        enriched["blocked"] = blocked
+        items.append(enriched)
+        if len(items) >= limit:
+            break
+
+    summarized = [summarize_node(node, view=view, preview_chars=preview_chars) for node in items]
+    for item, node in zip(summarized, items):
+        if node.get("column") is not None:
+            item["column"] = node["column"]
+        if node.get("priority") is not None:
+            item["priority"] = node["priority"]
+        if node.get("owner") is not None:
+            item["owner"] = node["owner"]
+        item["blocked"] = bool(node.get("blocked"))
+    groups = {}
+    for item, node in zip(summarized, items):
+        if group_by == "column":
+            key = node.get("column") or "uncategorized"
+        elif group_by == "status":
+            key = node_status(node) or "unset"
+        elif group_by == "priority":
+            key = kanban_priority(node) or "unset"
+        elif group_by == "owner":
+            key = kanban_owner(node) or "unassigned"
+        else:
+            key = "blocked" if kanban_blocked(node) else "unblocked"
+        groups.setdefault(key, []).append(item)
+    response = {
+        "ok": True,
+        "project_id": project_id,
+        "view": view,
+        "kanban_root": "/kanban",
+        "group_by": group_by,
+        "items": summarized,
+        "groups": groups,
+        "next_cursor": None,
+        "has_more": False,
+        "truncated": bool(raw.get("truncated") or raw.get("has_more") or raw.get("next_cursor")),
+        "omitted_fields": ["content_text"],
+        "budget": {"limit": limit, "max_limit": 100, "preview_chars": preview_chars},
+        "filters": {
+            "active_only": active_only,
+            "column": sorted(column_filter),
+            "status": sorted(status_filter),
+            "priority": sorted(priority_filter),
+            "owner": sorted(owner_filter),
+            "blocked": as_bool(blocked_filter, False) if blocked_filter is not None else None,
+        },
+    }
+    if as_bool(args.get("verbose"), False):
+        response["diagnostics"] = {
+            "source": "nodes",
+            "source_query": {"q": "/kanban", "view": "full"},
+            "source_item_count": len(raw.get("items", [])),
+            "default_columns": DEFAULT_KANBAN_COLUMNS,
+        }
+        if view_warnings:
+            response["warnings"] = view_warnings
+    return response
+
+
+def link_present(links, path, relation):
+    return any(
+        isinstance(item, dict)
+        and normalize_node_path(item.get("path") or "") == normalize_node_path(path)
+        and str(item.get("relation") or "references") == relation
+        for item in links or []
+    )
+
+
+def add_link_once(links, path, relation):
+    items = [dict(item) for item in links or [] if isinstance(item, dict)]
+    normalized = normalize_node_path(path)
+    if not link_present(items, normalized, relation):
+        items.append({"path": normalized, "relation": relation})
+    return items
+
+
+def add_tags_once(tags, additions):
+    return unique_preserve_order(list(tags or []) + list(additions or []))
+
+
+def find_archived_node_by_path(path):
+    normalized = normalize_node_path(path)
+    result = list_project_nodes({"archived_only": True, "q": normalized, "limit": 200, "view": "full"})
+    for node in result.get("items", []):
+        if normalize_node_path(node.get("full_path") or "") == normalized:
+            return node
+    return None
+
+
+def get_plan_for_lifecycle(path):
+    normalized = normalize_node_path(path)
+    if not normalized.startswith("/plans/"):
+        raise RuntimeError("plan lifecycle helpers only operate on /plans/* nodes")
+    try:
+        node = get_node_by_path({"path": normalized})
+        return node, False
+    except RuntimeError as exc:
+        if "HTTP 404" not in str(exc) and "node not found" not in str(exc):
+            raise
+        archived = find_archived_node_by_path(normalized)
+        if archived:
+            return archived, True
+        raise
+
+
+def plan_lifecycle_matches(node, *, status, target_path=None, metadata_key=None, link_relation=None):
+    metadata = node_metadata(node)
+    if node_status(node) != status:
+        return False
+    if target_path and metadata_key and normalize_node_path(metadata.get(metadata_key) or "") != normalize_node_path(target_path):
+        return False
+    if target_path and link_relation and not link_present(node.get("links") or [], target_path, link_relation):
+        return False
+    return True
+
+
+def plan_lifecycle_result(action, path, node, archived, changed, dry_run, planned_changes=None, warnings=None):
+    return {
+        "ok": True,
+        "action": action,
+        "path": normalize_node_path(path),
+        "status": node_status(node),
+        "changed": bool(changed),
+        "dry_run": bool(dry_run),
+        "archived": bool(archived),
+        "planned_changes": planned_changes or [],
+        "warnings": warnings or [],
+    }
+
+
+def complete_plan(args):
+    return plan_lifecycle_update(
+        args,
+        action="complete",
+        terminal_status="completed",
+        required_target_key="outcome_path",
+        metadata_target_key="outcome_path",
+        timestamp_key="completed_at",
+        reason_key="completion_reason",
+        link_relation="implemented-by",
+        terminal_tags=["completed", "archived"],
+    )
+
+
+def supersede_plan(args):
+    return plan_lifecycle_update(
+        args,
+        action="supersede",
+        terminal_status="superseded",
+        required_target_key="replacement_path",
+        metadata_target_key="superseded_by",
+        timestamp_key="superseded_at",
+        reason_key="supersede_reason",
+        link_relation="superseded-by",
+        terminal_tags=["superseded", "archived"],
+        require_reason=True,
+    )
+
+
+def cancel_plan(args):
+    return plan_lifecycle_update(
+        args,
+        action="cancel",
+        terminal_status="cancelled",
+        required_target_key=None,
+        metadata_target_key=None,
+        timestamp_key="cancelled_at",
+        reason_key="cancel_reason",
+        link_relation=None,
+        terminal_tags=["cancelled", "archived"],
+        require_reason=True,
+    )
+
+
+def plan_lifecycle_update(args, *, action, terminal_status, required_target_key, metadata_target_key, timestamp_key, reason_key, link_relation, terminal_tags, require_reason=False):
+    path = normalize_node_path(args.get("path") or "")
+    if not path or path == "/":
+        raise RuntimeError("path is required")
+    target_path = normalize_node_path(args.get(required_target_key)) if required_target_key else None
+    if required_target_key and not args.get(required_target_key):
+        raise RuntimeError(f"{required_target_key} is required")
+    reason = str(args.get("reason") or args.get("notes") or "").strip()
+    if require_reason and not reason:
+        raise RuntimeError("reason is required")
+    dry_run = as_bool(args.get("dry_run"), False)
+    node, already_archived = get_plan_for_lifecycle(path)
+
+    already_terminal = plan_lifecycle_matches(
+        node,
+        status=terminal_status,
+        target_path=target_path,
+        metadata_key=metadata_target_key,
+        link_relation=link_relation,
+    )
+    if already_terminal and already_archived:
+        return plan_lifecycle_result(action, path, node, True, False, dry_run)
+    if target_path and not already_terminal:
+        if try_get_node_by_path(target_path, allow_agent=is_agent_namespace_path(target_path)) is None:
+            raise RuntimeError(f"target node not found: {target_path}")
+
+    metadata = dict(node_metadata(node))
+    links = node.get("links") if isinstance(node.get("links"), list) else []
+    tags = list(node.get("tags") or [])
+    now = iso_now()
+    planned_changes = []
+
+    if metadata.get("status") != terminal_status:
+        metadata["status"] = terminal_status
+        planned_changes.append(f"set metadata.status={terminal_status}")
+    if not metadata.get(timestamp_key):
+        metadata[timestamp_key] = now
+        planned_changes.append(f"set metadata.{timestamp_key}")
+    if reason and metadata.get(reason_key) != reason:
+        metadata[reason_key] = reason
+        planned_changes.append(f"set metadata.{reason_key}")
+    if args.get("notes") and metadata.get("lifecycle_notes") != args.get("notes"):
+        metadata["lifecycle_notes"] = args.get("notes")
+        planned_changes.append("set metadata.lifecycle_notes")
+    if target_path and metadata_target_key and normalize_node_path(metadata.get(metadata_target_key) or "") != target_path:
+        metadata[metadata_target_key] = target_path
+        planned_changes.append(f"set metadata.{metadata_target_key}")
+    missing_tags = [tag for tag in terminal_tags if tag not in tags]
+    if missing_tags:
+        tags = add_tags_once(tags, missing_tags)
+        planned_changes.append(f"add tags: {', '.join(missing_tags)}")
+    if target_path and link_relation and not link_present(links, target_path, link_relation):
+        links = add_link_once(links, target_path, link_relation)
+        planned_changes.append(f"add {link_relation} link")
+
+    if not already_archived:
+        planned_changes.append("archive node")
+    if dry_run:
+        preview = dict(node)
+        preview["metadata"] = metadata
+        preview["tags"] = tags
+        preview["links"] = links
+        return plan_lifecycle_result(action, path, preview, already_archived, bool(planned_changes), True, planned_changes)
+    if already_archived:
+        return plan_lifecycle_result(
+            action,
+            path,
+            node,
+            True,
+            False,
+            False,
+            warnings=["plan is already archived; metadata cannot be changed through active node update"],
+        )
+
+    updated = node
+    if planned_changes != ["archive node"]:
+        updated = update_node_by_path({"path": path, "metadata": metadata, "tags": tags, "links": links}).get("node") or updated
+    archive_result = archive_node_by_path({"path": path})
+    return plan_lifecycle_result(
+        action,
+        path,
+        updated,
+        bool(archive_result.get("archived")),
+        True,
+        False,
+        planned_changes,
+    )
+
+
 def list_folders(args):
     project_id = resolve_project_id(args)
     return request_json("GET", f"/v1/projects/{project_id}/folders")
@@ -9103,6 +9510,49 @@ def raw_tools():
             },
         },
         {
+            "name": "nap_plan_list_active",
+            "description": "List active /plans nodes as compact summaries by default. Completed, superseded, cancelled, and archived plans are excluded.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "folder_path": {"type": "string", "default": "/plans"},
+                    "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "exclude_status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 25},
+                    "cursor": {"type": "string"},
+                    "view": {"type": "string", "enum": ["paths", "summary", "metadata"], "default": "summary"},
+                    "verbose": {"type": "boolean", "default": False},
+                    "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "nap_kanban_list",
+            "description": "List node-based kanban cards under /kanban, grouped and filtered without using ticket tables.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "q": {"type": "string"},
+                    "column": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "columns": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "priority": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "owner": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "assignee": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "blocked": {"type": "boolean"},
+                    "blocking": {"type": "boolean"},
+                    "active_only": {"type": "boolean", "default": True},
+                    "group_by": {"type": "string", "enum": ["column", "status", "priority", "owner", "blocked"], "default": "column"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 25},
+                    "view": {"type": "string", "enum": ["paths", "summary", "metadata"], "default": "summary"},
+                    "verbose": {"type": "boolean", "default": False},
+                    "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "nap_context",
             "description": "Fetch one or more nodes plus bounded outgoing links and backlinks for surrounding context.",
             "inputSchema": {
@@ -9374,6 +9824,56 @@ def raw_tools():
                 "type": "object",
                 "required": ["path"],
                 "properties": {"path": {"type": "string"}, "dry_run": {"type": "boolean", "default": False}},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "nap_plan_complete",
+            "description": "Mark a /plans node completed, link it to an outcome, add terminal tags, and archive it so active plan discovery excludes it.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "outcome_path"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "outcome_path": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "notes": {"type": "string"},
+                    "dry_run": {"type": "boolean", "default": False},
+                    "verbose": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "nap_plan_supersede",
+            "description": "Mark a /plans node superseded by another plan/node, add terminal tags and link, then archive it.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "replacement_path", "reason"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "replacement_path": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "notes": {"type": "string"},
+                    "dry_run": {"type": "boolean", "default": False},
+                    "verbose": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "nap_plan_cancel",
+            "description": "Mark a /plans node cancelled with a reason, add terminal tags, and archive it.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path", "reason"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "notes": {"type": "string"},
+                    "dry_run": {"type": "boolean", "default": False},
+                    "verbose": {"type": "boolean", "default": False},
+                },
                 "additionalProperties": False,
             },
         },
@@ -9652,6 +10152,8 @@ TOOL_CATEGORIES = {
         "nap_contract",
         "nap_grep",
         "nap_find",
+        "nap_plan_list_active",
+        "nap_kanban_list",
         "nap_context",
         "nap_tree",
         "nap_stat",
@@ -9673,6 +10175,9 @@ TOOL_CATEGORIES = {
         "nap_patch",
         "nap_node_patch",
         "nap_rm",
+        "nap_plan_complete",
+        "nap_plan_supersede",
+        "nap_plan_cancel",
         "nap_ln",
         "nap_mv",
         "nap_mv_folder",
@@ -9735,6 +10240,8 @@ READ_ONLY_TOOLS = {
     "nap_index_status",
     "nap_grep",
     "nap_find",
+    "nap_plan_list_active",
+    "nap_kanban_list",
     "nap_context",
     "nap_tree",
     "nap_stat",
@@ -9775,6 +10282,9 @@ AUTO_LOCK_TOOLS = {
     "nap_patch",
     "nap_node_patch",
     "nap_rm",
+    "nap_plan_complete",
+    "nap_plan_supersede",
+    "nap_plan_cancel",
     "nap_ln",
     "nap_mv",
     "nap_mv_folder",
@@ -9813,7 +10323,16 @@ def tool_auth_mode(name):
 
 def tool_contract_metadata(name):
     side_effect = tool_side_effect(name)
-    dry_run_supported = name in {"nap_rm", "nap_mv", "nap_mv_folder", "nap_bulk", "nap_node_patch"}
+    dry_run_supported = name in {
+        "nap_rm",
+        "nap_mv",
+        "nap_mv_folder",
+        "nap_bulk",
+        "nap_node_patch",
+        "nap_plan_complete",
+        "nap_plan_supersede",
+        "nap_plan_cancel",
+    }
     return {
         "contract_version": CONTRACT_VERSION,
         "category": tool_category(name),
@@ -10057,6 +10576,10 @@ def call_tool_impl(name, args):
         return search_memory(args)
     if name == "nap_find":
         return list_project_nodes(args)
+    if name == "nap_plan_list_active":
+        return list_active_plans(args)
+    if name == "nap_kanban_list":
+        return list_kanban_cards(args)
     if name == "nap_context":
         return get_memory_context(args)
     if name == "nap_tree":
@@ -10118,6 +10641,12 @@ def call_tool_impl(name, args):
         return guarded_node_patch(args)
     if name == "nap_rm":
         return archive_node_by_path(args)
+    if name == "nap_plan_complete":
+        return complete_plan(args)
+    if name == "nap_plan_supersede":
+        return supersede_plan(args)
+    if name == "nap_plan_cancel":
+        return cancel_plan(args)
     if name == "nap_cat":
         return get_node_by_path(args)
     if name == "nap_ln":
