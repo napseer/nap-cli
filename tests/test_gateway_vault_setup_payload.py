@@ -72,8 +72,16 @@ def run():
     assert "secret_b64" not in str(mod.VAULT_SECRETS)
 
     tools = {tool["name"]: tool for tool in mod.raw_tools()}
-    assert "transient secret_b64" not in tools["nap_gateway_vault_setup_process"]["description"]
-    assert "opaque client-wrapped key bundle records" in tools["nap_gateway_vault_setup_process"]["description"]
+    assert "nap_gateway_vault_ls" in tools
+    assert "nap_gateway_vault_process" in tools
+    assert "nap_gateway_vault_" + "setup_ls" not in tools
+    assert "nap_gateway_vault_" + "setup_process" not in tools
+    assert not [name for name in tools if name.startswith("napseer_")]
+    assert not [
+        tool for tool in mod.tools() if tool.get("napseer", {}).get("replaces")
+    ]
+    assert "transient secret_b64" not in tools["nap_gateway_vault_process"]["description"]
+    assert "opaque client-wrapped key bundle records" in tools["nap_gateway_vault_process"]["description"]
     assert "transient secret_b64" not in tools["nap_gateway_vault_secret_rotate"]["description"]
     assert "opaque client-wrapped key bundle record" in tools["nap_gateway_vault_secret_rotate"]["description"]
 
@@ -165,7 +173,19 @@ def run():
     assert calls[0][0] == "POST"
     assert calls[0][1] == f"/v1/projects/{PROJECT_ID}/vault/secrets/chat/rotate"
     assert calls[0][5] == "encryption"
-    assert set(calls[0][2]) == {"wrapped_key_bundle"}
+    assert set(calls[0][2]) == {
+        "previous_wrapping_epoch",
+        "previous_bundle_version",
+        "previous_data_key_epoch",
+        "previous_aad_hash",
+        "previous_ciphertext_sha256",
+        "wrapped_key_bundle",
+    }
+    assert calls[0][2]["previous_wrapping_epoch"] == 1
+    assert calls[0][2]["previous_bundle_version"] == 1
+    assert calls[0][2]["previous_data_key_epoch"] == 1
+    assert calls[0][2]["previous_aad_hash"] == active_bundle["aad_hash"]
+    assert calls[0][2]["previous_ciphertext_sha256"] == active_bundle["ciphertext_sha256"]
     assert_wrapped_record(mod, calls[0][2]["wrapped_key_bundle"], "chat", data_key_epoch=2)
     assert "secret_b64" not in str(calls[0][2])
     assert mod.VAULT_SECRETS == local_before

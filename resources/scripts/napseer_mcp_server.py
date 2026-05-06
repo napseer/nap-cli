@@ -49,6 +49,46 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+DISCOVERY_VIEWS = {"paths", "summary", "metadata", "full"}
+ACTIVE_EXCLUDED_STATUSES = {
+    "completed",
+    "complete_verified_uncommitted",
+    "complete_pending_human_e2e",
+    "superseded",
+    "cancelled",
+    "archived",
+    "done",
+}
+KNOWN_LIFECYCLE_STATUSES = {
+    "active",
+    "archived",
+    "backlog",
+    "blocked",
+    "cancelled",
+    "completed",
+    "complete_pending_human_e2e",
+    "complete_verified_uncommitted",
+    "current",
+    "doing",
+    "done",
+    "draft",
+    "in_progress",
+    "pending",
+    "planned",
+    "review",
+    "reviewed_plan",
+    "superseded",
+    "todo",
+}
+SUMMARY_METADATA_KEYS = {
+    "/plans": ["status", "priority", "scope", "owner", "agent_owner", "implementation_allowed", "blocked_by"],
+    "/decisions": ["status", "date", "decision_category", "decision_area", "supersedes", "superseded_by"],
+    "/implementation-notes": ["status", "date", "repos", "verification_summary"],
+    "/reviews": ["status", "date", "severity_counts"],
+    "/rules": ["status", "scope", "source"],
+    "/tasks": ["status", "priority", "blocked_by", "owner", "assignee"],
+}
+
 from napseer_spake2 import (
     relay_aad,
     relay_context_hash,
@@ -359,8 +399,8 @@ PUBLIC_TOOLS = {
     "nap_gateway_unlock",
     "nap_gateway_lock",
     "nap_gateway_configure",
-    "nap_gateway_vault_setup_ls",
-    "nap_gateway_vault_setup_process",
+    "nap_gateway_vault_ls",
+    "nap_gateway_vault_process",
     "nap_gateway_vault_secret_rotate",
     "nap_gateway_restart",
     "nap_gateway_kill",
@@ -412,64 +452,6 @@ PUBLIC_TOOLS = {
     "nap_crontab_register_key",
     "nap_crontab_put",
 }
-OLD_TOOL_RENAMES = {
-    "napseer_auth_status": "nap_whoami",
-    "napseer_gateway_status": "nap_gateway_status",
-    "napseer_gateway_setup": "nap_gateway_setup",
-    "napseer_gateway_configure": "nap_gateway_configure",
-    "napseer_gateway_unlock": "nap_gateway_unlock",
-    "napseer_gateway_lock": "nap_gateway_lock",
-    "napseer_gateway_restart": "nap_gateway_restart",
-    "napseer_gateway_kill": "nap_gateway_kill",
-    "napseer_renew_auth": "nap_login",
-    "napseer_update_status": "nap_update_status",
-    "napseer_update_self": "nap_update_self",
-    "napseer_explore_tools": "nap_apropos",
-    "napseer_contract_profile": "nap_contract",
-    "napseer_acquire_lock": "nap_lock_acquire",
-    "napseer_renew_lock": "nap_lock_renew",
-    "napseer_release_lock": "nap_lock_release",
-    "napseer_list_locks": "nap_lock_ls",
-    "napseer_reindex_project": "nap_reindex_project",
-    "napseer_search_local": "nap_grep_local",
-    "napseer_index_status": "nap_index_status",
-    "napseer_clear_local_index": "nap_index_clear",
-    "napseer_search_memory": "nap_grep",
-    "napseer_get_memory_context": "nap_context",
-    "napseer_find_related_nodes": "nap_find_related",
-    "napseer_recent_memory": "nap_recent",
-    "napseer_list_folders": "nap_ls_folders",
-    "napseer_list_tags": "nap_ls_tags",
-    "napseer_move_node": "nap_mv",
-    "napseer_move_folder": "nap_mv_folder",
-    "napseer_bulk_upsert_nodes": "nap_bulk",
-    "napseer_create_project": "nap_project_create",
-    "napseer_create_node": "nap_create_node",
-    "napseer_upsert_node": "nap_tee",
-    "napseer_update_node_by_path": "nap_patch",
-    "napseer_get_node_edit": "nap_node_get",
-    "napseer_patch_node_guarded": "nap_node_patch",
-    "napseer_archive_node_by_path": "nap_rm",
-    "napseer_get_node_by_path": "nap_cat",
-    "napseer_link_nodes": "nap_ln",
-    "napseer_get_backlinks": "nap_backlinks",
-    "napseer_list_nodes": "nap_ls",
-    "napseer_list_agent_nodes": "nap_agent_ls",
-    "napseer_get_agent_node": "nap_agent_cat",
-    "napseer_upsert_agent_node": "nap_agent_tee",
-    "napseer_update_agent_node": "nap_agent_patch",
-    "napseer_archive_agent_node": "nap_agent_rm",
-    "napseer_link_agent_node": "nap_agent_ln",
-    "napseer_submit_feedback": "nap_feedback_submit",
-    "napseer_list_feedback": "nap_feedback_ls",
-    "napseer_admin_list_feedback": "nap_feedback_admin_ls",
-    "napseer_update_feedback_status": "nap_feedback_resolve",
-    "napseer_claim_account": "nap_claim_account",
-    "napseer_register_project_signing_key": "nap_crontab_register_key",
-    "napseer_create_signed_schedule": "nap_crontab_put",
-    "napseer_open_ui": "nap_ui_open",
-}
-NEW_TOOL_REPLACES = {new: old for old, new in OLD_TOOL_RENAMES.items()}
 VAULT_SCHEMA = "napseer.vault.v1"
 GATEWAY_RELAY_SECRET_SCHEMA = "napseer.gateway-relay-secret.v1"
 GATEWAY_RELAY_STATE_SCHEMA = "napseer.gateway-relay-state.v1"
@@ -3777,10 +3759,13 @@ def gateway_rotate_project_vault_secret(args=None):
     if current.get("secret_kind") != secret_kind:
         raise RuntimeError("active project secret is unavailable")
     account_id = current_account_id()
-    current_bundle = unwrap_project_key_bundle(current.get("wrapped_key_bundle"))
+    current_wrapped_bundle = current.get("wrapped_key_bundle")
+    current_bundle = unwrap_project_key_bundle(current_wrapped_bundle)
     wrapping_epoch = int(current.get("wrapping_epoch") or 0)
-    bundle_version = int(current.get("bundle_version") or 0) + 1
-    data_key_epoch = int(current.get("data_key_epoch") or 0) + 1
+    previous_bundle_version = int(current.get("bundle_version") or 0)
+    previous_data_key_epoch = int(current.get("data_key_epoch") or 0)
+    bundle_version = previous_bundle_version + 1
+    data_key_epoch = previous_data_key_epoch + 1
     if wrapping_epoch <= 0 or bundle_version <= 1 or data_key_epoch <= 1:
         raise RuntimeError("active project secret is unavailable")
     plaintext_bundle = generate_project_data_key_bundle(
@@ -3794,6 +3779,11 @@ def gateway_rotate_project_vault_secret(args=None):
         "POST",
         f"/v1/projects/{project_id}/vault/secrets/{urllib.parse.quote(secret_kind, safe='')}/rotate",
         {
+            "previous_wrapping_epoch": wrapping_epoch,
+            "previous_bundle_version": previous_bundle_version,
+            "previous_data_key_epoch": previous_data_key_epoch,
+            "previous_aad_hash": current_wrapped_bundle.get("aad_hash"),
+            "previous_ciphertext_sha256": current_wrapped_bundle.get("ciphertext_sha256"),
             "wrapped_key_bundle": wrapped_project_key_bundle_record(
                 project_id,
                 account_id,
@@ -3846,7 +3836,7 @@ def start_gateway_vault_setup_thread():
     if GATEWAY_VAULT_SETUP_THREAD_STARTED:
         return
     GATEWAY_VAULT_SETUP_THREAD_STARTED = True
-    threading.Thread(target=gateway_vault_setup_loop, name="napseer-gateway-vault-setup", daemon=True).start()
+    threading.Thread(target=gateway_vault_setup_loop, name="napseer-gateway-vault", daemon=True).start()
 
 
 def handle_gateway_relay_session(connect_request, listener_sock=None):
@@ -5043,6 +5033,188 @@ def reject_agent_namespace_path(value, label="path"):
 
 def filter_project_nodes(nodes):
     return [node for node in (nodes or []) if not is_agent_namespace_path(node.get("full_path") or "")]
+
+
+def as_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
+def normalize_int(value, default, minimum, maximum):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def normalize_string_list(value):
+    if value in (None, ""):
+        return []
+    values = value if isinstance(value, list) else [value]
+    normalized = []
+    for item in values:
+        for part in str(item).split(","):
+            part = part.strip()
+            if part:
+                normalized.append(part)
+    return unique_preserve_order(normalized)
+
+
+def normalize_discovery_view(args, default="summary"):
+    requested = str(args.get("view") or "").strip().lower()
+    warnings = []
+    if requested:
+        if requested not in DISCOVERY_VIEWS:
+            raise RuntimeError("view must be paths, summary, metadata, or full")
+        return requested, warnings
+    if as_bool(args.get("include_content"), False):
+        return "full", warnings
+    return default, warnings
+
+
+def node_metadata(node):
+    metadata = node.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def node_status(node):
+    if node.get("status") not in (None, ""):
+        return str(node.get("status")).strip()
+    value = node_metadata(node).get("status")
+    if value in (None, "") and isinstance(node.get("metadata_summary"), dict):
+        value = node["metadata_summary"].get("status")
+    return str(value).strip() if value not in (None, "") else None
+
+
+def node_archived(node):
+    return bool(node.get("archived_at")) or node_status(node) == "archived"
+
+
+def status_filter_from_args(args):
+    statuses = normalize_string_list(args.get("status"))
+    excluded = normalize_string_list(args.get("exclude_status"))
+    active_only = as_bool(args.get("active_only"), False)
+    warnings = []
+    for status in statuses + excluded:
+        if status not in KNOWN_LIFECYCLE_STATUSES:
+            warnings.append(f"unknown metadata.status filter: {status}")
+    return {"status": statuses, "exclude_status": excluded, "active_only": active_only, "warnings": warnings}
+
+
+def apply_status_filters(nodes, filters):
+    items = []
+    status_set = set(filters.get("status") or [])
+    excluded = set(filters.get("exclude_status") or [])
+    if filters.get("active_only"):
+        excluded = excluded | ACTIVE_EXCLUDED_STATUSES
+    for node in nodes:
+        status = node_status(node)
+        if filters.get("active_only") and node_archived(node):
+            continue
+        if status_set and status not in status_set:
+            continue
+        if status and status in excluded:
+            continue
+        items.append(node)
+    return items
+
+
+def preview_text(value, limit):
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def metadata_summary(node):
+    metadata = node_metadata(node)
+    if not metadata and isinstance(node.get("metadata_summary"), dict):
+        return dict(node["metadata_summary"])
+    folder = node.get("folder_path") or ""
+    keys = []
+    for prefix, prefix_keys in SUMMARY_METADATA_KEYS.items():
+        if folder == prefix or folder.startswith(f"{prefix}/"):
+            keys.extend(prefix_keys)
+            break
+    keys.extend(["status", "date", "priority", "scope", "owner"])
+    return {key: metadata[key] for key in unique_preserve_order(keys) if key in metadata}
+
+
+def summarize_node(node, view="summary", preview_chars=240):
+    if view == "full":
+        return node
+    metadata = node_metadata(node)
+    status = node_status(node)
+    if view == "paths":
+        item = {
+            "full_path": node.get("full_path"),
+            "type": node.get("type"),
+            "status": status,
+            "updated_at": node.get("updated_at"),
+        }
+        if node_archived(node):
+            item["archived"] = True
+        return {key: value for key, value in item.items() if value not in (None, "")}
+
+    item = {
+        "id": node.get("id"),
+        "project_id": node.get("project_id"),
+        "full_path": node.get("full_path"),
+        "type": node.get("type"),
+        "name": node.get("name"),
+        "folder_path": node.get("folder_path"),
+        "tags": node.get("tags") or [],
+        "status": status,
+        "metadata_summary": metadata_summary(node),
+        "updated_at": node.get("updated_at"),
+        "links_count": len(node.get("links") or []) if isinstance(node.get("links"), list) else 0,
+        "archived": node_archived(node),
+    }
+    content = node.get("snippet") or node.get("preview") or node.get("content_text")
+    if content:
+        item["preview"] = preview_text(content, preview_chars)
+    for key in ("search_source", "matched_query", "matched_strategy", "indexed_at", "rank"):
+        if key in node:
+            item[key] = node[key]
+    if view == "metadata":
+        item["metadata"] = metadata
+    return {key: value for key, value in item.items() if value not in (None, "")}
+
+
+def discovery_envelope(project_id, items, args, *, view=None, next_cursor=None, has_more=None, diagnostics=None, query_analysis=None, warnings=None):
+    view = view or normalize_discovery_view(args)[0]
+    limit = normalize_int(args.get("limit"), 25, 1, 100 if view != "full" else 200)
+    preview_chars = normalize_int(args.get("preview_chars"), 240, 80, 1000)
+    summarized = [summarize_node(node, view=view, preview_chars=preview_chars) for node in items]
+    response = {
+        "ok": True,
+        "project_id": project_id,
+        "view": view,
+        "items": summarized,
+        "next_cursor": next_cursor,
+        "has_more": bool(has_more) if has_more is not None else bool(next_cursor),
+        "truncated": False,
+        "omitted_fields": [] if view == "full" else ["content_text"],
+        "budget": {"limit": limit, "max_limit": 100 if view != "full" else 200, "preview_chars": preview_chars},
+    }
+    if as_bool(args.get("verbose"), False):
+        if query_analysis is not None:
+            response["query_analysis"] = query_analysis
+        if diagnostics is not None:
+            response["diagnostics"] = diagnostics
+        if warnings:
+            response["warnings"] = warnings
+    return response
 
 
 def agent_slug_from_args(args):
@@ -6596,7 +6768,7 @@ def cli_project_create(args):
     positionals = cli_positionals(args)
     slug = cli_option(args, "--slug", default=positionals[0] if positionals else default_project_slug())
     name = cli_option(args, "--name", default=default_project_name(slug))
-    encryption = cli_option(args, "--encryption", default="encrypted" if cli_flag(args, "--encrypted") else "plaintext")
+    encryption = cli_option(args, "--encryption", default="plaintext")
     payload = {
         "slug": slug,
         "name": name,
@@ -7150,12 +7322,18 @@ def get_backlinks_by_path(args):
 
 def list_project_nodes(args):
     project_id = resolve_project_id(args)
+    view, view_warnings = normalize_discovery_view(args)
+    filters = status_filter_from_args(args)
+    limit = normalize_int(args.get("limit"), 25, 1, 100 if view != "full" else 200)
     allowed = {"tag", "folder_path", "q", "limit", "cursor", "updated_before", "updated_after", "type", "include_archived", "archived_only"}
     base_query = {key: value for key, value in args.items() if key in allowed and value not in (None, "")}
+    base_query["limit"] = limit
+    if filters["active_only"]:
+        base_query["include_archived"] = False
+        base_query["archived_only"] = False
     raw_q = str(base_query.get("q") or "").strip()
     if raw_q and not base_query.get("cursor"):
         query_analysis = analyze_search_query(raw_q)
-        limit = max(1, min(int(base_query.get("limit", 50)), 200))
         collected = []
         diagnostics = {"server_queries": []}
         for server_query in server_search_queries(query_analysis):
@@ -7172,17 +7350,34 @@ def list_project_nodes(args):
                 node = dict(node)
                 node["matched_query"] = server_query
                 collected.append(node)
+        items = apply_status_filters(unique_nodes(collected), filters)[:limit]
         return {
-            "items": unique_nodes(collected)[:limit],
-            "query_analysis": query_analysis,
-            "diagnostics": diagnostics,
+            **discovery_envelope(
+                project_id,
+                items,
+                {**args, "limit": limit},
+                view=view,
+                diagnostics=diagnostics,
+                query_analysis=query_analysis,
+                warnings=view_warnings + filters["warnings"],
+            ),
         }
 
     query = urllib.parse.urlencode(base_query)
     suffix = f"?{query}" if query else ""
     result = request_json("GET", f"/v1/projects/{project_id}/nodes{suffix}")
-    result["items"] = decrypt_nodes_for_return(filter_project_nodes(result.get("items", [])), project_id=project_id)
-    return result
+    items = decrypt_nodes_for_return(filter_project_nodes(result.get("items", [])), project_id=project_id)
+    items = apply_status_filters(items, filters)
+    return discovery_envelope(
+        project_id,
+        items[:limit],
+        {**args, "limit": limit},
+        view=view,
+        next_cursor=result.get("next_cursor"),
+        has_more=bool(result.get("next_cursor")),
+        query_analysis=result.get("query_analysis"),
+        warnings=view_warnings + filters["warnings"],
+    )
 
 
 def list_folders(args):
@@ -7361,10 +7556,12 @@ def search_memory(args):
         raise RuntimeError("q is required")
     query_analysis = analyze_search_query(q)
     limit = max(1, min(int(args.get("limit", 25)), 100))
+    view, view_warnings = normalize_discovery_view(args)
+    filters = status_filter_from_args(args)
     mode = str(args.get("mode") or "hybrid").strip().lower()
     if mode not in {"hybrid", "server", "local"}:
         raise RuntimeError("mode must be hybrid, server, or local")
-    include_content = bool(args.get("include_content", False))
+    include_content = view == "full"
     encryption_state = project_encryption_state(project_id)
     collected = []
     sources = []
@@ -7405,10 +7602,11 @@ def search_memory(args):
         for server_query in server_search_queries(query_analysis):
             if len(unique_nodes(collected)) >= limit:
                 break
-            server = list_project_nodes({"q": server_query, "limit": remaining}).get("items", [])
+            server_args = {**args, "q": server_query, "limit": remaining, "view": view}
+            server = list_project_nodes(server_args).get("items", [])
             diagnostics["server_queries"].append({"q": server_query, "matched": len(server)})
             for node in server:
-                node = strip_node_content(node, include_content=include_content)
+                node = summarize_node(node, view=view) if view != "full" else node
                 node["search_source"] = "server"
                 node["matched_query"] = server_query
                 collected.append(node)
@@ -7416,30 +7614,33 @@ def search_memory(args):
                 sources.append("server")
             remaining = max(1, limit - len(unique_nodes(collected)))
 
-    items = unique_nodes(collected)[:limit]
+    items = apply_status_filters(unique_nodes(collected), filters)[:limit]
     if not items and query_analysis["is_long_query"]:
         diagnostics["hint"] = "Long natural-language query produced no matches; retry with quoted exact phrases or 2-5 distinctive nouns if the target memory exists."
-    return {
-        "project_id": project_id,
-        "query": q,
-        "query_analysis": query_analysis,
-        "mode": mode,
-        "encryption_state": encryption_state,
-        "sources": sources,
-        "diagnostics": diagnostics,
-        "items": items,
-    }
+    response = discovery_envelope(
+        project_id,
+        items,
+        {**args, "limit": limit},
+        view=view,
+        diagnostics=diagnostics,
+        query_analysis=query_analysis,
+        warnings=view_warnings + filters["warnings"],
+    )
+    response["query"] = q
+    response["mode"] = mode
+    response["encryption_state"] = encryption_state
+    response["sources"] = sources
+    return response
 
 
 def recent_memory(args):
     limit = max(1, min(int(args.get("limit", 25)), 100))
-    query = {"limit": limit}
+    view, _warnings = normalize_discovery_view(args)
+    query = {**args, "limit": limit, "view": view}
     for key in ["folder_path", "tag", "updated_before", "updated_after", "cursor"]:
         if args.get(key):
             query[key] = args[key]
-    result = list_project_nodes(query)
-    result["items"] = [strip_node_content(node, include_content=bool(args.get("include_content", False))) for node in result.get("items", [])]
-    return result
+    return list_project_nodes(query)
 
 
 def get_memory_context(args):
@@ -7448,7 +7649,8 @@ def get_memory_context(args):
         raise RuntimeError("path or paths is required")
     max_nodes = max(1, min(int(args.get("max_nodes", 20)), 100))
     depth = max(0, min(int(args.get("depth", 1)), 2))
-    include_content = bool(args.get("include_content", True))
+    default_view = "full" if as_bool(args.get("include_content"), True) and not args.get("view") else "summary"
+    view, _warnings = normalize_discovery_view(args, default=default_view)
     queue_paths = [normalize_node_path(path) for path in raw_paths]
     nodes = []
     edges = []
@@ -7464,7 +7666,7 @@ def get_memory_context(args):
                 node = get_node_by_path({"path": path}, allow_agent=is_agent_namespace_path(path))
             except Exception:
                 continue
-            nodes.append(strip_node_content(node, include_content=include_content))
+            nodes.append(summarize_node(node, view=view, preview_chars=normalize_int(args.get("preview_chars"), 240, 80, 1000)))
             links = node.get("links") if isinstance(node.get("links"), list) else []
             for link in links:
                 target_path = link.get("path") if isinstance(link, dict) else None
@@ -7484,12 +7686,12 @@ def get_memory_context(args):
                     pass
         queue_paths = next_paths
         current_depth += 1
-    return {"items": unique_nodes(nodes), "edges": edges[: max_nodes * 4]}
+    return {"items": unique_nodes(nodes), "edges": edges[: max_nodes * 4], "view": view}
 
 
 def find_related_nodes(args):
     path = args["path"]
-    include_content = bool(args.get("include_content", False))
+    view, _warnings = normalize_discovery_view(args)
     limit = max(1, min(int(args.get("limit", 25)), 100))
     target = get_node_by_path({"path": path}, allow_agent=is_agent_namespace_path(path))
     related = []
@@ -7505,12 +7707,13 @@ def find_related_nodes(args):
             except Exception:
                 pass
     for tag in target.get("tags") or []:
-        related.extend(list_project_nodes({"tag": tag, "limit": limit}).get("items", []))
+        related.extend(list_project_nodes({"tag": tag, "limit": limit, "view": view}).get("items", []))
     folder = target.get("folder_path")
     if folder:
-        related.extend(list_project_nodes({"folder_path": folder, "limit": limit}).get("items", []))
-    items = [strip_node_content(node, include_content=include_content) for node in unique_nodes(related) if node.get("full_path") != target.get("full_path")]
-    return {"target": strip_node_content(target, include_content=include_content), "items": items[:limit]}
+        related.extend(list_project_nodes({"folder_path": folder, "limit": limit, "view": view}).get("items", []))
+    preview_chars = normalize_int(args.get("preview_chars"), 240, 80, 1000)
+    items = [summarize_node(node, view=view, preview_chars=preview_chars) for node in unique_nodes(related) if node.get("full_path") != target.get("full_path")]
+    return {"target": summarize_node(target, view=view, preview_chars=preview_chars), "items": items[:limit], "view": view}
 
 
 def inbound_reference_plan(path):
@@ -8272,9 +8475,9 @@ def start_local_ui(args):
                 return gateway_setup(payload)
             if route == "/local-api/gateway/configure":
                 return gateway_tmux_configure(payload)
-            if route == "/local-api/gateway/vault-setup/list":
+            if route == "/local-api/gateway/vault/list":
                 return gateway_vault_setup_requests(payload)
-            if route == "/local-api/gateway/vault-setup/process":
+            if route == "/local-api/gateway/vault/process":
                 return gateway_process_vault_setup_requests(payload)
             if route == "/local-api/gateway/vault-secret/rotate":
                 return gateway_rotate_project_vault_secret(payload)
@@ -8648,7 +8851,7 @@ def raw_tools():
             },
         },
         {
-            "name": "nap_gateway_vault_setup_ls",
+            "name": "nap_gateway_vault_ls",
             "description": "List project vault setup requests assigned to this gateway worker. Does not reveal secret material.",
             "inputSchema": {
                 "type": "object",
@@ -8657,7 +8860,7 @@ def raw_tools():
             },
         },
         {
-            "name": "nap_gateway_vault_setup_process",
+            "name": "nap_gateway_vault_process",
             "description": "Complete pending project vault setup requests assigned to this unlocked gateway by uploading opaque client-wrapped key bundle records for backend-owned HashiCorp storage.",
             "inputSchema": {
                 "type": "object",
@@ -8864,23 +9067,37 @@ def raw_tools():
                     "q": {"type": "string", "description": "Search text. Natural language is accepted; distinctive nouns, paths, tags, or quoted phrases produce better matches than full instructions."},
                     "mode": {"type": "string", "enum": ["hybrid", "server", "local"], "default": "hybrid"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "include_content": {"type": "boolean", "default": False},
+                    "view": {"type": "string", "enum": ["paths", "summary", "metadata", "full"], "default": "summary"},
+                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
+                    "active_only": {"type": "boolean", "default": False},
+                    "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "exclude_status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "verbose": {"type": "boolean", "default": False},
+                    "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
                 },
                 "additionalProperties": False,
             },
         },
         {
             "name": "nap_find",
-            "description": "Structured active memory search by folder, tag, path, or query.",
+            "description": "Structured active memory search by folder, tag, path, or query. Returns compact summaries by default; use view='full' or nap_cat for body text.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "folder_path": {"type": "string"},
                     "tag": {"type": "string"},
                     "q": {"type": "string"},
+                    "cursor": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "include_content": {"type": "boolean", "default": False},
+                    "view": {"type": "string", "enum": ["paths", "summary", "metadata", "full"], "default": "summary"},
+                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
                     "include_archived": {"type": "boolean", "default": False},
+                    "archived_only": {"type": "boolean", "default": False},
+                    "active_only": {"type": "boolean", "default": False},
+                    "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "exclude_status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "verbose": {"type": "boolean", "default": False},
+                    "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
                 },
                 "additionalProperties": False,
             },
@@ -8895,7 +9112,9 @@ def raw_tools():
                     "paths": {"type": "array", "items": {"type": "string"}},
                     "depth": {"type": "integer", "minimum": 0, "maximum": 2},
                     "max_nodes": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "include_content": {"type": "boolean", "default": True},
+                    "view": {"type": "string", "enum": ["paths", "summary", "metadata", "full"], "default": "full"},
+                    "include_content": {"type": "boolean", "default": True, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
+                    "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
                 },
                 "additionalProperties": False,
             },
@@ -8919,7 +9138,9 @@ def raw_tools():
                 "properties": {
                     "path": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "include_content": {"type": "boolean", "default": False},
+                    "view": {"type": "string", "enum": ["paths", "summary", "metadata", "full"], "default": "summary"},
+                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
+                    "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
                 },
                 "additionalProperties": False,
             },
@@ -8936,7 +9157,13 @@ def raw_tools():
                     "updated_before": {"type": "string"},
                     "updated_after": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "include_content": {"type": "boolean", "default": False},
+                    "view": {"type": "string", "enum": ["paths", "summary", "metadata", "full"], "default": "summary"},
+                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
+                    "active_only": {"type": "boolean", "default": False},
+                    "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "exclude_status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "verbose": {"type": "boolean", "default": False},
+                    "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
                 },
                 "additionalProperties": False,
             },
@@ -9193,7 +9420,17 @@ def raw_tools():
                     "tag": {"type": "string"},
                     "folder_path": {"type": "string"},
                     "q": {"type": "string", "description": "Search phrase. Distinctive nouns, paths, tags, and quoted phrases work best; long sentences are decomposed automatically."},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                    "cursor": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "view": {"type": "string", "enum": ["paths", "summary", "metadata", "full"], "default": "summary"},
+                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
+                    "include_archived": {"type": "boolean", "default": False},
+                    "archived_only": {"type": "boolean", "default": False},
+                    "active_only": {"type": "boolean", "default": False},
+                    "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "exclude_status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "verbose": {"type": "boolean", "default": False},
+                    "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
                 },
                 "additionalProperties": False,
             },
@@ -9457,8 +9694,8 @@ TOOL_CATEGORIES = {
         "nap_gateway_status",
         "nap_gateway_setup",
         "nap_gateway_configure",
-        "nap_gateway_vault_setup_ls",
-        "nap_gateway_vault_setup_process",
+        "nap_gateway_vault_ls",
+        "nap_gateway_vault_process",
         "nap_gateway_vault_secret_rotate",
         "nap_gateway_unlock",
         "nap_gateway_restart",
@@ -9523,7 +9760,7 @@ LOCAL_FILE_TOOLS = {
     "nap_index_clear",
     "nap_gateway_setup",
     "nap_gateway_configure",
-    "nap_gateway_vault_setup_process",
+    "nap_gateway_vault_process",
     "nap_gateway_vault_secret_rotate",
     "nap_gateway_unlock",
     "nap_gateway_lock",
@@ -9588,7 +9825,7 @@ def tool_contract_metadata(name):
         "idempotency": "safe" if side_effect == "none" else "not-idempotent",
         "dangerous": side_effect in {"process-control", "terminal-control"} or name in SECRET_ACCEPTING_TOOLS,
         "dry_run_supported": dry_run_supported,
-        "replaces": NEW_TOOL_REPLACES.get(name),
+        "replaces": None,
         "requires_local": tool_auth_mode(name) != "public",
     }
 
@@ -9707,14 +9944,6 @@ def explore_tools(args):
 
 def man_tool(args):
     name = str(args.get("tool") or args.get("name") or "").strip()
-    if name in OLD_TOOL_RENAMES:
-        replacement = OLD_TOOL_RENAMES[name]
-        return {
-            "ok": False,
-            "tool": name,
-            "renamed_to": replacement,
-            "message": f"{name} was renamed to {replacement}; call {replacement} instead",
-        }
     for tool in tools():
         if tool["name"] == name:
             return tool_card(tool, include_schema=True)
@@ -9742,7 +9971,7 @@ def du_memory(args):
 
 def lint_memory(args):
     limit = max(1, min(int(args.get("limit", 200)), 500))
-    result = list_project_nodes({"limit": limit, "include_content": False})
+    result = list_project_nodes({"limit": limit, "view": "full"})
     warnings = []
     for node in result.get("items", []):
         for link in node.get("links") or []:
@@ -9772,8 +10001,6 @@ def doctor(args):
 
 def call_tool_impl(name, args):
     args = args or {}
-    if name in OLD_TOOL_RENAMES:
-        raise RuntimeError(f"{name} was renamed to {OLD_TOOL_RENAMES[name]}; call {OLD_TOOL_RENAMES[name]} instead")
     if name not in PUBLIC_TOOLS and name in PROTECTED_TOOLS:
         require_unlocked(name)
     if name == "nap_whoami":
@@ -9784,9 +10011,9 @@ def call_tool_impl(name, args):
         return gateway_setup(args)
     if name == "nap_gateway_configure":
         return mcp_gateway_configure(args)
-    if name == "nap_gateway_vault_setup_ls":
+    if name == "nap_gateway_vault_ls":
         return gateway_vault_setup_requests(args)
-    if name == "nap_gateway_vault_setup_process":
+    if name == "nap_gateway_vault_process":
         return gateway_process_vault_setup_requests(args)
     if name == "nap_gateway_vault_secret_rotate":
         return gateway_rotate_project_vault_secret(args)
@@ -10080,13 +10307,7 @@ def cli_main(argv):
         if subcommand in {"plaintext", "plain", "unencrypt", "decrypt", "disable-encryption"}:
             print(json.dumps(project_encryption_transition({"state": "plaintext"}), indent=2))
             return
-        if subcommand in {"encrypted", "encrypt", "enable-encryption"}:
-            print(json.dumps(project_encryption_transition({
-                "state": "encrypted",
-                "passphrase": cli_option(argv[3:], "--passphrase", default=None),
-            }), indent=2))
-            return
-        print("Usage: napseer_mcp_server.py project [create [slug] [--name NAME] [--description TEXT] [--encrypted|--encryption plaintext|encrypted] [--passphrase TEXT]|claim [--no-browser] [--timeout SECONDS] [--return-url URL]|status|encryption [status|set plaintext|set encrypted|plaintext|encrypted] [--passphrase TEXT]|plaintext|encrypted [--passphrase TEXT]]")
+        print("Usage: napseer_mcp_server.py project [create [slug] [--name NAME] [--description TEXT] [--encryption plaintext] [--passphrase TEXT]|claim [--no-browser] [--timeout SECONDS] [--return-url URL]|status|encryption [status|set plaintext|plaintext] [--passphrase TEXT]|plaintext [--passphrase TEXT]]")
         return
     if command == "gateway":
         subcommand = argv[2] if len(argv) > 2 else "status"
@@ -10219,7 +10440,7 @@ def cli_main(argv):
                 gateway_service_run(payload)
                 return
             raise RuntimeError("unknown gateway service action; use preregister|activate|run")
-        if subcommand in {"vault", "vault-setup", "vault_setup", "project-vault"}:
+        if subcommand == "vault":
             action = args[0] if args else "status"
             vault_args = args[1:] if args else []
             if action in {"help", "-h", "--help"}:

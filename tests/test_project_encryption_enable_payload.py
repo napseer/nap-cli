@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Smoke-test project encryption enable payload generation."""
+"""Smoke-test project encryption enable fail-closed behavior."""
 
-import base64
 import importlib.util
 import pathlib
 import sys
@@ -17,6 +16,18 @@ def load_module():
     return module
 
 
+def assert_raises_hashicorp_closed(fn):
+    try:
+        fn()
+    except RuntimeError as exc:
+        message = str(exc)
+        assert "HashiCorp" in message
+        assert "disabled" in message
+        assert "setup-request" in message
+    else:
+        raise AssertionError("CLI direct project encryption enable must fail closed")
+
+
 def run():
     mod = load_module()
     calls = []
@@ -25,34 +36,28 @@ def run():
     mod.AUTH = {"agent_id": "agent-1"}
     mod.request_project_write = lambda method, path, body, project_id, purpose, scope_type="project": calls.append(
         (method, path, body, project_id, purpose, scope_type)
-    ) or {"state": "encrypted", "active_project_key_version": {"version": 1}}
+    ) or {"state": "plaintext"}
+    mod.create_project_with_state = lambda args: ({"id": "project-1"}, "created", "created")
     mod.save_auth = lambda payload: None
 
-    result = mod.project_encryption_transition({"state": "encrypted", "passphrase": "pw"})
-    assert result["status"] == "updated"
-    assert calls, "encryption enable should call backend"
-    method, path, body, project_id, purpose, scope_type = calls[0]
-    assert method == "POST"
-    assert path == "/v1/projects/project-1/encryption/enable"
-    assert project_id == "project-1"
-    assert scope_type == "encryption"
-    assert body["state"] == "encrypted"
-    wrapped = body["wrapped_project_key"]
-    assert wrapped["credential_id"] == "local-passphrase:agent-1"
-    assert wrapped["wrap_alg"] == "AES-GCM-256"
-    assert wrapped["kdf_alg"] == "PBKDF2-SHA256"
-    assert wrapped["kdf_params"]["source"] == "local_passphrase"
-    assert wrapped["kdf_params"]["iterations"] == mod.PROJECT_KEY_KDF_ITERATIONS
-    assert len(base64.b64decode(wrapped["salt_b64"])) == 16
-    assert len(base64.b64decode(wrapped["kdf_params"]["nonce_b64"])) == 12
-    assert len(base64.b64decode(wrapped["wrapped_project_key_b64"])) == 48
+    assert_raises_hashicorp_closed(lambda: mod.project_encryption_transition({"state": "encrypted", "passphrase": "pw"}))
+    assert calls == []
 
-    calls.clear()
+    assert_raises_hashicorp_closed(lambda: mod.bootstrap_project({"encryption": "encrypted", "passphrase": "pw"}))
+    assert calls == []
+
     result = mod.project_encryption_transition({"state": "plaintext"})
     assert result["status"] == "updated"
-    assert "wrapped_project_key" not in calls[0][2]
+    assert calls, "plaintext transition should still call backend"
+    method, path, body, project_id, purpose, scope_type = calls[0]
+    assert method == "POST"
+    assert path == "/v1/projects/project-1/encryption/disable"
+    assert project_id == "project-1"
+    assert scope_type == "encryption"
+    assert body == {"state": "plaintext"}
+    assert "wrapped" not in str(body)
 
-    print("ok: project encryption enable payload smoke passed")
+    print("ok: project encryption enable fail-closed smoke passed")
 
 
 if __name__ == "__main__":

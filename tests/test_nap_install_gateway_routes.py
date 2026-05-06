@@ -33,8 +33,12 @@ def run():
     assert mod.handle_gateway(["vault", "rotate-secret", "--kind", "chat"]) == 0
     assert calls[-1] == ("gateway", ["vault", "rotate-secret", "--kind", "chat"])
 
-    assert mod.handle_gateway(["vault-setup", "list"]) == 0
-    assert calls[-1] == ("gateway", ["vault-setup", "list"])
+    try:
+        mod.handle_gateway(["vault-setup", "list"])
+    except RuntimeError as exc:
+        assert "unknown gateway command" in str(exc)
+    else:
+        raise AssertionError("deprecated gateway vault-setup alias must not route")
 
     assert mod.handle_gateway(["terminal", "list"]) == 0
     assert calls[-1] == ("gateway", ["terminal", "list"])

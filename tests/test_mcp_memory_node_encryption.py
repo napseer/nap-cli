@@ -255,9 +255,52 @@ def run():
     moved["full_path"] = "/renamed/alpha"
     moved["folder_path"] = "/renamed"
     mod.request_json = lambda method, path, payload=None, **kwargs: {"items": [moved]}
-    listed = mod.list_project_nodes({"limit": 10})
+    listed = mod.list_project_nodes({"limit": 10, "include_content": True})
     assert listed["items"][0]["content_text"] == "secret needle"
     assert listed["items"][0]["metadata"] == {"private": "secret metadata"}
+
+    mod.request_json = lambda method, path, payload=None, **kwargs: {"items": [moved]}
+    compact = mod.list_project_nodes({"limit": 10})
+    assert compact["ok"] is True
+    assert compact["view"] == "summary"
+    assert "content_text" not in compact["items"][0]
+    assert compact["items"][0]["preview"] == "secret needle"
+    assert compact["items"][0]["metadata_summary"] == {}
+    full = mod.list_project_nodes({"limit": 10, "view": "full"})
+    assert full["items"][0]["content_text"] == "secret needle"
+
+    plan_base = {
+        "project_id": "project-1",
+        "folder_path": "/plans",
+        "name": "plan",
+        "type": "note",
+        "tags": ["plan"],
+        "links": [],
+        "content_text": "plan body",
+        "encryption_state": "legacy_plaintext",
+    }
+    active_nodes = [
+        {**plan_base, "id": "active", "full_path": "/plans/active", "metadata": {"status": "planned"}},
+        {**plan_base, "id": "done", "full_path": "/plans/done", "metadata": {"status": "completed"}},
+        {**plan_base, "id": "archived", "full_path": "/plans/archived", "metadata": {"status": "planned"}, "archived_at": "2026-05-06T00:00:00Z"},
+    ]
+    mod.request_json = lambda method, path, payload=None, **kwargs: {"items": active_nodes}
+    active = mod.list_project_nodes({"folder_path": "/plans", "active_only": True})
+    assert [item["full_path"] for item in active["items"]] == ["/plans/active"]
+    status_filtered = mod.list_project_nodes({"folder_path": "/plans", "status": ["completed"], "view": "paths"})
+    assert status_filtered["items"] == [{"full_path": "/plans/done", "type": "note", "status": "completed"}]
+
+    def search_response(method, path, payload=None, **kwargs):
+        assert "q=" in path
+        return {"items": [dict(moved)]}
+
+    mod.request_json = search_response
+    found = mod.list_project_nodes({"q": "secret needle", "limit": 5})
+    assert "query_analysis" not in found
+    assert "diagnostics" not in found
+    verbose_found = mod.list_project_nodes({"q": "secret needle", "limit": 5, "verbose": True})
+    assert "query_analysis" in verbose_found
+    assert "diagnostics" in verbose_found
 
     legacy_moved = encrypted_node(mod, full_path="/notes/legacy", content="old")
     legacy_moved["encrypted_content_envelope"].pop("aad_subject")

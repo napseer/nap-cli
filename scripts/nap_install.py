@@ -617,12 +617,11 @@ def handle_gateway(args):
         print("  nap gateway vault process             Complete pending setup requests.")
         print("  nap gateway vault rotate-secret --kind chat|tabs|gateway|memory")
         return 0
-    if subcommand in {"vault", "vault-setup", "vault_setup", "project-vault"} and rest and rest[0] in {"help", "-h", "--help"}:
+    if subcommand == "vault" and rest and rest[0] in {"help", "-h", "--help"}:
         print("Usage: nap gateway vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway|memory] [--all] [--project-id ID]")
         print("  status        Show configured/locked state and pending setup requests.")
         print("  process       Upload opaque client-wrapped key bundle records for backend-owned HashiCorp storage.")
         print("  rotate-secret Rotate one encrypted project secret.")
-        print("  vault-setup   Deprecated alias for vault.")
         return 0
     if subcommand == "start":
         return print_json(start_service("gateway", ["--no-browser", *rest])) or 0
@@ -634,7 +633,7 @@ def handle_gateway(args):
         return print_json(service_logs("gateway", rest)) or 0
     if subcommand in {"configure", "config"}:
         return run_wrapper("gateway", ["configure", *rest])
-    if subcommand in {"setup", "unlock", "lock", "restart", "kill", "vault", "vault-setup", "vault_setup", "project-vault", "terminal", "schedule", "service"}:
+    if subcommand in {"setup", "unlock", "lock", "restart", "kill", "vault", "terminal", "schedule", "service"}:
         return run_wrapper("gateway", [subcommand, *rest])
     raise RuntimeError("unknown gateway command; use nap gateway start|stop|configure|setup|unlock|lock|restart|kill|logs|status|vault|terminal|schedule|service")
 
@@ -697,10 +696,10 @@ def main(argv):
         print("Usage: nap [auth|project|gateway|agent|feedback|status|update|where|install]")
         print("  auth        Auth commands: login-local, status.")
         print("              Example: nap auth login-local")
-        print("  project     Project commands: create, status, encryption, encrypted, plaintext.")
-        print("              Examples: nap project create --encrypted, nap project encrypted, nap project plaintext")
-        print("              Project encryption uses a project passphrase; use --passphrase or NAPSEER_PROJECT_PASSPHRASE for automation.")
-        print("              Equivalent explicit form: nap project encryption set encrypted|plaintext")
+        print("  project     Project commands: create, status, encryption status, plaintext.")
+        print("              Examples: nap project create, nap project status, nap project encryption set plaintext")
+        print("              Direct encrypted project enablement is disabled; use gateway vault setup flows.")
+        print("              Equivalent explicit form: nap project encryption set plaintext")
         print("  gateway     Gateway commands: start, stop, configure, setup, unlock, lock, restart, kill, logs, status, vault.")
         print("              Start auto-selects a local port; use --port to pin one.")
         print("              Examples: nap gateway start, nap gateway vault, nap gateway vault rotate-secret --kind chat")
