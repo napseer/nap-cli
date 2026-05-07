@@ -57,6 +57,20 @@ def run():
     assert mod.TOKEN == "fresh"
     assert mod.TOKEN_EXPIRES_AT == "new"
 
+    mod.load_public_auth_file = lambda: {
+        "base_url": "https://api.example.test",
+        "project_id": "project_1",
+        "worker_name": "agent",
+        "device_fingerprint": "device",
+        "root_path": "/repo",
+        "worker_capabilities": {"local_mcp": True, "gateway": True},
+        "token": "newer",
+        "token_expires_at": "later",
+    }
+    mod.refresh_public_auth_state()
+    assert mod.TOKEN == "newer"
+    assert mod.TOKEN_EXPIRES_AT == "later"
+
     try:
         mod.save_auth({"gateway_default_command": "bash -l"})
     except RuntimeError as exc:

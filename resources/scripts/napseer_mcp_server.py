@@ -4773,6 +4773,7 @@ def gateway_relay_loop(lane_id="lane-1"):
         try:
             lane_index = int(str(lane_id).rsplit("-", 1)[-1]) if str(lane_id).rsplit("-", 1)[-1].isdigit() else 1
             if gateway_remote_should_run() and lane_index <= gateway_listener_target_lanes():
+                refresh_public_auth_state()
                 ensure_gateway_worker_capability(refresh=True)
                 project_id = current_project_id()
                 agent_id = AUTH.get("agent_id")
@@ -4786,13 +4787,29 @@ def gateway_relay_loop(lane_id="lane-1"):
                     lane_id=lane_id,
                     target_lanes=gateway_listener_target_lanes(),
                 )
-                listener = ws_connect(
-                    gateway_listener_ws_url(project_id, agent_id),
-                    extra_headers={
-                        "Authorization": f"Bearer {TOKEN}",
-                        "X-Napseer-Gateway-Lane-Id": lane_id,
-                    },
-                )
+                try:
+                    listener = ws_connect(
+                        gateway_listener_ws_url(project_id, agent_id),
+                        extra_headers={
+                            "Authorization": f"Bearer {TOKEN}",
+                            "X-Napseer-Gateway-Lane-Id": lane_id,
+                        },
+                    )
+                except RuntimeError as exc:
+                    if " 401 " not in str(exc):
+                        raise
+                    gateway_log("relay_listener_auth_retry", level="warn", project_id=project_id, agent_id=agent_id, lane_id=lane_id)
+                    renew_auth()
+                    refresh_public_auth_state()
+                    project_id = current_project_id()
+                    agent_id = AUTH.get("agent_id")
+                    listener = ws_connect(
+                        gateway_listener_ws_url(project_id, agent_id),
+                        extra_headers={
+                            "Authorization": f"Bearer {TOKEN}",
+                            "X-Napseer-Gateway-Lane-Id": lane_id,
+                        },
+                    )
                 connected_at = time.time()
                 with GATEWAY_LISTENER_STABILITY_LOCK:
                     GATEWAY_LISTENER_ACTIVE_LANES.add(lane_id)
@@ -6286,6 +6303,17 @@ def save_auth(updates):
     TOKEN = AUTH["token"]
     DEFAULT_PROJECT_ID = AUTH["project_id"]
     TOKEN_EXPIRES_AT = AUTH["token_expires_at"]
+
+
+def refresh_public_auth_state():
+    global AUTH, BASE_URL, TOKEN, DEFAULT_PROJECT_ID, TOKEN_EXPIRES_AT
+    public = load_public_auth_file()
+    AUTH = load_auth(public_override=public, secret_override=VAULT_SECRETS if gateway_is_unlocked() else {})
+    BASE_URL = AUTH["base_url"].rstrip("/")
+    TOKEN = AUTH["token"]
+    DEFAULT_PROJECT_ID = AUTH["project_id"]
+    TOKEN_EXPIRES_AT = AUTH["token_expires_at"]
+    return AUTH
 
 
 def ensure_local_files():
