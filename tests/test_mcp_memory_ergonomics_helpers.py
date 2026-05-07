@@ -61,6 +61,25 @@ def test_active_plan_listing(mod):
     assert result["items"][0]["status"] == "in_progress"
 
 
+def test_node_discovery_allows_large_requested_limit(mod):
+    calls = []
+
+    def fake_request(method, path, payload=None, **kwargs):
+        calls.append(path)
+        assert method == "GET"
+        assert "limit=250" in path
+        return {"items": [node(f"/plans/item-{index}") for index in range(250)], "next_cursor": None}
+
+    mod.request_json = fake_request
+    result = mod.list_project_nodes({"folder_path": "/plans", "limit": 250})
+    assert result["ok"] is True
+    assert len(result["items"]) == 250
+    assert result["budget"]["limit"] == 250
+    assert result["budget"]["max_limit"] > 200
+    assert "content_text" not in result["items"][0]
+    assert len(calls) == 1
+
+
 def test_kanban_list_grouping_and_filters(mod):
     doing = node(
         "/kanban/doing/fix-wrapper",
@@ -99,6 +118,43 @@ def test_kanban_list_grouping_and_filters(mod):
     assert result["items"][0]["column"] == "doing"
     assert result["items"][0]["blocked"] is True
     assert list(result["groups"]) == ["doing"]
+
+
+def test_kanban_list_reads_beyond_first_source_page(mod):
+    first_page = [
+        node(
+            "/kanban/todo/other-card",
+            "todo",
+            metadata={"column": "todo", "owner": "codex", "blocked": False},
+            tags=["kanban"],
+            node_type="kanban_card",
+        )
+    ]
+    second_page = [
+        node(
+            "/kanban/doing/blocked-card",
+            "doing",
+            metadata={"column": "doing", "owner": "codex", "blocked": True},
+            tags=["kanban"],
+            node_type="kanban_card",
+        )
+    ]
+    calls = []
+
+    def fake_request(method, path, payload=None, **kwargs):
+        calls.append(path)
+        assert method == "GET"
+        assert "q=%2Fkanban" in path
+        assert "limit=10000" in path
+        if "cursor=page-2" in path:
+            return {"items": second_page, "next_cursor": None}
+        return {"items": first_page, "next_cursor": "page-2"}
+
+    mod.request_json = fake_request
+    result = mod.list_kanban_cards({"blocked": True, "limit": 10})
+    assert [item["full_path"] for item in result["items"]] == ["/kanban/doing/blocked-card"]
+    assert result["truncated"] is False
+    assert len(calls) == 2
 
 
 def test_plan_lifecycle_dry_run_and_write(mod):
@@ -167,7 +223,11 @@ def run():
     mod = load_module()
     test_active_plan_listing(mod)
     mod = load_module()
+    test_node_discovery_allows_large_requested_limit(mod)
+    mod = load_module()
     test_kanban_list_grouping_and_filters(mod)
+    mod = load_module()
+    test_kanban_list_reads_beyond_first_source_page(mod)
     mod = load_module()
     test_plan_lifecycle_dry_run_and_write(mod)
     mod = load_module()

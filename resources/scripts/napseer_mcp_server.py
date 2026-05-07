@@ -50,6 +50,11 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DISCOVERY_VIEWS = {"paths", "summary", "metadata", "full"}
+DISCOVERY_DEFAULT_LIMIT = 25
+DISCOVERY_COMPACT_MAX_LIMIT = 10_000
+DISCOVERY_FULL_MAX_LIMIT = 10_000
+DISCOVERY_SOURCE_PAGE_LIMIT = 10_000
+DISCOVERY_CURSOR_GUARD_PAGES = 100
 ACTIVE_EXCLUDED_STATUSES = {
     "completed",
     "complete_verified_uncommitted",
@@ -91,6 +96,10 @@ SUMMARY_METADATA_KEYS = {
 }
 KANBAN_DONE_STATUSES = {"done", "cancelled", "archived"}
 DEFAULT_KANBAN_COLUMNS = ["backlog", "todo", "doing", "review", "done"]
+
+
+def discovery_max_limit(view):
+    return DISCOVERY_FULL_MAX_LIMIT if view == "full" else DISCOVERY_COMPACT_MAX_LIMIT
 
 from napseer_spake2 import (
     relay_aad,
@@ -5196,7 +5205,7 @@ def summarize_node(node, view="summary", preview_chars=240):
 
 def discovery_envelope(project_id, items, args, *, view=None, next_cursor=None, has_more=None, diagnostics=None, query_analysis=None, warnings=None):
     view = view or normalize_discovery_view(args)[0]
-    limit = normalize_int(args.get("limit"), 25, 1, 100 if view != "full" else 200)
+    limit = normalize_int(args.get("limit"), DISCOVERY_DEFAULT_LIMIT, 1, discovery_max_limit(view))
     preview_chars = normalize_int(args.get("preview_chars"), 240, 80, 1000)
     summarized = [summarize_node(node, view=view, preview_chars=preview_chars) for node in items]
     response = {
@@ -5208,7 +5217,7 @@ def discovery_envelope(project_id, items, args, *, view=None, next_cursor=None, 
         "has_more": bool(has_more) if has_more is not None else bool(next_cursor),
         "truncated": False,
         "omitted_fields": [] if view == "full" else ["content_text"],
-        "budget": {"limit": limit, "max_limit": 100 if view != "full" else 200, "preview_chars": preview_chars},
+        "budget": {"limit": limit, "max_limit": discovery_max_limit(view), "preview_chars": preview_chars},
     }
     if as_bool(args.get("verbose"), False):
         if query_analysis is not None:
@@ -7327,7 +7336,7 @@ def list_project_nodes(args):
     project_id = resolve_project_id(args)
     view, view_warnings = normalize_discovery_view(args)
     filters = status_filter_from_args(args)
-    limit = normalize_int(args.get("limit"), 25, 1, 100 if view != "full" else 200)
+    limit = normalize_int(args.get("limit"), DISCOVERY_DEFAULT_LIMIT, 1, discovery_max_limit(view))
     allowed = {"tag", "folder_path", "q", "limit", "cursor", "updated_before", "updated_after", "type", "include_archived", "archived_only"}
     base_query = {key: value for key, value in args.items() if key in allowed and value not in (None, "")}
     base_query["limit"] = limit
@@ -7394,7 +7403,7 @@ def list_active_plans(args):
         "include_archived": False,
         "archived_only": False,
         "view": view,
-        "limit": normalize_int(args.get("limit"), 25, 1, 100),
+        "limit": normalize_int(args.get("limit"), DISCOVERY_DEFAULT_LIMIT, 1, DISCOVERY_COMPACT_MAX_LIMIT),
     }
     return list_project_nodes(query)
 
@@ -7469,7 +7478,7 @@ def list_kanban_cards(args):
     view, view_warnings = normalize_discovery_view(args)
     if view == "full":
         raise RuntimeError("nap_kanban_list supports paths, summary, or metadata views; use nap_cat for full card bodies")
-    limit = normalize_int(args.get("limit"), 25, 1, 100)
+    limit = normalize_int(args.get("limit"), DISCOVERY_DEFAULT_LIMIT, 1, DISCOVERY_COMPACT_MAX_LIMIT)
     preview_chars = normalize_int(args.get("preview_chars"), 240, 80, 1000)
     active_only = as_bool(args.get("active_only"), True)
     column_filter = set(normalize_string_list(args.get("column") or args.get("columns")))
@@ -7483,17 +7492,35 @@ def list_kanban_cards(args):
     if group_by not in {"column", "status", "priority", "owner", "blocked"}:
         raise RuntimeError("group_by must be column, status, priority, owner, or blocked")
 
-    source_args = {
+    source_query = {
         "q": "/kanban",
-        "limit": limit,
+        "limit": DISCOVERY_SOURCE_PAGE_LIMIT,
         "view": "full",
-        "active_only": False,
         "include_archived": not active_only,
         "archived_only": False,
     }
-    raw = list_project_nodes(source_args)
+    source_items = []
+    source_truncated = False
+    source_pages = 0
+    seen_cursors = set()
+    while True:
+        suffix = f"?{urllib.parse.urlencode(source_query)}"
+        raw = request_json("GET", f"/v1/projects/{project_id}/nodes{suffix}")
+        page_items = decrypt_nodes_for_return(filter_project_nodes(raw.get("items", [])), project_id=project_id)
+        source_items.extend(page_items)
+        source_pages += 1
+        next_cursor = raw.get("next_cursor")
+        if not next_cursor:
+            source_truncated = bool(raw.get("truncated") or raw.get("has_more"))
+            break
+        if next_cursor in seen_cursors or source_pages >= DISCOVERY_CURSOR_GUARD_PAGES:
+            source_truncated = True
+            break
+        seen_cursors.add(next_cursor)
+        source_query["cursor"] = next_cursor
+
     items = []
-    for node in raw.get("items", []):
+    for node in source_items:
         full_path = normalize_node_path(node.get("full_path") or "")
         if not full_path.startswith("/kanban/"):
             continue
@@ -7524,11 +7551,10 @@ def list_kanban_cards(args):
             enriched["owner"] = owner
         enriched["blocked"] = blocked
         items.append(enriched)
-        if len(items) >= limit:
-            break
 
-    summarized = [summarize_node(node, view=view, preview_chars=preview_chars) for node in items]
-    for item, node in zip(summarized, items):
+    returned_items = items[:limit]
+    summarized = [summarize_node(node, view=view, preview_chars=preview_chars) for node in returned_items]
+    for item, node in zip(summarized, returned_items):
         if node.get("column") is not None:
             item["column"] = node["column"]
         if node.get("priority") is not None:
@@ -7537,7 +7563,7 @@ def list_kanban_cards(args):
             item["owner"] = node["owner"]
         item["blocked"] = bool(node.get("blocked"))
     groups = {}
-    for item, node in zip(summarized, items):
+    for item, node in zip(summarized, returned_items):
         if group_by == "column":
             key = node.get("column") or "uncategorized"
         elif group_by == "status":
@@ -7559,9 +7585,9 @@ def list_kanban_cards(args):
         "groups": groups,
         "next_cursor": None,
         "has_more": False,
-        "truncated": bool(raw.get("truncated") or raw.get("has_more") or raw.get("next_cursor")),
+        "truncated": bool(source_truncated or len(items) > limit),
         "omitted_fields": ["content_text"],
-        "budget": {"limit": limit, "max_limit": 100, "preview_chars": preview_chars},
+        "budget": {"limit": limit, "max_limit": DISCOVERY_COMPACT_MAX_LIMIT, "preview_chars": preview_chars},
         "filters": {
             "active_only": active_only,
             "column": sorted(column_filter),
@@ -7574,8 +7600,10 @@ def list_kanban_cards(args):
     if as_bool(args.get("verbose"), False):
         response["diagnostics"] = {
             "source": "nodes",
-            "source_query": {"q": "/kanban", "view": "full"},
-            "source_item_count": len(raw.get("items", [])),
+            "source_query": {"q": "/kanban", "view": "full", "limit": DISCOVERY_SOURCE_PAGE_LIMIT},
+            "source_page_count": source_pages,
+            "source_item_count": len(source_items),
+            "filtered_item_count": len(items),
             "default_columns": DEFAULT_KANBAN_COLUMNS,
         }
         if view_warnings:
@@ -9495,7 +9523,7 @@ def raw_tools():
                     "tag": {"type": "string"},
                     "q": {"type": "string"},
                     "cursor": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10000},
                     "view": {"type": "string", "enum": ["paths", "summary", "metadata", "full"], "default": "summary"},
                     "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
                     "include_archived": {"type": "boolean", "default": False},
@@ -9518,7 +9546,7 @@ def raw_tools():
                     "folder_path": {"type": "string", "default": "/plans"},
                     "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
                     "exclude_status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 25},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 25},
                     "cursor": {"type": "string"},
                     "view": {"type": "string", "enum": ["paths", "summary", "metadata"], "default": "summary"},
                     "verbose": {"type": "boolean", "default": False},
@@ -9544,7 +9572,7 @@ def raw_tools():
                     "blocking": {"type": "boolean"},
                     "active_only": {"type": "boolean", "default": True},
                     "group_by": {"type": "string", "enum": ["column", "status", "priority", "owner", "blocked"], "default": "column"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 25},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 25},
                     "view": {"type": "string", "enum": ["paths", "summary", "metadata"], "default": "summary"},
                     "verbose": {"type": "boolean", "default": False},
                     "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
@@ -9921,7 +9949,7 @@ def raw_tools():
                     "folder_path": {"type": "string"},
                     "q": {"type": "string", "description": "Search phrase. Distinctive nouns, paths, tags, and quoted phrases work best; long sentences are decomposed automatically."},
                     "cursor": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10000},
                     "view": {"type": "string", "enum": ["paths", "summary", "metadata", "full"], "default": "summary"},
                     "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
                     "include_archived": {"type": "boolean", "default": False},
