@@ -157,6 +157,87 @@ def test_kanban_list_reads_beyond_first_source_page(mod):
     assert len(calls) == 2
 
 
+def test_kanban_workflow_reads_pending_and_pick_next(mod):
+    backlog_urgent = node(
+        "/kanban/backlog/later-urgent",
+        "backlog",
+        metadata={"column": "backlog", "priority": "urgent", "rank": "00001024", "blocked": False},
+        tags=["kanban"],
+        node_type="kanban_card",
+    )
+    todo_high = node(
+        "/kanban/todo/next-high",
+        "todo",
+        metadata={"column": "todo", "priority": "high", "rank": "00002048", "blocked": False},
+        tags=["kanban"],
+        node_type="kanban_card",
+    )
+    todo_blocked = node(
+        "/kanban/todo/blocked",
+        "todo",
+        metadata={"column": "todo", "priority": "urgent", "rank": "00001024", "blocked": True},
+        tags=["kanban"],
+        node_type="kanban_card",
+    )
+
+    def fake_request(method, path, payload=None, **kwargs):
+        assert method == "GET"
+        return {"items": [backlog_urgent, todo_high, todo_blocked], "next_cursor": None}
+
+    mod.request_json = fake_request
+    pending = mod.get_pending_kanban_cards({})
+    assert [item["full_path"] for item in pending["items"]] == ["/kanban/todo/next-high", "/kanban/backlog/later-urgent"]
+
+    picked = mod.pick_next_kanban_card({})
+    assert picked["selected"]["full_path"] == "/kanban/todo/next-high"
+    assert picked["selection"]["blocked_excluded"] is True
+
+
+def test_kanban_workflow_create_move_and_block(mod):
+    writes = []
+    existing = node(
+        "/kanban/todo/add-mcp-commands",
+        "todo",
+        metadata={"column": "todo", "priority": "normal", "rank": "00001024", "blocked": False, "title": "Add MCP commands"},
+        tags=["kanban"],
+        node_type="kanban_card",
+    )
+
+    mod.list_kanban_cards = lambda args: {"items": []}
+    mod.request_project_write = lambda method, path, payload, *args, **kwargs: writes.append((method, path, payload)) or {
+        **existing,
+        "id": "id-add-mcp-commands",
+        "full_path": f"{payload.get('folder_path', '/kanban/todo')}/{payload.get('name', 'add-mcp-commands')}".replace("//", "/"),
+        "folder_path": payload.get("folder_path", "/kanban/todo"),
+        "name": payload.get("name", "add-mcp-commands"),
+        "metadata": payload.get("metadata", existing["metadata"]),
+        "content_text": payload.get("content_text", existing["content_text"]),
+        "tags": payload.get("tags", existing["tags"]),
+    }
+    mod.get_node_by_path = lambda args, allow_agent=False: existing
+    mod.index_node = lambda node: None
+    mod.remove_indexed_node = lambda node_id: None
+
+    created = mod.create_kanban_card({"title": "Add MCP commands", "priority": "HIGH"})
+    assert created["created"] is True
+    assert writes[0][0] == "POST"
+    assert writes[0][2]["folder_path"] == "/kanban/todo"
+    assert writes[0][2]["metadata"]["priority"] == "high"
+    assert writes[0][2]["metadata"]["rank"] == "00001024"
+
+    moved = mod.move_kanban_card({"path": "/kanban/todo/add-mcp-commands"}, "doing")
+    assert moved["to"] == "/kanban/doing/add-mcp-commands"
+    assert writes[1][0] == "PATCH"
+    assert writes[1][2]["folder_path"] == "/kanban/doing"
+    assert writes[1][2]["metadata"]["column"] == "doing"
+    assert writes[1][2]["metadata"]["lifecycle_state"] == "active"
+
+    blocked = mod.block_kanban_card({"path": "/kanban/todo/add-mcp-commands", "blocked_reason": "waiting"}, True)
+    assert blocked["updated"] is True
+    assert writes[2][2]["metadata"]["blocked"] is True
+    assert writes[2][2]["metadata"]["blocked_by"] == "waiting"
+
+
 def test_plan_lifecycle_dry_run_and_write(mod):
     plan = node("/plans/example", "in_progress", tags=["plan"])
     outcome = node("/implementation-notes/example", "completed", node_type="implementation-note")
@@ -213,10 +294,22 @@ def test_plan_lifecycle_archived_idempotent(mod):
 
 def test_tool_registry(mod):
     names = {tool["name"] for tool in mod.raw_tools()}
-    for name in ["nap_plan_list_active", "nap_kanban_list", "nap_plan_complete", "nap_plan_supersede", "nap_plan_cancel"]:
+    for name in [
+        "nap_plan_list_active",
+        "nap_kanban_list",
+        "nap_kanban_get_pending",
+        "nap_kanban_pick_next",
+        "nap_kanban_start",
+        "nap_kanban_complete",
+        "nap_plan_complete",
+        "nap_plan_supersede",
+        "nap_plan_cancel",
+    ]:
         assert name in names
     assert mod.tool_contract_metadata("nap_plan_complete")["dry_run_supported"] is True
     assert mod.tool_contract_metadata("nap_plan_list_active")["side_effect"] == "none"
+    assert mod.tool_contract_metadata("nap_kanban_get_pending")["side_effect"] == "none"
+    assert mod.tool_contract_metadata("nap_kanban_start")["side_effect"] == "remote-write"
 
 
 def run():
@@ -228,6 +321,10 @@ def run():
     test_kanban_list_grouping_and_filters(mod)
     mod = load_module()
     test_kanban_list_reads_beyond_first_source_page(mod)
+    mod = load_module()
+    test_kanban_workflow_reads_pending_and_pick_next(mod)
+    mod = load_module()
+    test_kanban_workflow_create_move_and_block(mod)
     mod = load_module()
     test_plan_lifecycle_dry_run_and_write(mod)
     mod = load_module()

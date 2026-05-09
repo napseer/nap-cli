@@ -96,6 +96,15 @@ SUMMARY_METADATA_KEYS = {
 }
 KANBAN_DONE_STATUSES = {"done", "cancelled", "archived"}
 DEFAULT_KANBAN_COLUMNS = ["backlog", "todo", "doing", "review", "done"]
+DEFAULT_KANBAN_PRIORITIES = ["low", "normal", "high", "urgent"]
+KANBAN_PRIORITY_RANK = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
+KANBAN_COLUMN_LIFECYCLE = {
+    "backlog": "open",
+    "todo": "open",
+    "doing": "active",
+    "review": "review",
+    "done": "done",
+}
 
 
 def discovery_max_limit(view):
@@ -7458,7 +7467,89 @@ def kanban_owner(node):
 
 def kanban_priority(node):
     value = node_metadata(node).get("priority")
-    return str(value).strip() if value not in (None, "") else None
+    return normalize_kanban_priority(value, fallback=None)
+
+
+def normalize_kanban_priority(value, fallback="normal"):
+    if value in (None, ""):
+        return fallback
+    normalized = str(value).strip().lower()
+    return normalized if normalized in DEFAULT_KANBAN_PRIORITIES else fallback
+
+
+def normalize_kanban_column(value, default=None):
+    column = str(value or default or "").strip().lower()
+    if column == "working":
+        column = "doing"
+    if column not in DEFAULT_KANBAN_COLUMNS:
+        raise RuntimeError(f"kanban column must be one of: {', '.join(DEFAULT_KANBAN_COLUMNS)}")
+    return column
+
+
+def kanban_title(node):
+    metadata = node_metadata(node)
+    value = metadata.get("title")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return str(node.get("name") or path_parts(node.get("full_path") or "/untitled")["name"]).strip()
+
+
+def kanban_rank_value(node):
+    metadata = node_metadata(node)
+    value = metadata.get("rank") if metadata.get("rank") not in (None, "") else metadata.get("order")
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def kanban_rank_token(value):
+    return str(max(1, int(value))).zfill(8)
+
+
+def kanban_sort_key(node):
+    column = kanban_column(node) or ""
+    rank = kanban_rank_value(node)
+    return (
+        DEFAULT_KANBAN_COLUMNS.index(column) if column in DEFAULT_KANBAN_COLUMNS else len(DEFAULT_KANBAN_COLUMNS),
+        KANBAN_PRIORITY_RANK.get(kanban_priority(node) or "normal", KANBAN_PRIORITY_RANK["normal"]),
+        rank if rank is not None else 10**12,
+        str(node.get("updated_at") or ""),
+        str(node.get("full_path") or ""),
+    )
+
+
+def normalize_kanban_slug(value, fallback="untitled"):
+    slug = re.sub(r"[^a-z0-9._\s-]", "-", str(value or "").strip().lower())
+    slug = re.sub(r"[\s-]+", "-", slug).strip("-")
+    return slug or fallback
+
+
+def kanban_compact_card(node, view="summary", preview_chars=240):
+    item = summarize_node(node, view=view, preview_chars=preview_chars)
+    metadata = node_metadata(node)
+    item["title"] = kanban_title(node)
+    item["column"] = kanban_column(node)
+    priority = kanban_priority(node)
+    if priority:
+        item["priority"] = priority
+    owner = kanban_owner(node)
+    if owner:
+        item["owner"] = owner
+    item["blocked"] = kanban_blocked(node)
+    blocked_by = metadata.get("blocked_by")
+    if blocked_by not in (None, ""):
+        item["blocked_by"] = str(blocked_by).strip()
+    due_date = metadata.get("due_date")
+    if due_date not in (None, ""):
+        item["due_date"] = str(due_date).strip()
+    rank = metadata.get("rank") if metadata.get("rank") not in (None, "") else metadata.get("order")
+    if rank not in (None, ""):
+        item["rank"] = str(rank).strip()
+    lifecycle_state = kanban_lifecycle_state(node)
+    if lifecycle_state:
+        item["lifecycle_state"] = lifecycle_state
+    return {key: value for key, value in item.items() if value not in (None, "")}
 
 
 def kanban_blocked(node):
@@ -7580,16 +7671,9 @@ def list_kanban_cards(args):
         enriched["blocked"] = blocked
         items.append(enriched)
 
+    items.sort(key=kanban_sort_key)
     returned_items = items[:limit]
-    summarized = [summarize_node(node, view=view, preview_chars=preview_chars) for node in returned_items]
-    for item, node in zip(summarized, returned_items):
-        if node.get("column") is not None:
-            item["column"] = node["column"]
-        if node.get("priority") is not None:
-            item["priority"] = node["priority"]
-        if node.get("owner") is not None:
-            item["owner"] = node["owner"]
-        item["blocked"] = bool(node.get("blocked"))
+    summarized = [kanban_compact_card(node, view=view, preview_chars=preview_chars) for node in returned_items]
     groups = {}
     for item, node in zip(summarized, returned_items):
         if group_by == "column":
@@ -7637,6 +7721,216 @@ def list_kanban_cards(args):
         if view_warnings:
             response["warnings"] = view_warnings
     return response
+
+
+def get_kanban_column(args, column):
+    query = dict(args or {})
+    query["column"] = normalize_kanban_column(column)
+    query.setdefault("active_only", column != "done")
+    return list_kanban_cards(query)
+
+
+def get_pending_kanban_cards(args):
+    args = dict(args or {})
+    include_backlog = as_bool(args.pop("include_backlog", True), True)
+    include_blocked = as_bool(args.pop("include_blocked", False), False)
+    limit = normalize_int(args.get("limit"), DISCOVERY_DEFAULT_LIMIT, 1, DISCOVERY_COMPACT_MAX_LIMIT)
+    query = {
+        **args,
+        "column": ["todo", "backlog"] if include_backlog else ["todo"],
+        "blocked": None if include_blocked else False,
+        "active_only": True,
+        "limit": limit,
+        "group_by": args.get("group_by") or "column",
+    }
+    result = list_kanban_cards(query)
+    def pending_key(item):
+        try:
+            rank = int(str(item.get("rank") or "").strip())
+        except (TypeError, ValueError):
+            rank = 10**12
+        return (
+            0 if item.get("column") == "todo" else 1,
+            KANBAN_PRIORITY_RANK.get(item.get("priority") or "normal", KANBAN_PRIORITY_RANK["normal"]),
+            rank,
+            str(item.get("updated_at") or ""),
+            str(item.get("full_path") or ""),
+        )
+    result["items"] = sorted(result.get("items") or [], key=pending_key)
+    return result
+
+
+def get_blocked_kanban_cards(args):
+    query = {**(args or {}), "blocked": True, "active_only": False}
+    return list_kanban_cards(query)
+
+
+def pick_next_kanban_card(args):
+    args = dict(args or {})
+    result = get_pending_kanban_cards({**args, "limit": max(normalize_int(args.get("limit"), 25, 1, DISCOVERY_COMPACT_MAX_LIMIT), 25)})
+    items = result.get("items") or []
+    item = items[0] if items else None
+    return {
+        "ok": True,
+        "project_id": result.get("project_id"),
+        "selected": item,
+        "items_considered": len(items),
+        "selection": {
+            "columns": ["todo", "backlog"] if as_bool(args.get("include_backlog"), True) else ["todo"],
+            "blocked_excluded": not as_bool(args.get("include_blocked"), False),
+            "sort": ["column", "priority", "rank", "updated_at", "path"],
+        },
+    }
+
+
+def kanban_card_by_path(path):
+    node = get_node_by_path({"path": normalize_node_path(path), "view": "render"})
+    if not normalize_node_path(node.get("full_path") or "").startswith("/kanban/"):
+        raise RuntimeError("kanban command path must reference a /kanban card")
+    return node
+
+
+def kanban_target_path(node, column):
+    column = normalize_kanban_column(column)
+    title_slug = normalize_kanban_slug(node.get("name") or kanban_title(node))
+    return f"/kanban/{column}/{title_slug}"
+
+
+def next_kanban_rank(column):
+    cards = list_kanban_cards({"column": column, "active_only": False, "limit": DISCOVERY_COMPACT_MAX_LIMIT, "view": "metadata"}).get("items", [])
+    ranks = []
+    for card in cards:
+        metadata = node_metadata(card)
+        value = metadata.get("rank") if metadata.get("rank") not in (None, "") else card.get("rank")
+        try:
+            ranks.append(int(str(value).strip()))
+        except (TypeError, ValueError):
+            continue
+    return kanban_rank_token((max(ranks) if ranks else 0) + 1024)
+
+
+def kanban_card_metadata(args, existing=None, column=None):
+    metadata = dict(node_metadata(existing or {}))
+    if isinstance(args.get("metadata"), dict):
+        metadata.update(args["metadata"])
+    if args.get("title") not in (None, ""):
+        metadata["title"] = str(args["title"]).strip()
+    if args.get("priority") not in (None, "") or "priority" not in metadata:
+        metadata["priority"] = normalize_kanban_priority(args.get("priority", metadata.get("priority")))
+    if args.get("owner") not in (None, ""):
+        metadata["owner"] = str(args["owner"]).strip()
+    if args.get("assignee") not in (None, ""):
+        metadata["assignee"] = str(args["assignee"]).strip()
+    if args.get("due_date") not in (None, ""):
+        metadata["due_date"] = str(args["due_date"]).strip()
+    if column:
+        column = normalize_kanban_column(column)
+        metadata["column"] = column
+        metadata["status"] = column
+        metadata["lifecycle_state"] = KANBAN_COLUMN_LIFECYCLE[column]
+    if "blocked" in args:
+        metadata["blocked"] = as_bool(args.get("blocked"), False)
+    if args.get("blocked_by") not in (None, ""):
+        metadata["blocked_by"] = str(args["blocked_by"]).strip()
+    if args.get("blocked_reason") not in (None, ""):
+        metadata["blocked_by"] = str(args["blocked_reason"]).strip()
+    return metadata
+
+
+def create_kanban_card(args):
+    args = dict(args or {})
+    title = str(args.get("title") or args.get("name") or "").strip()
+    if not title:
+        raise RuntimeError("title is required")
+    column = normalize_kanban_column(args.get("column"), "todo")
+    slug = normalize_kanban_slug(args.get("slug") or title)
+    path = f"/kanban/{column}/{slug}"
+    metadata = kanban_card_metadata(args, column=column)
+    metadata.setdefault("rank", next_kanban_rank(column))
+    payload = {
+        "path": path,
+        "type": "kanban_card",
+        "tags": unique_preserve_order(list(args.get("tags") or []) + ["kanban"]),
+        "aliases": args.get("aliases") or [],
+        "links": args.get("links") or [],
+        "metadata": metadata,
+        "content_text": args.get("content_text") or args.get("body") or "",
+    }
+    result = upsert_node(payload) if as_bool(args.get("upsert"), False) else None
+    if result is None:
+        project_id = resolve_project_id(args)
+        created = request_project_write(
+            "POST",
+            f"/v1/projects/{project_id}/nodes",
+            encrypt_node_payload_for_write(project_id, node_payload_from_args(payload)),
+            project_id,
+            f"create kanban card {path}",
+            "path",
+            path,
+        )
+        index_node(created)
+        result = {"created": True, "node": decrypt_node_for_return(created, project_id=project_id)}
+    node = result.get("node", result)
+    return {"ok": True, "created": bool(result.get("created", True)), "path": node.get("full_path"), "node": kanban_compact_card(node, view="summary")}
+
+
+def update_kanban_card(args):
+    args = dict(args or {})
+    path = args.get("path")
+    if not path:
+        raise RuntimeError("path is required")
+    existing = kanban_card_by_path(path)
+    metadata = kanban_card_metadata(args, existing=existing, column=kanban_column(existing))
+    if "clear_blocked_by" in args and as_bool(args.get("clear_blocked_by"), False):
+        metadata.pop("blocked_by", None)
+    payload = {
+        "path": existing["full_path"],
+        "type": args.get("type") or existing.get("type") or "kanban_card",
+        "tags": args.get("tags", existing.get("tags") or []),
+        "aliases": args.get("aliases", existing.get("aliases") or []),
+        "links": args.get("links", existing.get("links") or []),
+        "metadata": metadata,
+    }
+    if "content_text" in args or "body" in args:
+        payload["content_text"] = args.get("content_text") if "content_text" in args else args.get("body")
+    updated = update_node_by_path(payload)
+    return {"ok": True, "updated": True, "node": kanban_compact_card(updated["node"], view="summary")}
+
+
+def move_kanban_card(args, target_column):
+    args = dict(args or {})
+    path = args.get("path")
+    if not path:
+        raise RuntimeError("path is required")
+    target_column = normalize_kanban_column(args.get("column") or target_column)
+    existing = kanban_card_by_path(path)
+    source = existing["full_path"]
+    target = kanban_target_path(existing, target_column)
+    metadata = kanban_card_metadata(args, existing=existing, column=target_column)
+    metadata["rank"] = args.get("rank") or next_kanban_rank(target_column)
+    project_id = resolve_project_id(args)
+    payload = node_payload_from_args({"path": target, "metadata": metadata}, existing=existing)
+    updated = request_project_write(
+        "PATCH",
+        f"/v1/projects/{project_id}/nodes/{existing['id']}",
+        encrypt_node_payload_for_write(project_id, payload, existing=existing),
+        project_id,
+        f"move kanban card {source} to {target}",
+        "path",
+        source,
+    )
+    remove_indexed_node(existing["id"])
+    index_node(updated)
+    node = decrypt_node_for_return(updated, project_id=project_id)
+    return {"ok": True, "changed": True, "from": source, "to": node.get("full_path"), "node": kanban_compact_card(node, view="summary")}
+
+
+def block_kanban_card(args, blocked):
+    args = dict(args or {})
+    args["blocked"] = blocked
+    if not blocked:
+        args["clear_blocked_by"] = True
+    return update_kanban_card(args)
 
 
 def link_present(links, path, relation):
@@ -9263,6 +9557,119 @@ def start_local_ui(args):
     return {"status": "running", "url": url, "project_id": current_project_id()}
 
 
+def kanban_workflow_tool_schemas():
+    compact_read_schema = {
+        "type": "object",
+        "properties": {
+            "q": {"type": "string"},
+            "include_blocked": {"type": "boolean", "default": False},
+            "include_backlog": {"type": "boolean", "default": True},
+            "active_only": {"type": "boolean", "default": True},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 25},
+            "view": {"type": "string", "enum": ["paths", "summary", "metadata"], "default": "summary"},
+            "verbose": {"type": "boolean", "default": False},
+            "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
+        },
+        "additionalProperties": False,
+    }
+    column_read_schema = {
+        "type": "object",
+        "properties": {
+            "q": {"type": "string"},
+            "blocked": {"type": "boolean"},
+            "active_only": {"type": "boolean", "default": True},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 25},
+            "view": {"type": "string", "enum": ["paths", "summary", "metadata"], "default": "summary"},
+            "verbose": {"type": "boolean", "default": False},
+            "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
+        },
+        "additionalProperties": False,
+    }
+    card_path_schema = {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+            "path": {"type": "string"},
+            "rank": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
+    block_schema = {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+            "path": {"type": "string"},
+            "blocked_by": {"type": "string"},
+            "blocked_reason": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
+    update_schema = {
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+            "path": {"type": "string"},
+            "title": {"type": "string"},
+            "content_text": {"type": "string"},
+            "body": {"type": "string"},
+            "priority": {"type": "string", "enum": DEFAULT_KANBAN_PRIORITIES},
+            "owner": {"type": "string"},
+            "assignee": {"type": "string"},
+            "due_date": {"type": "string"},
+            "blocked": {"type": "boolean"},
+            "blocked_by": {"type": "string"},
+            "blocked_reason": {"type": "string"},
+            "metadata": {"type": "object"},
+            "links": {"type": "array", "items": {"type": "object"}},
+            "tags": {"type": "array", "items": {"type": "string"}},
+        },
+        "additionalProperties": False,
+    }
+    return [
+        {"name": "nap_kanban_get_pending", "description": "Get actionable unblocked not-started Kanban work from /kanban/todo and optionally /kanban/backlog.", "inputSchema": compact_read_schema},
+        {"name": "nap_kanban_get_backlog", "description": "Get node-backed Kanban cards in /kanban/backlog.", "inputSchema": column_read_schema},
+        {"name": "nap_kanban_get_todo", "description": "Get node-backed Kanban cards in /kanban/todo.", "inputSchema": column_read_schema},
+        {"name": "nap_kanban_get_working", "description": "Get node-backed Kanban cards currently working; maps to canonical /kanban/doing.", "inputSchema": column_read_schema},
+        {"name": "nap_kanban_get_review", "description": "Get node-backed Kanban cards in /kanban/review.", "inputSchema": column_read_schema},
+        {"name": "nap_kanban_get_done", "description": "Get node-backed Kanban cards in /kanban/done.", "inputSchema": {**column_read_schema, "properties": {**column_read_schema["properties"], "active_only": {"type": "boolean", "default": False}}}},
+        {"name": "nap_kanban_get_blocked", "description": "Get blocked node-backed Kanban cards across columns.", "inputSchema": column_read_schema},
+        {"name": "nap_kanban_pick_next", "description": "Pick the next unblocked Kanban card from pending work by column, priority, and rank.", "inputSchema": compact_read_schema},
+        {
+            "name": "nap_kanban_create",
+            "description": "Create a normal node-backed Kanban card under /kanban/<column>/<slug>.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["title"],
+                "properties": {
+                    "title": {"type": "string"},
+                    "slug": {"type": "string"},
+                    "column": {"type": "string", "enum": DEFAULT_KANBAN_COLUMNS, "default": "todo"},
+                    "content_text": {"type": "string"},
+                    "body": {"type": "string"},
+                    "priority": {"type": "string", "enum": DEFAULT_KANBAN_PRIORITIES, "default": "normal"},
+                    "owner": {"type": "string"},
+                    "assignee": {"type": "string"},
+                    "due_date": {"type": "string"},
+                    "blocked": {"type": "boolean"},
+                    "blocked_by": {"type": "string"},
+                    "links": {"type": "array", "items": {"type": "object"}},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "metadata": {"type": "object"},
+                    "upsert": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {"name": "nap_kanban_start", "description": "Move a Kanban card to working state, canonical /kanban/doing.", "inputSchema": card_path_schema},
+        {"name": "nap_kanban_send_review", "description": "Move a Kanban card to /kanban/review.", "inputSchema": card_path_schema},
+        {"name": "nap_kanban_complete", "description": "Move a Kanban card to /kanban/done.", "inputSchema": card_path_schema},
+        {"name": "nap_kanban_block", "description": "Mark a Kanban card blocked and optionally record a reason.", "inputSchema": block_schema},
+        {"name": "nap_kanban_unblock", "description": "Clear a Kanban card blocked state and reason.", "inputSchema": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}, "additionalProperties": False}},
+        {"name": "nap_kanban_update", "description": "Update common Kanban card fields while preserving the node-backed model.", "inputSchema": update_schema},
+        {"name": "nap_kanban_archive", "description": "Archive a node-backed Kanban card.", "inputSchema": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}, "dry_run": {"type": "boolean", "default": False}}, "additionalProperties": False}},
+    ]
+
+
 def raw_tools():
     return [
         {
@@ -9608,6 +10015,7 @@ def raw_tools():
                 "additionalProperties": False,
             },
         },
+        *kanban_workflow_tool_schemas(),
         {
             "name": "nap_context",
             "description": "Fetch one or more nodes plus bounded outgoing links and backlinks for surrounding context.",
@@ -10210,6 +10618,14 @@ TOOL_CATEGORIES = {
         "nap_find",
         "nap_plan_list_active",
         "nap_kanban_list",
+        "nap_kanban_get_pending",
+        "nap_kanban_get_backlog",
+        "nap_kanban_get_todo",
+        "nap_kanban_get_working",
+        "nap_kanban_get_review",
+        "nap_kanban_get_done",
+        "nap_kanban_get_blocked",
+        "nap_kanban_pick_next",
         "nap_context",
         "nap_tree",
         "nap_stat",
@@ -10234,6 +10650,14 @@ TOOL_CATEGORIES = {
         "nap_plan_complete",
         "nap_plan_supersede",
         "nap_plan_cancel",
+        "nap_kanban_create",
+        "nap_kanban_start",
+        "nap_kanban_send_review",
+        "nap_kanban_complete",
+        "nap_kanban_block",
+        "nap_kanban_unblock",
+        "nap_kanban_update",
+        "nap_kanban_archive",
         "nap_ln",
         "nap_mv",
         "nap_mv_folder",
@@ -10298,6 +10722,14 @@ READ_ONLY_TOOLS = {
     "nap_find",
     "nap_plan_list_active",
     "nap_kanban_list",
+    "nap_kanban_get_pending",
+    "nap_kanban_get_backlog",
+    "nap_kanban_get_todo",
+    "nap_kanban_get_working",
+    "nap_kanban_get_review",
+    "nap_kanban_get_done",
+    "nap_kanban_get_blocked",
+    "nap_kanban_pick_next",
     "nap_context",
     "nap_tree",
     "nap_stat",
@@ -10341,6 +10773,14 @@ AUTO_LOCK_TOOLS = {
     "nap_plan_complete",
     "nap_plan_supersede",
     "nap_plan_cancel",
+    "nap_kanban_create",
+    "nap_kanban_start",
+    "nap_kanban_send_review",
+    "nap_kanban_complete",
+    "nap_kanban_block",
+    "nap_kanban_unblock",
+    "nap_kanban_update",
+    "nap_kanban_archive",
     "nap_ln",
     "nap_mv",
     "nap_mv_folder",
@@ -10636,6 +11076,22 @@ def call_tool_impl(name, args):
         return list_active_plans(args)
     if name == "nap_kanban_list":
         return list_kanban_cards(args)
+    if name == "nap_kanban_get_pending":
+        return get_pending_kanban_cards(args)
+    if name == "nap_kanban_get_backlog":
+        return get_kanban_column(args, "backlog")
+    if name == "nap_kanban_get_todo":
+        return get_kanban_column(args, "todo")
+    if name == "nap_kanban_get_working":
+        return get_kanban_column(args, "doing")
+    if name == "nap_kanban_get_review":
+        return get_kanban_column(args, "review")
+    if name == "nap_kanban_get_done":
+        return get_kanban_column({**args, "active_only": False}, "done")
+    if name == "nap_kanban_get_blocked":
+        return get_blocked_kanban_cards(args)
+    if name == "nap_kanban_pick_next":
+        return pick_next_kanban_card(args)
     if name == "nap_context":
         return get_memory_context(args)
     if name == "nap_tree":
@@ -10703,6 +11159,22 @@ def call_tool_impl(name, args):
         return supersede_plan(args)
     if name == "nap_plan_cancel":
         return cancel_plan(args)
+    if name == "nap_kanban_create":
+        return create_kanban_card(args)
+    if name == "nap_kanban_start":
+        return move_kanban_card(args, "doing")
+    if name == "nap_kanban_send_review":
+        return move_kanban_card(args, "review")
+    if name == "nap_kanban_complete":
+        return move_kanban_card(args, "done")
+    if name == "nap_kanban_block":
+        return block_kanban_card(args, True)
+    if name == "nap_kanban_unblock":
+        return block_kanban_card(args, False)
+    if name == "nap_kanban_update":
+        return update_kanban_card(args)
+    if name == "nap_kanban_archive":
+        return archive_node_by_path(args)
     if name == "nap_cat":
         return get_node_by_path(args)
     if name == "nap_ln":
