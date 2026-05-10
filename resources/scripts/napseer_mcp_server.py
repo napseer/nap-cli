@@ -115,6 +115,26 @@ KANBAN_RELATIONS = {
     "implements",
     "references",
 }
+KANBAN_RELATION_BLOCKED_BY = "blocked_by"
+KANBAN_RELATION_BLOCKS = "blocks"
+KANBAN_RELATIONS_SOFT_DEPENDENCY = {"follows", "precedes"}
+KANBAN_RELATIONS_RELATED = {"relates_to", "tracks", "tracked_by"}
+KANBAN_RELATION_CHILD_OF = "child_of"
+KANBAN_RELATION_PARENT_OF = "parent_of"
+KANBAN_RELATIONS_DUPLICATE = {"duplicates", "duplicate_of"}
+KANBAN_RELATIONS_MILESTONE = {"milestone_of", "has_milestone"}
+KANBAN_RELATION_MUTUALLY_EXCLUSIVE = "mutually_exclusive_with"
+KANBAN_DEPENDENCY_VIEWS = ["ready", "blocked", "blocking", "related", "children", "duplicates"]
+KANBAN_DEPENDENCY_VIEW_READY = "ready"
+KANBAN_DEPENDENCY_VIEW_BLOCKED = "blocked"
+KANBAN_DEPENDENCY_VIEW_BLOCKING = "blocking"
+KANBAN_DEPENDENCY_VIEW_RELATED = "related"
+KANBAN_DEPENDENCY_VIEW_CHILDREN = "children"
+KANBAN_DEPENDENCY_VIEW_DUPLICATES = "duplicates"
+KANBAN_EXTERNAL_BLOCKERS_KEY = "external_blockers"
+KANBAN_BLOCK_STATE_OPEN_HARD_KEY = "open_hard_blockers"
+KANBAN_RESOLVED_EXTERNAL_STATES = {"done", "closed", "resolved"}
+KANBAN_SOFT_BLOCKER_STRENGTH = "soft"
 KANBAN_PRIORITY_RANK = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
 KANBAN_COLUMN_LIFECYCLE = {
     "backlog": "open",
@@ -7588,16 +7608,16 @@ def kanban_block_state_count(metadata, key):
 
 
 def kanban_external_blocker_count(metadata):
-    external_blockers = metadata.get("external_blockers")
+    external_blockers = metadata.get(KANBAN_EXTERNAL_BLOCKERS_KEY)
     if not isinstance(external_blockers, list):
-        return kanban_block_state_count(metadata, "external_blockers")
+        return kanban_block_state_count(metadata, KANBAN_EXTERNAL_BLOCKERS_KEY)
     count = 0
     for blocker in external_blockers:
         if not isinstance(blocker, dict):
             continue
         state = str(blocker.get("state") or "open").strip().lower()
         strength = str(blocker.get("strength") or "hard").strip().lower()
-        if state not in {"done", "closed", "resolved"} and strength != "soft":
+        if state not in KANBAN_RESOLVED_EXTERNAL_STATES and strength != KANBAN_SOFT_BLOCKER_STRENGTH:
             count += 1
     return count
 
@@ -7618,27 +7638,27 @@ def kanban_dependency_summary(node):
         path = link.get("path")
         if not relation or not path:
             continue
-        if relation == "blocked_by":
+        if relation == KANBAN_RELATION_BLOCKED_BY:
             hard_blockers.append(path)
-        elif relation == "blocks":
+        elif relation == KANBAN_RELATION_BLOCKS:
             blocking.append(path)
-        elif relation in {"follows", "precedes"}:
+        elif relation in KANBAN_RELATIONS_SOFT_DEPENDENCY:
             soft_dependencies.append(path)
-        elif relation in {"relates_to", "tracks", "tracked_by"}:
+        elif relation in KANBAN_RELATIONS_RELATED:
             related.append(path)
-        elif relation == "child_of":
+        elif relation == KANBAN_RELATION_CHILD_OF:
             parents.append(path)
-        elif relation == "parent_of":
+        elif relation == KANBAN_RELATION_PARENT_OF:
             children.append(path)
-        elif relation in {"duplicates", "duplicate_of"}:
+        elif relation in KANBAN_RELATIONS_DUPLICATE:
             duplicates.append(path)
-        elif relation in {"milestone_of", "has_milestone"}:
+        elif relation in KANBAN_RELATIONS_MILESTONE:
             milestones.append(path)
-        elif relation == "mutually_exclusive_with":
+        elif relation == KANBAN_RELATION_MUTUALLY_EXCLUSIVE:
             mutual_exclusions.append(path)
 
     blocked_reason = ""
-    blocked_by = metadata.get("blocked_by")
+    blocked_by = metadata.get(KANBAN_RELATION_BLOCKED_BY)
     if blocked_by not in (None, ""):
         blocked_by_text = str(blocked_by).strip()
         if blocked_by_text.startswith("/"):
@@ -7647,7 +7667,7 @@ def kanban_dependency_summary(node):
             blocked_reason = blocked_by_text
 
     external_blockers = kanban_external_blocker_count(metadata)
-    open_hard_blockers = kanban_block_state_count(metadata, "open_hard_blockers")
+    open_hard_blockers = kanban_block_state_count(metadata, KANBAN_BLOCK_STATE_OPEN_HARD_KEY)
     blocked = (
         as_bool(metadata.get("blocked") if "blocked" in metadata else metadata.get("blocking"), False)
         or bool(hard_blockers)
@@ -7826,8 +7846,8 @@ def list_kanban_cards(args):
     if blocked_filter is None:
         blocked_filter = args.get("blocking")
     dependency_view = str(args.get("dependency_view") or args.get("relation_view") or "").strip().lower().replace("-", "_")
-    if dependency_view and dependency_view not in {"ready", "blocked", "blocking", "related", "children", "duplicates"}:
-        raise RuntimeError("dependency_view must be ready, blocked, blocking, related, children, or duplicates")
+    if dependency_view and dependency_view not in KANBAN_DEPENDENCY_VIEWS:
+        raise RuntimeError(f"dependency_view must be one of: {', '.join(KANBAN_DEPENDENCY_VIEWS)}")
     group_by = str(args.get("group_by") or "column").strip().lower()
     if group_by not in {"column", "status", "priority", "owner", "blocked"}:
         raise RuntimeError("group_by must be column, status, priority, owner, or blocked")
@@ -7882,17 +7902,17 @@ def list_kanban_cards(args):
             continue
         if blocked_filter is not None and blocked != as_bool(blocked_filter, False):
             continue
-        if dependency_view == "ready" and blocked:
+        if dependency_view == KANBAN_DEPENDENCY_VIEW_READY and blocked:
             continue
-        if dependency_view == "blocked" and not blocked:
+        if dependency_view == KANBAN_DEPENDENCY_VIEW_BLOCKED and not blocked:
             continue
-        if dependency_view == "blocking" and not dependencies["blocking"]:
+        if dependency_view == KANBAN_DEPENDENCY_VIEW_BLOCKING and not dependencies["blocking"]:
             continue
-        if dependency_view == "related" and not dependencies["related"]:
+        if dependency_view == KANBAN_DEPENDENCY_VIEW_RELATED and not dependencies["related"]:
             continue
-        if dependency_view == "children" and not dependencies["children"]:
+        if dependency_view == KANBAN_DEPENDENCY_VIEW_CHILDREN and not dependencies["children"]:
             continue
-        if dependency_view == "duplicates" and not dependencies["duplicates"]:
+        if dependency_view == KANBAN_DEPENDENCY_VIEW_DUPLICATES and not dependencies["duplicates"]:
             continue
         if not kanban_text_matches(node, args.get("q")):
             continue
@@ -9803,7 +9823,7 @@ def kanban_workflow_tool_schemas():
             "include_blocked": {"type": "boolean", "default": False},
             "include_backlog": {"type": "boolean", "default": True},
             "active_only": {"type": "boolean", "default": True},
-            "dependency_view": {"type": "string", "enum": ["ready", "blocked", "blocking", "related", "children", "duplicates"]},
+            "dependency_view": {"type": "string", "enum": KANBAN_DEPENDENCY_VIEWS},
             "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 25},
             "view": {"type": "string", "enum": ["paths", "summary", "metadata"], "default": "summary"},
             "verbose": {"type": "boolean", "default": False},
@@ -9817,7 +9837,7 @@ def kanban_workflow_tool_schemas():
             "q": {"type": "string"},
             "blocked": {"type": "boolean"},
             "active_only": {"type": "boolean", "default": True},
-            "dependency_view": {"type": "string", "enum": ["ready", "blocked", "blocking", "related", "children", "duplicates"]},
+            "dependency_view": {"type": "string", "enum": KANBAN_DEPENDENCY_VIEWS},
             "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 25},
             "view": {"type": "string", "enum": ["paths", "summary", "metadata"], "default": "summary"},
             "verbose": {"type": "boolean", "default": False},
@@ -10245,7 +10265,7 @@ def raw_tools():
                     "assignee": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
                     "blocked": {"type": "boolean"},
                     "blocking": {"type": "boolean"},
-                    "dependency_view": {"type": "string", "enum": ["ready", "blocked", "blocking", "related", "children", "duplicates"]},
+                    "dependency_view": {"type": "string", "enum": KANBAN_DEPENDENCY_VIEWS},
                     "active_only": {"type": "boolean", "default": True},
                     "group_by": {"type": "string", "enum": ["column", "status", "priority", "owner", "blocked"], "default": "column"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 25},
