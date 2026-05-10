@@ -7542,6 +7542,44 @@ def normalize_kanban_slug(value, fallback="untitled"):
     return slug or fallback
 
 
+def kanban_timestamp_token(value=None):
+    if value is None:
+        value = datetime.now(timezone.utc)
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            value = datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    value = value.astimezone(timezone.utc)
+    return value.strftime("%Y%m%d%H%M%S")
+
+
+def unique_kanban_slug(column, slug, existing_cards=None, now=None):
+    column = normalize_kanban_column(column)
+    slug = normalize_kanban_slug(slug)
+    cards = existing_cards
+    if cards is None:
+        cards = list_kanban_cards({"column": column, "active_only": False, "limit": DISCOVERY_COMPACT_MAX_LIMIT, "view": "metadata"}).get("items", [])
+    folder = f"/kanban/{column}"
+    existing_names = set()
+    for card in cards or []:
+        path = normalize_node_path(card.get("full_path") or "")
+        if path.startswith(f"{folder}/"):
+            existing_names.add(path[len(folder) + 1:])
+    if slug not in existing_names:
+        return slug
+    stamped = f"{slug}-{kanban_timestamp_token(now)}"
+    if stamped not in existing_names:
+        return stamped
+    for index in range(2, 100):
+        candidate = f"{stamped}-{index}"
+        if candidate not in existing_names:
+            return candidate
+    return f"{stamped}-{secrets.token_hex(3)}"
+
+
 def kanban_compact_card(node, view="summary", preview_chars=240):
     item = summarize_node(node, view=view, preview_chars=preview_chars)
     metadata = node_metadata(node)
@@ -7861,6 +7899,8 @@ def create_kanban_card(args):
         raise RuntimeError("title is required")
     column = normalize_kanban_column(args.get("column"), "todo")
     slug = normalize_kanban_slug(args.get("slug") or title)
+    if not as_bool(args.get("upsert"), False):
+        slug = unique_kanban_slug(column, slug, now=args.get("now"))
     path = f"/kanban/{column}/{slug}"
     metadata = kanban_card_metadata(args, column=column)
     metadata.setdefault("rank", next_kanban_rank(column))

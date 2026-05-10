@@ -260,6 +260,31 @@ def test_kanban_workflow_create_move_and_block(mod):
     assert writes[2][2]["metadata"]["blocked_by"] == "waiting"
 
 
+def test_kanban_create_deduplicates_overlapping_titles(mod):
+    writes = []
+    existing_cards = [
+        node("/kanban/todo/add-mcp-commands", "todo", metadata={"column": "todo"}, tags=["kanban"], node_type="kanban_card"),
+        node("/kanban/todo/add-mcp-commands-20260510123456", "todo", metadata={"column": "todo"}, tags=["kanban"], node_type="kanban_card"),
+        node("/kanban/doing/add-mcp-commands", "doing", metadata={"column": "doing"}, tags=["kanban"], node_type="kanban_card"),
+    ]
+
+    mod.list_kanban_cards = lambda args: {"items": existing_cards if args.get("column") == "todo" else []}
+    mod.request_project_write = lambda method, path, payload, *args, **kwargs: writes.append((method, path, payload)) or {
+        **existing_cards[0],
+        "id": "id-deduped",
+        "full_path": f"{payload.get('folder_path')}/{payload.get('name')}",
+        "folder_path": payload.get("folder_path"),
+        "name": payload.get("name"),
+        "metadata": payload.get("metadata", {}),
+        "tags": payload.get("tags", []),
+    }
+    mod.index_node = lambda node: None
+
+    created = mod.create_kanban_card({"title": "Add MCP commands", "column": "todo", "now": "2026-05-10T12:34:56Z"})
+    assert created["path"] == "/kanban/todo/add-mcp-commands-20260510123456-2"
+    assert writes[0][2]["name"] == "add-mcp-commands-20260510123456-2"
+
+
 def test_plan_lifecycle_dry_run_and_write(mod):
     plan = node("/plans/example", "in_progress", tags=["plan"])
     outcome = node("/implementation-notes/example", "completed", node_type="implementation-note")
@@ -347,6 +372,8 @@ def run():
     test_kanban_workflow_reads_pending_and_pick_next(mod)
     mod = load_module()
     test_kanban_workflow_create_move_and_block(mod)
+    mod = load_module()
+    test_kanban_create_deduplicates_overlapping_titles(mod)
     mod = load_module()
     test_plan_lifecycle_dry_run_and_write(mod)
     mod = load_module()
