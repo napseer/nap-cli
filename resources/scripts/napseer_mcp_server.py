@@ -2523,7 +2523,7 @@ def relay_ws_url(project_id, session_id, ticket, socket="terminal"):
     parsed = urllib.parse.urlparse(relay_base_url())
     scheme = "wss" if parsed.scheme == "https" else "ws"
     netloc = parsed.netloc
-    return f"{scheme}://{netloc}/v1/projects/{project_id}/gateway-sessions/{session_id}/relay/{socket}?{urllib.parse.urlencode({'ticket': ticket})}"
+    return f"{scheme}://{netloc}/v1/projects/{project_id}/gateway-sessions/{session_id}/relay/{socket}?{rest_query_string({'ticket': ticket})}"
 
 
 def gateway_listener_ws_url(project_id, agent_id):
@@ -5325,6 +5325,23 @@ def request_json(method, path, payload=None, token_required=True, retry_auth=Tru
         raise RuntimeError(f"{method} {path} failed: HTTP {exc.code}: {body_text}") from exc
 
 
+def rest_query_string(params):
+    def encode_value(value):
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return value
+
+    normalized = {}
+    for key, value in (params or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            normalized[key] = [encode_value(item) for item in value]
+        else:
+            normalized[key] = encode_value(value)
+    return urllib.parse.urlencode(normalized, doseq=True)
+
+
 def request_form_json(method, path, payload, token_required=False, extra_headers=None):
     if token_required and not TOKEN:
         raise RuntimeError("NAPSEER_TOKEN is required")
@@ -5832,7 +5849,7 @@ def reindex_project(args):
         query = {"limit": limit}
         if cursor:
             query["cursor"] = cursor
-        page = request_json("GET", f"/v1/projects/{project_id}/nodes?{urllib.parse.urlencode(query)}")
+        page = request_json("GET", f"/v1/projects/{project_id}/nodes?{rest_query_string(query)}")
         nodes.extend(filter_project_nodes(page.get("items", [])))
         cursor = page.get("next_cursor")
         if not cursor:
@@ -7134,7 +7151,7 @@ def get_node_by_path(args, allow_agent=False):
     params = {"path": path}
     if args.get("view"):
         params["view"] = args["view"]
-    node = request_json("GET", f"/v1/projects/{project_id}/nodes/by-path?{urllib.parse.urlencode(params)}")
+    node = request_json("GET", f"/v1/projects/{project_id}/nodes/by-path?{rest_query_string(params)}")
     return decrypt_node_for_return(node, project_id=project_id)
 
 
@@ -7177,7 +7194,7 @@ def guarded_node_patch(args):
     path = normalize_node_path(args["path"])
     result = request_project_write(
         "PATCH",
-        f"/v1/projects/{project_id}/nodes/by-path?{urllib.parse.urlencode({'path': path})}",
+        f"/v1/projects/{project_id}/nodes/by-path?{rest_query_string({'path': path})}",
         payload,
         project_id,
         f"guarded patch node {path}",
@@ -7391,7 +7408,7 @@ def list_project_nodes(args):
             query = dict(base_query)
             query["q"] = server_query
             query["limit"] = max(1, limit - len(unique_nodes(collected)))
-            suffix = f"?{urllib.parse.urlencode(query)}"
+            suffix = f"?{rest_query_string(query)}"
             page = request_json("GET", f"/v1/projects/{project_id}/nodes{suffix}")
             items = decrypt_nodes_for_return(filter_project_nodes(page.get("items", [])), project_id=project_id)
             diagnostics["server_queries"].append({"q": server_query, "matched": len(items)})
@@ -7412,7 +7429,7 @@ def list_project_nodes(args):
             ),
         }
 
-    query = urllib.parse.urlencode(base_query)
+    query = rest_query_string(base_query)
     suffix = f"?{query}" if query else ""
     result = request_json("GET", f"/v1/projects/{project_id}/nodes{suffix}")
     items = decrypt_nodes_for_return(filter_project_nodes(result.get("items", [])), project_id=project_id)
@@ -7623,7 +7640,7 @@ def list_kanban_cards(args):
     source_pages = 0
     seen_cursors = set()
     while True:
-        suffix = f"?{urllib.parse.urlencode(source_query)}"
+        suffix = f"?{rest_query_string(source_query)}"
         raw = request_json("GET", f"/v1/projects/{project_id}/nodes{suffix}")
         page_items = decrypt_nodes_for_return(filter_project_nodes(raw.get("items", [])), project_id=project_id)
         source_items.extend(page_items)
@@ -8160,7 +8177,7 @@ def list_feedback_reports(args=None):
         value = args.get(key)
         if value not in (None, ""):
             query[key] = value
-    suffix = f"?{urllib.parse.urlencode(query)}" if query else ""
+    suffix = f"?{rest_query_string(query)}" if query else ""
     return request_json("GET", f"/v1/feedback{suffix}")
 
 
@@ -8171,7 +8188,7 @@ def list_admin_feedback_reports(args=None):
         value = args.get(key)
         if value not in (None, ""):
             query[key] = value
-    suffix = f"?{urllib.parse.urlencode(query)}" if query else ""
+    suffix = f"?{rest_query_string(query)}" if query else ""
     if LOCAL_AUTH_SECRET and LOCAL_AUTH_PURPOSE == "admin_feedback":
         return request_json(
             "GET",
@@ -8655,7 +8672,7 @@ def list_agent_nodes(args):
         query["tag"] = args["tag"]
     if args.get("folder_path"):
         query["folder_path"] = agent_scoped_folder(args)
-    suffix = urllib.parse.urlencode(query)
+    suffix = rest_query_string(query)
     nodes = request_json("GET", f"/v1/projects/{project_id}/nodes?{suffix}").get("items", [])
     return {
         "agent_slug": args["agent_slug"],
@@ -9141,12 +9158,12 @@ def start_local_ui(args):
             nodes_query = {"limit": 200}
             if search:
                 nodes_query["q"] = search
-            nodes_suffix = urllib.parse.urlencode(nodes_query)
+            nodes_suffix = rest_query_string(nodes_query)
             all_nodes = request_json("GET", f"/v1/projects/{project_id}/nodes?{nodes_suffix}").get("items", [])
             archived_query = {"limit": 200, "archived_only": "true"}
             if search:
                 archived_query["q"] = search
-            archived_suffix = urllib.parse.urlencode(archived_query)
+            archived_suffix = rest_query_string(archived_query)
             archived_nodes = request_json("GET", f"/v1/projects/{project_id}/nodes?{archived_suffix}").get("items", [])
             archived_nodes = filter_project_nodes(archived_nodes)
             nodes = filter_project_nodes(all_nodes)
@@ -9352,7 +9369,7 @@ def start_local_ui(args):
                 nodes_query = {"limit": 200}
                 if search:
                     nodes_query["q"] = search
-                nodes_suffix = urllib.parse.urlencode(nodes_query)
+                nodes_suffix = rest_query_string(nodes_query)
                 nodes = request_json("GET", f"/v1/projects/{project_id}/nodes?{nodes_suffix}").get("items", [])
                 nodes = sort_nodes_by_recency(nodes)
                 if not selected_path and nodes:
@@ -9380,7 +9397,7 @@ def start_local_ui(args):
                 selected_title = html.escape(selected_path or "New node")
                 selected_badges = ui_tags((selected_node or {}).get("tags") or [])
                 node_rows = "".join(
-                    f"<tr><td><a class='path-link' href='/?{urllib.parse.urlencode({'mode': 'filesystem', 'path': item['full_path'], 'q': search})}'><code>{html.escape(item['full_path'])}</code></a></td><td>{ui_tags(item.get('tags') or [])}</td><td>{html.escape(item.get('type') or 'note')}</td><td><form method='post' action='/nodes/archive'><input type='hidden' name='return_to' value='/?{urllib.parse.urlencode({'mode': mode, 'q': search})}'><input type='hidden' name='path' value='{html.escape(item['full_path'])}'><button class='ghost'>Archive</button></form></td></tr>"
+                    f"<tr><td><a class='path-link' href='/?{rest_query_string({'mode': 'filesystem', 'path': item['full_path'], 'q': search})}'><code>{html.escape(item['full_path'])}</code></a></td><td>{ui_tags(item.get('tags') or [])}</td><td>{html.escape(item.get('type') or 'note')}</td><td><form method='post' action='/nodes/archive'><input type='hidden' name='return_to' value='/?{rest_query_string({'mode': mode, 'q': search})}'><input type='hidden' name='path' value='{html.escape(item['full_path'])}'><button class='ghost'>Archive</button></form></td></tr>"
                     for item in nodes
                 )
                 schedule_rows = "".join(

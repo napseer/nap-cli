@@ -80,6 +80,24 @@ def test_node_discovery_allows_large_requested_limit(mod):
     assert len(calls) == 1
 
 
+def test_rest_query_string_serializes_booleans_lowercase(mod):
+    query = mod.rest_query_string({
+        "folder_path": "/kanban",
+        "include_archived": False,
+        "archived_only": False,
+        "active_only": True,
+        "status": ["todo", "doing"],
+    })
+
+    assert "include_archived=false" in query
+    assert "archived_only=false" in query
+    assert "active_only=true" in query
+    assert "include_archived=False" not in query
+    assert "active_only=True" not in query
+    assert "status=todo" in query
+    assert "status=doing" in query
+
+
 def test_kanban_list_grouping_and_filters(mod):
     doing = node(
         "/kanban/doing/fix-wrapper",
@@ -107,6 +125,8 @@ def test_kanban_list_grouping_and_filters(mod):
     def fake_request(method, path, payload=None, **kwargs):
         assert method == "GET"
         assert "q=" in path
+        assert "include_archived=false" in path
+        assert "archived_only=false" in path
         return {"items": [doing, todo, done, outside], "next_cursor": None}
 
     mod.request_json = fake_request
@@ -146,6 +166,8 @@ def test_kanban_list_reads_beyond_first_source_page(mod):
         assert method == "GET"
         assert "q=%2Fkanban" in path
         assert "limit=10000" in path
+        assert "include_archived=false" in path
+        assert "archived_only=false" in path
         if "cursor=page-2" in path:
             return {"items": second_page, "next_cursor": None}
         return {"items": first_page, "next_cursor": "page-2"}
