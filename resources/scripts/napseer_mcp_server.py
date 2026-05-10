@@ -170,31 +170,16 @@ class RelaySocketClosed(RuntimeError):
 
 
 def local_state_dir():
-    preferred = pathlib.Path.cwd() / ".napseer"
-    legacy = pathlib.Path.cwd() / "napseer"
-    if preferred.exists() or not legacy.exists():
-        return preferred
-    return legacy
+    return pathlib.Path.cwd() / ".napseer"
 
 
 def state_dir_status_payload():
-    preferred = pathlib.Path.cwd() / ".napseer"
-    legacy = pathlib.Path.cwd() / "napseer"
     active = AUTH_DIR
-    if preferred.exists() and legacy.exists():
-        message = "Both .napseer and legacy napseer directories exist; .napseer is active."
-    elif active == legacy:
-        message = "Legacy napseer directory is active because .napseer does not exist."
-    else:
-        message = ".napseer directory is active."
     return {
         "active_state_dir": str(active),
-        "preferred_state_dir": str(preferred),
-        "legacy_state_dir": str(legacy),
-        "legacy_state_dir_active": active == legacy,
-        "preferred_state_dir_exists": preferred.exists(),
-        "legacy_state_dir_exists": legacy.exists(),
-        "state_dir_message": message,
+        "state_dir": str(active),
+        "state_dir_exists": active.exists(),
+        "state_dir_message": ".napseer directory is active.",
     }
 
 
@@ -6722,7 +6707,7 @@ def bootstrap_project(args):
     if encryption == "encrypted":
         raise RuntimeError(
             "CLI direct project encryption enable is disabled for backend-owned HashiCorp project secrets. "
-            "Use the backend/gateway setup-request flow when available."
+            "Create the project, configure/unlock the gateway vault, then run `nap gateway vault process`."
         )
     project, project_status, message = create_project_with_state(args)
     encryption_state = "plaintext"
@@ -6751,17 +6736,7 @@ def project_encryption_transition(args=None):
     args = args or {}
     requested = str(args.get("state") or args.get("mode") or "").strip().lower()
     aliases = {
-        "on": "encrypted",
-        "enable": "encrypted",
-        "enabled": "encrypted",
-        "encrypt": "encrypted",
         "encrypted": "encrypted",
-        "off": "plaintext",
-        "disable": "plaintext",
-        "disabled": "plaintext",
-        "decrypt": "plaintext",
-        "decrypted": "plaintext",
-        "plain": "plaintext",
         "plaintext": "plaintext",
     }
     desired = aliases.get(requested)
@@ -6770,7 +6745,7 @@ def project_encryption_transition(args=None):
     if desired == "encrypted":
         raise RuntimeError(
             "CLI direct project encryption enable is disabled for backend-owned HashiCorp project secrets. "
-            "Use the backend/gateway setup-request flow when available."
+            "Create the project, configure/unlock the gateway vault, then run `nap gateway vault process`."
         )
     project_id = resolve_project_id(args)
     operation = "disable"
@@ -9598,8 +9573,8 @@ def start_local_ui(args):
 <label>Project name<input name="name" required placeholder="{html.escape(default_project_name(default_project_slug()))}"></label>
 <label>Project slug<input name="slug" required value="{html.escape(default_project_slug())}"></label>
 <label>Description<textarea name="description"></textarea></label>
-<label>Initial privacy<select name="encryption"><option value="plaintext">Plaintext project</option><option value="encrypted">Encrypted project</option></select></label>
-<label>Project passphrase, only for encrypted projects<input name="passphrase" type="password"></label>
+<input type="hidden" name="encryption" value="plaintext">
+<p>Project encryption is configured after project creation from an unlocked gateway with <code>nap gateway vault process</code>.</p>
 <button type="submit">Create project</button></form></section></main></body></html>""")
                     return
                 search = query.get("q", [""])[0]
@@ -11548,7 +11523,7 @@ def handle(message):
 
 def cli_main(argv):
     command = argv[1] if len(argv) > 1 else ""
-    if command in {"configure", "config"}:
+    if command == "configure":
         print(json.dumps(cli_configure_status(), indent=2))
         return
     if command in {"open-ui", "ui"}:
@@ -11599,12 +11574,10 @@ def cli_main(argv):
         if subcommand in {"claim", "login"}:
             print(json.dumps(cli_project_claim(argv[3:]), indent=2))
             return
-        if subcommand == "bootstrap":
-            raise RuntimeError("project bootstrap was removed; use nap project create")
         if subcommand in {"status", "current"}:
             print(json.dumps(cli_configure_status(), indent=2))
             return
-        if subcommand in {"encryption", "privacy"}:
+        if subcommand == "encryption":
             action = argv[3] if len(argv) > 3 else "status"
             if action in {"status", "state", "show"}:
                 print(json.dumps(project_encryption_status({}), indent=2))
@@ -11622,10 +11595,7 @@ def cli_main(argv):
                 "passphrase": cli_option(argv[4:], "--passphrase", default=None),
             }), indent=2))
             return
-        if subcommand in {"plaintext", "plain", "unencrypt", "decrypt", "disable-encryption"}:
-            print(json.dumps(project_encryption_transition({"state": "plaintext"}), indent=2))
-            return
-        print("Usage: napseer_mcp_server.py project [create [slug] [--name NAME] [--description TEXT] [--encryption plaintext] [--passphrase TEXT]|claim [--no-browser] [--timeout SECONDS] [--return-url URL]|status|encryption [status|set plaintext|plaintext] [--passphrase TEXT]|plaintext [--passphrase TEXT]]")
+        print("Usage: napseer_mcp_server.py project [create [slug] [--name NAME] [--description TEXT] [--encryption plaintext]|claim [--no-browser] [--timeout SECONDS] [--return-url URL]|status|encryption [status|set plaintext|plaintext]]")
         return
     if command == "gateway":
         subcommand = argv[2] if len(argv) > 2 else "status"
@@ -11772,10 +11742,10 @@ def cli_main(argv):
             if action in {"list", "ls", "status"}:
                 print(json.dumps(gateway_vault_status(payload), indent=2))
                 return
-            if action in {"process", "complete", "run"}:
+            if action == "process":
                 print(json.dumps(gateway_process_vault_setup_requests(payload), indent=2))
                 return
-            if action in {"rotate", "rotate-secret"}:
+            if action == "rotate-secret":
                 if not payload.get("secret_kind"):
                     payload["secret_kind"] = vault_args[0] if vault_args and not vault_args[0].startswith("-") else "chat"
                 print(json.dumps(gateway_rotate_project_vault_secret(payload), indent=2))

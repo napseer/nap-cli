@@ -23,7 +23,7 @@ def assert_raises_hashicorp_closed(fn):
         message = str(exc)
         assert "HashiCorp" in message
         assert "disabled" in message
-        assert "setup-request" in message
+        assert "nap gateway vault process" in message
     else:
         raise AssertionError("CLI direct project encryption enable must fail closed")
 

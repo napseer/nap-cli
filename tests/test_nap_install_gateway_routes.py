@@ -34,6 +34,13 @@ def run():
     assert calls[-1] == ("gateway", ["vault", "rotate-secret", "--kind", "chat"])
 
     try:
+        mod.handle_gateway(["config"])
+    except RuntimeError as exc:
+        assert "unknown gateway command" in str(exc)
+    else:
+        raise AssertionError("gateway config alias must not route")
+
+    try:
         mod.handle_gateway(["vault-setup", "list"])
     except RuntimeError as exc:
         assert "unknown gateway command" in str(exc)
@@ -42,6 +49,25 @@ def run():
 
     assert mod.handle_gateway(["terminal", "list"]) == 0
     assert calls[-1] == ("gateway", ["terminal", "list"])
+
+    calls.clear()
+    assert mod.main(["nap", "status"]) == 0
+    assert calls[-1] == ("configure", [])
+
+    for argv in (
+        ["nap", "config"],
+        ["nap", "configure"],
+        ["nap", "bootstrap"],
+        ["nap", "create"],
+        ["nap", "ui"],
+        ["nap", "project", "bootstrap"],
+    ):
+        try:
+            mod.main(argv)
+        except RuntimeError as exc:
+            assert "unknown" in str(exc)
+        else:
+            raise AssertionError(f"deprecated route must not be accepted: {argv}")
 
     print("ok: nap installer gateway route smoke passed")
 

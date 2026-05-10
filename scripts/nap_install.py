@@ -268,40 +268,23 @@ def preferred_state_dir():
     return pathlib.Path.cwd() / ".napseer"
 
 
-def legacy_state_dir():
-    return pathlib.Path.cwd() / "napseer"
-
-
 def cwd_state_dir():
     preferred = preferred_state_dir()
-    legacy = legacy_state_dir()
-    path = preferred if preferred.exists() or not legacy.exists() else legacy
-    path.mkdir(exist_ok=True)
-    chmod_best_effort(path, 0o700)
-    return path
+    preferred.mkdir(exist_ok=True)
+    chmod_best_effort(preferred, 0o700)
+    return preferred
 
 
 def state_dir_status():
     preferred = preferred_state_dir()
-    legacy = legacy_state_dir()
     active = cwd_state_dir()
-    if preferred.exists() and legacy.exists():
-        message = "Both .napseer and legacy napseer directories exist; .napseer is active."
-    elif active == legacy:
-        message = "Legacy napseer directory is active because .napseer does not exist."
-    else:
-        message = ".napseer directory is active."
     return {
         "active_state_dir": str(active),
         "active_auth_path": str(active / "auth.json"),
-        "preferred_state_dir": str(preferred),
-        "preferred_auth_path": str(preferred / "auth.json"),
-        "legacy_state_dir": str(legacy),
-        "legacy_auth_path": str(legacy / "auth.json"),
-        "preferred_state_dir_exists": preferred.exists(),
-        "legacy_state_dir_exists": legacy.exists(),
-        "legacy_state_dir_active": active == legacy,
-        "state_dir_message": message,
+        "state_dir": str(preferred),
+        "auth_path": str(preferred / "auth.json"),
+        "state_dir_exists": preferred.exists(),
+        "state_dir_message": ".napseer directory is active.",
     }
 
 
@@ -631,7 +614,7 @@ def handle_gateway(args):
         return print_json(list_service("gateway")) or 0
     if subcommand in {"logs", "log"}:
         return print_json(service_logs("gateway", rest)) or 0
-    if subcommand in {"configure", "config"}:
+    if subcommand == "configure":
         return run_wrapper("gateway", ["configure", *rest])
     if subcommand in {"setup", "unlock", "lock", "restart", "kill", "vault", "terminal", "schedule", "service"}:
         return run_wrapper("gateway", [subcommand, *rest])
@@ -653,22 +636,16 @@ def main(argv):
         result = install_assets(update_project=True)
         print_json({**result, "status": "updated", "message": "Napseer CLI and runtime scripts are updated."})
         return 0
-    if command == "bootstrap":
-        raise RuntimeError("nap bootstrap was removed; use nap project create")
-    if command == "ui":
-        raise RuntimeError("top-level nap ui was removed; use project and gateway commands instead")
     if command == "gateway":
         return handle_gateway(args)
-    if command in {"configure", "config", "status"}:
+    if command == "status":
         return run_wrapper("configure", args)
     if command == "project":
         if not args:
             return run_wrapper("project", ["status"])
-        if args and args[0] == "bootstrap":
-            raise RuntimeError("nap project bootstrap was removed; use nap project create")
+        if args[0] == "bootstrap":
+            raise RuntimeError("unknown project command: bootstrap")
         return run_wrapper("project", args)
-    if command == "create":
-        raise RuntimeError("top-level nap create was removed; use nap project create")
     if command == "agent":
         return run_wrapper("agent", args)
     if command == "auth":
@@ -696,10 +673,9 @@ def main(argv):
         print("Usage: nap [auth|project|gateway|agent|feedback|status|update|where|install]")
         print("  auth        Auth commands: login-local, status.")
         print("              Example: nap auth login-local")
-        print("  project     Project commands: create, status, encryption status, plaintext.")
-        print("              Examples: nap project create, nap project status, nap project encryption set plaintext")
-        print("              Direct encrypted project enablement is disabled; use gateway vault setup flows.")
-        print("              Equivalent explicit form: nap project encryption set plaintext")
+        print("  project     Project commands: create, status, encryption.")
+        print("              Examples: nap project create, nap project status, nap project encryption status")
+        print("              Encrypted project setup is completed by an unlocked gateway: nap gateway vault process")
         print("  gateway     Gateway commands: start, stop, configure, setup, unlock, lock, restart, kill, logs, status, vault.")
         print("              Start auto-selects a local port; use --port to pin one.")
         print("              Examples: nap gateway start, nap gateway vault, nap gateway vault rotate-secret --kind chat")
