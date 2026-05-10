@@ -97,6 +97,24 @@ SUMMARY_METADATA_KEYS = {
 KANBAN_DONE_STATUSES = {"done", "cancelled", "archived"}
 DEFAULT_KANBAN_COLUMNS = ["backlog", "todo", "doing", "review", "done"]
 DEFAULT_KANBAN_PRIORITIES = ["low", "normal", "high", "urgent"]
+KANBAN_RELATIONS = {
+    "blocked_by",
+    "blocks",
+    "follows",
+    "precedes",
+    "relates_to",
+    "duplicates",
+    "duplicate_of",
+    "parent_of",
+    "child_of",
+    "tracks",
+    "tracked_by",
+    "milestone_of",
+    "has_milestone",
+    "mutually_exclusive_with",
+    "implements",
+    "references",
+}
 KANBAN_PRIORITY_RANK = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
 KANBAN_COLUMN_LIFECYCLE = {
     "backlog": "open",
@@ -7524,6 +7542,134 @@ def kanban_rank_token(value):
     return str(max(1, int(value))).zfill(8)
 
 
+def normalize_kanban_relation(value):
+    normalized = re.sub(r"[\s-]+", "_", str(value or "").strip().lower())
+    return normalized if normalized in KANBAN_RELATIONS else None
+
+
+def unique_nonempty_strings(values):
+    seen = set()
+    result = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            result.append(text)
+            seen.add(text)
+    return result
+
+
+def kanban_node_links(node):
+    links = node.get("links") if isinstance(node, dict) else None
+    if not isinstance(links, list):
+        return []
+    result = []
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        raw_path = str(link.get("path") or "").strip()
+        if not raw_path:
+            continue
+        path = normalize_node_path(raw_path)
+        if path:
+            result.append({"path": path, "relation": normalize_kanban_relation(link.get("relation"))})
+    return result
+
+
+def kanban_block_state_count(metadata, key):
+    block_state = metadata.get("block_state")
+    if not isinstance(block_state, dict):
+        return 0
+    value = block_state.get(key)
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, number)
+
+
+def kanban_external_blocker_count(metadata):
+    external_blockers = metadata.get("external_blockers")
+    if not isinstance(external_blockers, list):
+        return kanban_block_state_count(metadata, "external_blockers")
+    count = 0
+    for blocker in external_blockers:
+        if not isinstance(blocker, dict):
+            continue
+        state = str(blocker.get("state") or "open").strip().lower()
+        strength = str(blocker.get("strength") or "hard").strip().lower()
+        if state not in {"done", "closed", "resolved"} and strength != "soft":
+            count += 1
+    return count
+
+
+def kanban_dependency_summary(node):
+    metadata = node_metadata(node)
+    hard_blockers = []
+    blocking = []
+    soft_dependencies = []
+    related = []
+    parents = []
+    children = []
+    duplicates = []
+    milestones = []
+    mutual_exclusions = []
+    for link in kanban_node_links(node):
+        relation = link.get("relation")
+        path = link.get("path")
+        if not relation or not path:
+            continue
+        if relation == "blocked_by":
+            hard_blockers.append(path)
+        elif relation == "blocks":
+            blocking.append(path)
+        elif relation in {"follows", "precedes"}:
+            soft_dependencies.append(path)
+        elif relation in {"relates_to", "tracks", "tracked_by"}:
+            related.append(path)
+        elif relation == "child_of":
+            parents.append(path)
+        elif relation == "parent_of":
+            children.append(path)
+        elif relation in {"duplicates", "duplicate_of"}:
+            duplicates.append(path)
+        elif relation in {"milestone_of", "has_milestone"}:
+            milestones.append(path)
+        elif relation == "mutually_exclusive_with":
+            mutual_exclusions.append(path)
+
+    blocked_reason = ""
+    blocked_by = metadata.get("blocked_by")
+    if blocked_by not in (None, ""):
+        blocked_by_text = str(blocked_by).strip()
+        if blocked_by_text.startswith("/"):
+            hard_blockers.append(normalize_node_path(blocked_by_text))
+        else:
+            blocked_reason = blocked_by_text
+
+    external_blockers = kanban_external_blocker_count(metadata)
+    open_hard_blockers = kanban_block_state_count(metadata, "open_hard_blockers")
+    blocked = (
+        as_bool(metadata.get("blocked") if "blocked" in metadata else metadata.get("blocking"), False)
+        or bool(hard_blockers)
+        or external_blockers > 0
+        or open_hard_blockers > 0
+    )
+    return {
+        "blocked": blocked,
+        "hard_blockers": unique_nonempty_strings(hard_blockers),
+        "blocking": unique_nonempty_strings(blocking),
+        "soft_dependencies": unique_nonempty_strings(soft_dependencies),
+        "related": unique_nonempty_strings(related),
+        "parents": unique_nonempty_strings(parents),
+        "children": unique_nonempty_strings(children),
+        "duplicates": unique_nonempty_strings(duplicates),
+        "milestones": unique_nonempty_strings(milestones),
+        "mutual_exclusions": unique_nonempty_strings(mutual_exclusions),
+        "external_blockers": external_blockers,
+        "blocked_reason": blocked_reason,
+    }
+
+
 def kanban_sort_key(node):
     column = kanban_column(node) or ""
     rank = kanban_rank_value(node)
@@ -7583,6 +7729,7 @@ def unique_kanban_slug(column, slug, existing_cards=None, now=None):
 def kanban_compact_card(node, view="summary", preview_chars=240):
     item = summarize_node(node, view=view, preview_chars=preview_chars)
     metadata = node_metadata(node)
+    dependencies = kanban_dependency_summary(node)
     item["title"] = kanban_title(node)
     item["column"] = kanban_column(node)
     priority = kanban_priority(node)
@@ -7591,10 +7738,27 @@ def kanban_compact_card(node, view="summary", preview_chars=240):
     owner = kanban_owner(node)
     if owner:
         item["owner"] = owner
-    item["blocked"] = kanban_blocked(node)
+    item["blocked"] = dependencies["blocked"]
     blocked_by = metadata.get("blocked_by")
     if blocked_by not in (None, ""):
         item["blocked_by"] = str(blocked_by).strip()
+    dependency_summary = {
+        "hard_blockers": len(dependencies["hard_blockers"]),
+        "blocking": len(dependencies["blocking"]),
+        "soft_dependencies": len(dependencies["soft_dependencies"]),
+        "related": len(dependencies["related"]),
+        "parents": len(dependencies["parents"]),
+        "children": len(dependencies["children"]),
+        "duplicates": len(dependencies["duplicates"]),
+        "external_blockers": dependencies["external_blockers"],
+    }
+    if any(dependency_summary.values()) or dependencies["blocked_reason"]:
+        item["dependency_summary"] = dependency_summary
+        for key in ["hard_blockers", "blocking", "soft_dependencies", "related", "parents", "children", "duplicates"]:
+            if dependencies[key]:
+                item[key] = dependencies[key]
+        if dependencies["blocked_reason"]:
+            item["blocked_reason"] = dependencies["blocked_reason"]
     due_date = metadata.get("due_date")
     if due_date not in (None, ""):
         item["due_date"] = str(due_date).strip()
@@ -7608,8 +7772,7 @@ def kanban_compact_card(node, view="summary", preview_chars=240):
 
 
 def kanban_blocked(node):
-    metadata = node_metadata(node)
-    return as_bool(metadata.get("blocked") if "blocked" in metadata else metadata.get("blocking"), False)
+    return bool(kanban_dependency_summary(node)["blocked"])
 
 
 def kanban_lifecycle_state(node):
@@ -7662,6 +7825,9 @@ def list_kanban_cards(args):
     blocked_filter = args.get("blocked")
     if blocked_filter is None:
         blocked_filter = args.get("blocking")
+    dependency_view = str(args.get("dependency_view") or args.get("relation_view") or "").strip().lower().replace("-", "_")
+    if dependency_view and dependency_view not in {"ready", "blocked", "blocking", "related", "children", "duplicates"}:
+        raise RuntimeError("dependency_view must be ready, blocked, blocking, related, children, or duplicates")
     group_by = str(args.get("group_by") or "column").strip().lower()
     if group_by not in {"column", "status", "priority", "owner", "blocked"}:
         raise RuntimeError("group_by must be column, status, priority, owner, or blocked")
@@ -7702,7 +7868,8 @@ def list_kanban_cards(args):
         status = node_status(node)
         priority = kanban_priority(node)
         owner = kanban_owner(node)
-        blocked = kanban_blocked(node)
+        dependencies = kanban_dependency_summary(node)
+        blocked = bool(dependencies["blocked"])
         if active_only and not kanban_card_active(node):
             continue
         if column_filter and column not in column_filter:
@@ -7715,6 +7882,18 @@ def list_kanban_cards(args):
             continue
         if blocked_filter is not None and blocked != as_bool(blocked_filter, False):
             continue
+        if dependency_view == "ready" and blocked:
+            continue
+        if dependency_view == "blocked" and not blocked:
+            continue
+        if dependency_view == "blocking" and not dependencies["blocking"]:
+            continue
+        if dependency_view == "related" and not dependencies["related"]:
+            continue
+        if dependency_view == "children" and not dependencies["children"]:
+            continue
+        if dependency_view == "duplicates" and not dependencies["duplicates"]:
+            continue
         if not kanban_text_matches(node, args.get("q")):
             continue
         enriched = dict(node)
@@ -7724,6 +7903,7 @@ def list_kanban_cards(args):
         if owner is not None:
             enriched["owner"] = owner
         enriched["blocked"] = blocked
+        enriched["dependency_summary"] = dependencies
         items.append(enriched)
 
     items.sort(key=kanban_sort_key)
@@ -7762,6 +7942,7 @@ def list_kanban_cards(args):
             "priority": sorted(priority_filter),
             "owner": sorted(owner_filter),
             "blocked": as_bool(blocked_filter, False) if blocked_filter is not None else None,
+            "dependency_view": dependency_view or None,
         },
     }
     if as_bool(args.get("verbose"), False):
@@ -9622,6 +9803,7 @@ def kanban_workflow_tool_schemas():
             "include_blocked": {"type": "boolean", "default": False},
             "include_backlog": {"type": "boolean", "default": True},
             "active_only": {"type": "boolean", "default": True},
+            "dependency_view": {"type": "string", "enum": ["ready", "blocked", "blocking", "related", "children", "duplicates"]},
             "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 25},
             "view": {"type": "string", "enum": ["paths", "summary", "metadata"], "default": "summary"},
             "verbose": {"type": "boolean", "default": False},
@@ -9635,6 +9817,7 @@ def kanban_workflow_tool_schemas():
             "q": {"type": "string"},
             "blocked": {"type": "boolean"},
             "active_only": {"type": "boolean", "default": True},
+            "dependency_view": {"type": "string", "enum": ["ready", "blocked", "blocking", "related", "children", "duplicates"]},
             "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 25},
             "view": {"type": "string", "enum": ["paths", "summary", "metadata"], "default": "summary"},
             "verbose": {"type": "boolean", "default": False},
@@ -10062,6 +10245,7 @@ def raw_tools():
                     "assignee": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
                     "blocked": {"type": "boolean"},
                     "blocking": {"type": "boolean"},
+                    "dependency_view": {"type": "string", "enum": ["ready", "blocked", "blocking", "related", "children", "duplicates"]},
                     "active_only": {"type": "boolean", "default": True},
                     "group_by": {"type": "string", "enum": ["column", "status", "priority", "owner", "blocked"], "default": "column"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 25},

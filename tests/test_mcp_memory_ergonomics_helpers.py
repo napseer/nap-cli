@@ -19,7 +19,7 @@ def load_module():
     return module
 
 
-def node(path, status="planned", metadata=None, tags=None, content="body text", archived_at=None, node_type="plan"):
+def node(path, status="planned", metadata=None, tags=None, content="body text", archived_at=None, node_type="plan", links=None):
     folder, name = path.rsplit("/", 1)
     merged_metadata = {"status": status}
     if metadata:
@@ -32,7 +32,7 @@ def node(path, status="planned", metadata=None, tags=None, content="body text", 
         "name": name,
         "type": node_type,
         "tags": tags or [],
-        "links": [],
+        "links": links or [],
         "metadata": merged_metadata,
         "content_text": content,
         "updated_at": "2026-05-06T12:00:00Z",
@@ -138,6 +138,56 @@ def test_kanban_list_grouping_and_filters(mod):
     assert result["items"][0]["column"] == "doing"
     assert result["items"][0]["blocked"] is True
     assert list(result["groups"]) == ["doing"]
+
+
+def test_kanban_dependency_summary_filters_ready_and_blocking(mod):
+    plan = node(
+        "/kanban/backlog/plan",
+        "backlog",
+        metadata={"column": "backlog", "priority": "urgent", "blocked": False},
+        tags=["kanban"],
+        node_type="kanban_card",
+        links=[{"path": "/kanban/backlog/implementation", "relation": "blocks"}],
+    )
+    implementation = node(
+        "/kanban/todo/implementation",
+        "todo",
+        metadata={
+            "column": "todo",
+            "priority": "high",
+            "blocked_by": "/kanban/backlog/plan",
+            "external_blockers": [{"id": "deploy", "state": "open", "strength": "hard"}],
+        },
+        tags=["kanban"],
+        node_type="kanban_card",
+        links=[
+            {"path": "/kanban/backlog/plan", "relation": "blocked-by"},
+            {"path": "/kanban/backlog/context", "relation": "relates-to"},
+            {"path": "/kanban/backlog/child", "relation": "parent_of"},
+            {"path": "/kanban/backlog/canonical", "relation": "duplicate-of"},
+        ],
+    )
+
+    def fake_request(method, path, payload=None, **kwargs):
+        assert method == "GET"
+        return {"items": [plan, implementation], "next_cursor": None}
+
+    mod.request_json = fake_request
+
+    blocked = mod.list_kanban_cards({"dependency_view": "blocked", "limit": 10})
+    assert [item["full_path"] for item in blocked["items"]] == ["/kanban/todo/implementation"]
+    assert blocked["items"][0]["dependency_summary"]["hard_blockers"] == 1
+    assert blocked["items"][0]["dependency_summary"]["external_blockers"] == 1
+    assert blocked["items"][0]["hard_blockers"] == ["/kanban/backlog/plan"]
+    assert blocked["items"][0]["related"] == ["/kanban/backlog/context"]
+    assert blocked["items"][0]["children"] == ["/kanban/backlog/child"]
+    assert blocked["items"][0]["duplicates"] == ["/kanban/backlog/canonical"]
+
+    ready = mod.list_kanban_cards({"dependency_view": "ready", "limit": 10})
+    assert [item["full_path"] for item in ready["items"]] == ["/kanban/backlog/plan"]
+
+    blocking = mod.list_kanban_cards({"dependency_view": "blocking", "limit": 10})
+    assert blocking["items"][0]["blocking"] == ["/kanban/backlog/implementation"]
 
 
 def test_kanban_list_reads_beyond_first_source_page(mod):
@@ -366,6 +416,8 @@ def run():
     test_node_discovery_allows_large_requested_limit(mod)
     mod = load_module()
     test_kanban_list_grouping_and_filters(mod)
+    mod = load_module()
+    test_kanban_dependency_summary_filters_ready_and_blocking(mod)
     mod = load_module()
     test_kanban_list_reads_beyond_first_source_page(mod)
     mod = load_module()
