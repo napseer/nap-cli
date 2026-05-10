@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke-test auth refresh while the gateway vault is locked."""
+"""Smoke-test auth refresh with local gateway storage available."""
 
 import importlib.util
 import pathlib
@@ -20,8 +20,9 @@ def run():
     mod = load_module()
     writes = []
 
+    vault_writes = []
     mod.VAULT_SECRETS = {}
-    mod.VAULT_KEY = None
+    mod.VAULT_KEY = b"k" * 32
     mod.AUTH = {
         "base_url": "https://api.example.test",
         "project_id": "project_1",
@@ -35,7 +36,7 @@ def run():
     mod.TOKEN = "expired"
     mod.TOKEN_EXPIRES_AT = "old"
     mod.vault_exists = lambda: True
-    mod.gateway_is_unlocked = lambda: False
+    mod.gateway_is_unlocked = lambda: True
     mod.load_public_auth_file = lambda: {
         "base_url": "https://api.example.test",
         "project_id": "project_1",
@@ -46,10 +47,8 @@ def run():
     }
     mod.write_public_auth = lambda payload: writes.append(dict(payload))
 
-    def locked(operation="operation"):
-        raise RuntimeError(f"gateway is locked; unlock with the master passphrase before {operation}")
-
-    mod.require_unlocked = locked
+    mod.require_unlocked = lambda operation="operation": None
+    mod.write_vault_with_key = lambda key, payload: vault_writes.append((key, payload))
 
     mod.save_auth({"token": "fresh", "token_expires_at": "new", "worker_id": "worker_1"})
     assert writes[-1]["token"] == "fresh"
@@ -71,14 +70,11 @@ def run():
     assert mod.TOKEN == "newer"
     assert mod.TOKEN_EXPIRES_AT == "later"
 
-    try:
-        mod.save_auth({"gateway_default_command": "bash -l"})
-    except RuntimeError as exc:
-        assert "updating gateway vault" in str(exc)
-    else:
-        raise AssertionError("gateway vault updates must still require unlock")
+    mod.save_auth({"gateway_default_command": "bash -l"})
+    assert vault_writes[-1][0] == b"k" * 32
+    assert vault_writes[-1][1]["secrets"]["gateway_default_command"] == "bash -l"
 
-    print("ok: locked gateway auth refresh smoke passed")
+    print("ok: local gateway auth refresh smoke passed")
 
 
 if __name__ == "__main__":

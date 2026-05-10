@@ -293,6 +293,7 @@ def send_telemetry_event_async(event, component, outcome="success", **fields):
 AUTH_DIR = local_state_dir()
 AUTH_PATH = AUTH_DIR / "auth.json"
 VAULT_PATH = AUTH_DIR / "vault.json"
+LOCAL_VAULT_KEY_PATH = AUTH_DIR / "vault.local-key"
 GATEWAY_RELAY_SECRET_PATH = AUTH_DIR / "gateway-relay-secret.json"
 GATEWAY_RELAY_STATE_PATH = AUTH_DIR / "gateway-relay-state.json"
 GATEWAY_SCHEDULES_PATH = AUTH_DIR / "gateway-schedules.json"
@@ -440,8 +441,6 @@ PUBLIC_TOOLS = {
     "nap_whoami",
     "nap_gateway_status",
     "nap_gateway_setup",
-    "nap_gateway_unlock",
-    "nap_gateway_lock",
     "nap_gateway_configure",
     "nap_gateway_vault_ls",
     "nap_gateway_vault_process",
@@ -696,13 +695,13 @@ def _decrypt_vault_payload(key, nonce, ciphertext, tag, aad=b""):
     one_time_key = _chacha20_block(key, 0, nonce)[:32]
     expected = _poly1305_mac(_aead_mac_data(aad, ciphertext), one_time_key)
     if not hmac.compare_digest(expected, tag):
-        raise ValueError("gateway unlock failed")
+        raise ValueError("local gateway vault open failed")
     return _chacha20_xor(key, nonce, ciphertext)
 
 
 def _derive_vault_key(passphrase, salt, iterations):
     if not isinstance(passphrase, str) or not passphrase:
-        raise ValueError("master passphrase is required")
+        raise ValueError("local gateway vault key is required")
     return hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt, iterations, dklen=32)
 
 
@@ -712,12 +711,30 @@ def read_master_passphrase(create=False):
         return value
     if not sys.stdin.isatty():
         raise RuntimeError("NAPSEER_MASTER_PASSPHRASE is required in non-interactive mode")
-    first = getpass.getpass("Create master passphrase: " if create else "Master passphrase: ")
+    first = getpass.getpass("Create gateway relay passphrase: " if create else "Gateway relay passphrase: ")
     if create:
-        second = getpass.getpass("Confirm master passphrase: ")
+        second = getpass.getpass("Confirm gateway relay passphrase: ")
         if first != second:
-            raise RuntimeError("master passphrases did not match")
+            raise RuntimeError("gateway relay passphrases did not match")
     return first
+
+
+def read_local_vault_key(create=False):
+    value = os.environ.get("NAPSEER_LOCAL_VAULT_KEY")
+    if value:
+        return value
+    if LOCAL_VAULT_KEY_PATH.exists():
+        value = LOCAL_VAULT_KEY_PATH.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    if not create:
+        return None
+    AUTH_DIR.mkdir(exist_ok=True)
+    chmod_best_effort(AUTH_DIR, 0o700)
+    value = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
+    LOCAL_VAULT_KEY_PATH.write_text(value + "\n", encoding="utf-8")
+    chmod_best_effort(LOCAL_VAULT_KEY_PATH, 0o600)
+    return value
 
 
 def vault_exists():
@@ -750,13 +767,13 @@ def write_public_auth(data):
 def read_vault(passphrase, return_key=False):
     envelope = json.loads(VAULT_PATH.read_text(encoding="utf-8"))
     if envelope.get("schema") != VAULT_SCHEMA:
-        raise ValueError("gateway unlock failed")
+        raise ValueError("local gateway vault open failed")
     if envelope.get("format") == "plaintext-local" or "payload" in envelope:
         raise ValueError("plaintext local gateway vault is unsupported; rerun gateway setup with a passphrase")
     kdf = envelope.get("kdf") or {}
     cipher = envelope.get("cipher") or {}
     if kdf.get("name") != "pbkdf2-sha256" or cipher.get("name") != "chacha20-poly1305":
-        raise ValueError("gateway unlock failed")
+        raise ValueError("local gateway vault open failed")
     salt = base64.b64decode(kdf["salt"])
     iterations = int(kdf["iterations"])
     nonce = base64.b64decode(cipher["nonce"])
@@ -766,7 +783,7 @@ def read_vault(passphrase, return_key=False):
     plaintext = _decrypt_vault_payload(key, nonce, ciphertext, tag, VAULT_SCHEMA.encode("utf-8"))
     data = json.loads(plaintext.decode("utf-8"))
     if not isinstance(data, dict):
-        raise ValueError("gateway unlock failed")
+        raise ValueError("local gateway vault open failed")
     return (data, key) if return_key else data
 
 
@@ -804,7 +821,7 @@ def write_vault(passphrase, payload):
 
 def write_vault_with_key(key, payload):
     if not key:
-        raise RuntimeError("gateway is locked; unlock before updating vault secrets")
+        raise RuntimeError("local gateway vault key is unavailable before updating vault secrets")
     plaintext = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     nonce, ciphertext, tag = _encrypt_vault_payload(key, plaintext, VAULT_SCHEMA.encode("utf-8"))
     envelope = json.loads(VAULT_PATH.read_text(encoding="utf-8"))
@@ -1049,10 +1066,10 @@ def gateway_locked_reason():
     if not vault_exists():
         return "vault_not_configured"
     if not GATEWAY_UNLOCKED:
-        return "locked"
-    if GATEWAY_LAST_USED_AT and datetime.now(timezone.utc) - GATEWAY_LAST_USED_AT > timedelta(seconds=GATEWAY_IDLE_TIMEOUT_SECONDS):
-        gateway_lock()
-        return "idle_timeout"
+        try:
+            gateway_open_local()
+        except Exception:
+            return "local_vault_unavailable"
     return None
 
 
@@ -1065,20 +1082,28 @@ def touch_gateway():
     GATEWAY_LAST_USED_AT = datetime.now(timezone.utc)
 
 
+def clear_gateway_runtime_caches():
+    global GATEWAY_PROJECT_BUNDLE_PASSPHRASE
+    GATEWAY_PROJECT_BUNDLE_PASSPHRASE = None
+    MEMORY_SECRET_CACHE.clear()
+    ACTIVE_MEMORY_SECRET_VERSIONS.clear()
+
+
 def gateway_lock():
-    global VAULT_SECRETS, VAULT_KEY, GATEWAY_UNLOCKED, GATEWAY_LAST_USED_AT, AUTH, TOKEN, TOKEN_EXPIRES_AT, GATEWAY_PROJECT_BUNDLE_PASSPHRASE
+    global VAULT_SECRETS, VAULT_KEY, GATEWAY_UNLOCKED, GATEWAY_LAST_USED_AT, AUTH, TOKEN, TOKEN_EXPIRES_AT
     with GATEWAY_LOCK:
-        VAULT_SECRETS = {}
-        VAULT_KEY = None
-        GATEWAY_PROJECT_BUNDLE_PASSPHRASE = None
-        MEMORY_SECRET_CACHE.clear()
-        ACTIVE_MEMORY_SECRET_VERSIONS.clear()
-        GATEWAY_UNLOCKED = False
+        clear_gateway_runtime_caches()
+        if vault_exists():
+            gateway_open_local()
+        else:
+            VAULT_SECRETS = {}
+            VAULT_KEY = None
+            GATEWAY_UNLOCKED = False
         GATEWAY_LAST_USED_AT = None
         AUTH = load_auth()
         TOKEN = AUTH["token"]
         TOKEN_EXPIRES_AT = AUTH["token_expires_at"]
-    return {"status": "locked", "vault_configured": vault_exists()}
+    return {"status": "local_available" if GATEWAY_UNLOCKED else "not_configured", "vault_configured": vault_exists()}
 
 
 def gateway_status():
@@ -1090,7 +1115,7 @@ def gateway_status():
         message = "No project/token is configured for this directory."
     elif not vault_exists():
         status = "vault_not_configured"
-        message = "Gateway vault is not configured; run nap gateway configure."
+        message = "Local gateway storage is not configured; run nap gateway configure."
     elif remote_enabled and listener_ready:
         status = "relay_ready"
         message = "Gateway relay listener is connected."
@@ -1109,9 +1134,10 @@ def gateway_status():
         "container_uuid": read_container_uuid(),
         "vault_path": str(VAULT_PATH),
         "vault_configured": vault_exists(),
+        "local_vault_available": unlocked,
+        "local_vault_key_path": str(LOCAL_VAULT_KEY_PATH),
         "locked": not unlocked,
         "lock_reason": gateway_locked_reason(),
-        "idle_timeout_seconds": GATEWAY_IDLE_TIMEOUT_SECONDS,
         "cwd": str(pathlib.Path.cwd()),
         "base_url": BASE_URL,
         "project_id": DEFAULT_PROJECT_ID,
@@ -1173,22 +1199,48 @@ def ensure_gateway_worker_capability(refresh=True):
 
 def apply_vault_secrets(secrets_payload):
     if not isinstance(secrets_payload, dict):
-        raise ValueError("gateway unlock failed")
+        raise ValueError("local gateway vault open failed")
     secrets_map = secrets_payload.get("secrets", secrets_payload)
     if not isinstance(secrets_map, dict):
-        raise ValueError("gateway unlock failed")
+        raise ValueError("local gateway vault open failed")
     return {key: value for key, value in secrets_map.items() if value is not None}
 
 
-def gateway_unlock(passphrase):
+def gateway_open_local(passphrase=None):
     global VAULT_SECRETS, VAULT_KEY, GATEWAY_UNLOCKED, AUTH, BASE_URL, TOKEN, DEFAULT_PROJECT_ID, TOKEN_EXPIRES_AT, GATEWAY_PROJECT_BUNDLE_PASSPHRASE
     if not vault_exists():
         raise RuntimeError("gateway vault is not configured")
+    local_key = read_local_vault_key(create=False)
+    vault_payload = None
+    vault_key = None
+    migrated_from_passphrase = False
     try:
-        vault_payload, vault_key = read_vault(passphrase, return_key=True)
+        if local_key:
+            try:
+                vault_payload, vault_key = read_vault(local_key, return_key=True)
+            except Exception:
+                if not passphrase:
+                    raise
+                vault_payload, _legacy_key = read_vault(passphrase, return_key=True)
+                write_vault(local_key, vault_payload)
+                vault_payload, vault_key = read_vault(local_key, return_key=True)
+                migrated_from_passphrase = True
+        elif passphrase:
+            vault_payload, _legacy_key = read_vault(passphrase, return_key=True)
+            local_key = read_local_vault_key(create=True)
+            write_vault(local_key, vault_payload)
+            vault_payload, vault_key = read_vault(local_key, return_key=True)
+            migrated_from_passphrase = True
+        else:
+            raise RuntimeError("local gateway vault key is unavailable")
+    except Exception as exc:
+        raise RuntimeError(
+            "local gateway vault is unavailable; run gateway setup/configure once with the existing passphrase to migrate local access"
+        ) from exc
+    try:
         secrets_map = apply_vault_secrets(vault_payload)
     except Exception as exc:
-        raise RuntimeError("gateway unlock failed") from exc
+        raise RuntimeError("local gateway vault is unavailable") from exc
     with GATEWAY_LOCK:
         public = load_public_auth_file()
         recovered_auth = auth_file_secret_subset(secrets_map)
@@ -1218,22 +1270,27 @@ def gateway_unlock(passphrase):
         TOKEN = AUTH["token"]
         DEFAULT_PROJECT_ID = AUTH["project_id"]
         TOKEN_EXPIRES_AT = AUTH["token_expires_at"]
-        GATEWAY_PROJECT_BUNDLE_PASSPHRASE = str(passphrase)
-        write_gateway_relay_secret(passphrase)
+        if passphrase:
+            GATEWAY_PROJECT_BUNDLE_PASSPHRASE = str(passphrase)
+            write_gateway_relay_secret(passphrase)
         persist_vault_secrets()
         touch_gateway()
     return {
-        "status": "unlocked",
-        "message": "Gateway vault unlocked.",
+        "status": "local_available",
+        "message": "Gateway local vault is available.",
         "project_id": DEFAULT_PROJECT_ID,
-        "idle_timeout_seconds": GATEWAY_IDLE_TIMEOUT_SECONDS,
+        "migrated_local_key": migrated_from_passphrase,
     }
+
+
+def gateway_unlock(passphrase):
+    return gateway_open_local(passphrase)
 
 
 def require_unlocked(operation="operation"):
     reason = gateway_locked_reason()
     if reason:
-        raise RuntimeError(f"gateway is locked; unlock with the master passphrase before {operation}")
+        raise RuntimeError(f"local gateway vault is unavailable before {operation}: {reason}")
     touch_gateway()
 
 
@@ -1261,9 +1318,9 @@ def normalize_gateway_command(value=None):
 
 
 def gateway_setup(args):
-    passphrase = args.get("passphrase") or read_master_passphrase(create=True)
+    passphrase = args.get("passphrase") or os.environ.get("NAPSEER_GATEWAY_PASSPHRASE") or read_master_passphrase(create=True)
     if vault_exists() and not args.get("overwrite"):
-        result = gateway_unlock(passphrase)
+        result = gateway_open_local(passphrase)
         capability_result = ensure_gateway_worker_capability(refresh=True)
         if args.get("default_command"):
             gateway_tmux_configure({"default_command": args.get("default_command")})
@@ -1279,9 +1336,10 @@ def gateway_setup(args):
         "gateway_remote_enabled": True,
     }
     payload = {"version": 1, "created_at": iso_now(), "secrets": secrets_map}
-    write_vault(passphrase, payload)
+    local_key = read_local_vault_key(create=True)
+    write_vault(local_key, payload)
     write_public_auth({**public, "gateway_auth_required": True, "vault_path": str(VAULT_PATH)})
-    result = gateway_unlock(passphrase)
+    result = gateway_open_local(passphrase)
     write_gateway_relay_state(
         remote_enabled=True,
         tmux_target={},
@@ -1292,11 +1350,11 @@ def gateway_setup(args):
     )
     write_gateway_relay_secret(passphrase)
     capability_result = ensure_gateway_worker_capability(refresh=True)
-    return {**gateway_status(), "status": result.get("status", "unlocked"), "message": "Gateway vault configured and unlocked.", "gateway_capability": capability_result}
+    return {**gateway_status(), "status": result.get("status", "local_available"), "message": "Gateway local vault configured.", "gateway_capability": capability_result}
 
 
 def gateway_rotate_passphrase(args):
-    require_unlocked("rotating gateway passphrase")
+    require_unlocked("rotating gateway relay passphrase")
     new_passphrase = (
         args.get("new_passphrase")
         or args.get("passphrase")
@@ -1309,17 +1367,19 @@ def gateway_rotate_passphrase(args):
         secrets_map = dict(VAULT_SECRETS)
         secrets_map.setdefault("gateway_encryption_key", base64.b64encode(secrets.token_bytes(32)).decode("ascii"))
         secrets_map.setdefault("gateway_remote_enabled", True)
-        write_vault(new_passphrase, {"version": 1, "updated_at": iso_now(), "secrets": secrets_map})
-        vault_payload, vault_key = read_vault(new_passphrase, return_key=True)
+        local_key = read_local_vault_key(create=True)
+        write_vault(local_key, {"version": 1, "updated_at": iso_now(), "secrets": secrets_map})
+        vault_payload, vault_key = read_vault(local_key, return_key=True)
         apply_vault_secrets(vault_payload)
         globals()["VAULT_KEY"] = vault_key
         globals()["VAULT_SECRETS"] = gateway_vault_secret_subset(secrets_map)
+        globals()["GATEWAY_PROJECT_BUNDLE_PASSPHRASE"] = new_passphrase
         write_gateway_relay_secret(new_passphrase)
         touch_gateway()
     return {
         **gateway_status(),
         "status": "rotated",
-        "message": "Gateway passphrase rotated. Update NAPSEER_GATEWAY_PASSPHRASE in compose.yaml or the service environment before restarting the gateway.",
+        "message": "Gateway relay passphrase rotated. Update NAPSEER_GATEWAY_PASSPHRASE in compose.yaml or the service environment before restarting the gateway.",
     }
 
 
@@ -3087,7 +3147,7 @@ def project_bundle_passphrase():
     value = os.environ.get("NAPSEER_MASTER_PASSPHRASE")
     if value:
         return value
-    raise RuntimeError("gateway is locked; unlock before handling project key bundles")
+    raise RuntimeError("gateway relay passphrase is required before handling project key bundles")
 
 
 def project_bundle_hkdf_info(project_id, secret_kind, wrapping_epoch, bundle_version, data_key_epoch):
@@ -3909,7 +3969,7 @@ def handle_gateway_relay_session(connect_request, listener_sock=None):
                 request_id=request_id,
                 reason="missing_gateway_relay_secret",
             )
-            raise RuntimeError("gateway relay secret is missing; run nap gateway configure or nap gateway unlock once")
+            raise RuntimeError("gateway relay secret is missing; run nap gateway configure once")
         spake2_context = connect_request.get("spake2_context") or {}
         relay_socket = str(connect_request.get("relay_socket") or connect_request.get("relay_lane") or spake2_context.get("relay_socket") or spake2_context.get("relay_lane") or "terminal")
         sock = ws_connect(relay_ws_url(project_id, session_id, connect_request["relay_ticket"], relay_socket))
@@ -6457,7 +6517,7 @@ def gateway_service_preregister(args=None):
             "default_command": args.get("default_command") or os.environ.get("NAPSEER_GATEWAY_COMMAND"),
         })
     elif passphrase and not gateway_is_unlocked():
-        gateway_unlock(passphrase)
+        gateway_open_local(passphrase)
 
     key_path = ensure_local_files()
     public_key = pathlib.Path(str(key_path) + ".pub").read_text(encoding="utf-8").strip()
@@ -6569,13 +6629,13 @@ def gateway_service_activate(args=None):
     }
 
 
-def gateway_service_unlock_from_env():
+def gateway_service_open_local_from_env():
     if not vault_exists() or gateway_is_unlocked():
         return False
     passphrase = os.environ.get("NAPSEER_GATEWAY_PASSPHRASE") or os.environ.get("NAPSEER_GATEWAY_PASSKEY")
     if not passphrase:
         return False
-    gateway_unlock(passphrase)
+    gateway_open_local(passphrase)
     return True
 
 
@@ -6594,7 +6654,7 @@ def gateway_service_run(args=None):
         or os.environ.get("NAPSEER_SERVICE_BOOTSTRAP_TOKEN")
         or os.environ.get("NAPSEER_GATEWAY_BOOTSTRAP_TOKEN")
     )
-    gateway_service_unlock_from_env()
+    gateway_service_open_local_from_env()
     if bootstrap_token and not TOKEN:
         try:
             gateway_service_preregister(args)
@@ -6609,7 +6669,7 @@ def gateway_service_run(args=None):
     activated = False
     while not TOKEN and time.time() < deadline:
         try:
-            gateway_service_unlock_from_env()
+            gateway_service_open_local_from_env()
             gateway_service_activate(args)
             activated = True
             break
@@ -6621,7 +6681,7 @@ def gateway_service_run(args=None):
     if not TOKEN and not activated:
         raise RuntimeError("gateway service was not accepted before activation timeout")
     if not gateway_is_unlocked():
-        gateway_service_unlock_from_env()
+        gateway_service_open_local_from_env()
     result = start_local_ui({"open_browser": False, "port": int(args.get("port") or os.environ.get("NAPSEER_GATEWAY_PORT", "0"))})
     print(json.dumps(result, indent=2))
     try:
@@ -6707,7 +6767,7 @@ def bootstrap_project(args):
     if encryption == "encrypted":
         raise RuntimeError(
             "CLI direct project encryption enable is disabled for backend-owned HashiCorp project secrets. "
-            "Create the project, configure/unlock the gateway vault, then run `nap gateway vault process`."
+            "Create the project, configure the local gateway, then run `nap gateway vault process`."
         )
     project, project_status, message = create_project_with_state(args)
     encryption_state = "plaintext"
@@ -6745,7 +6805,7 @@ def project_encryption_transition(args=None):
     if desired == "encrypted":
         raise RuntimeError(
             "CLI direct project encryption enable is disabled for backend-owned HashiCorp project secrets. "
-            "Create the project, configure/unlock the gateway vault, then run `nap gateway vault process`."
+            "Create the project, configure the local gateway, then run `nap gateway vault process`."
         )
     project_id = resolve_project_id(args)
     operation = "disable"
@@ -6908,7 +6968,7 @@ def cli_gateway_configure(args):
     default_command = cli_option(args, "--command", default=cli_option(args, "--default-command", default=None))
     if bootstrap_token:
         if passphrase and vault_exists() and not gateway_is_unlocked():
-            gateway_unlock(passphrase)
+            gateway_open_local(passphrase)
         if TOKEN:
             if default_command:
                 gateway_tmux_configure({"default_command": default_command})
@@ -6931,9 +6991,11 @@ def cli_gateway_configure(args):
             return gateway_bootstrap_token_invalid_result()
 
     if not vault_exists():
+        if not passphrase:
+            raise RuntimeError("gateway relay passphrase is required to create gateway storage")
         gateway_setup({"passphrase": passphrase})
     if not gateway_is_unlocked():
-        gateway_unlock(passphrase or getpass.getpass("Gateway passphrase: "))
+        gateway_open_local(passphrase)
 
     target = parse_tmux_target(cli_option(args, "--target", default=""))
     command = default_command or ""
@@ -6981,7 +7043,7 @@ def mcp_gateway_configure(args):
     default_command = args.get("default_command") or args.get("command")
     if bootstrap_token:
         if passphrase and vault_exists() and not gateway_is_unlocked():
-            gateway_unlock(passphrase)
+            gateway_open_local(passphrase)
         if TOKEN:
             if default_command:
                 gateway_tmux_configure({"default_command": default_command})
@@ -7010,7 +7072,7 @@ def mcp_gateway_configure(args):
             raise RuntimeError("gateway passphrase is required to create the gateway vault")
         gateway_setup({"passphrase": passphrase, "default_command": default_command})
     elif passphrase and not gateway_is_unlocked():
-        gateway_unlock(passphrase)
+        gateway_open_local(passphrase)
 
     target = parse_tmux_target(args.get("target", ""))
     payload = {
@@ -7028,7 +7090,7 @@ def cli_gateway_require_unlocked(args, operation="gateway operation"):
     if not vault_exists():
         raise RuntimeError("gateway vault is not configured; run nap gateway configure first")
     if not gateway_is_unlocked():
-        gateway_unlock(cli_option(args, "--passphrase", default=None) or getpass.getpass("Gateway passphrase: "))
+        gateway_open_local(cli_option(args, "--passphrase", default=None))
     require_unlocked(operation)
 
 
@@ -9458,9 +9520,10 @@ def start_local_ui(args):
         def handle_local_api_post(self, route, payload):
             project_id = current_project_id()
             if route == "/local-api/gateway/unlock":
-                return gateway_unlock(payload.get("passphrase", ""))
+                return gateway_open_local(payload.get("passphrase", ""))
             if route == "/local-api/gateway/lock":
-                return gateway_lock()
+                clear_gateway_runtime_caches()
+                return gateway_status()
             if route == "/local-api/gateway/setup":
                 return gateway_setup(payload)
             if route == "/local-api/gateway/configure":
@@ -9574,7 +9637,7 @@ def start_local_ui(args):
 <label>Project slug<input name="slug" required value="{html.escape(default_project_slug())}"></label>
 <label>Description<textarea name="description"></textarea></label>
 <input type="hidden" name="encryption" value="plaintext">
-<p>Project encryption is configured after project creation from an unlocked gateway with <code>nap gateway vault process</code>.</p>
+<p>Project encryption is configured after project creation from the local gateway with <code>nap gateway vault process</code>.</p>
 <button type="submit">Create project</button></form></section></main></body></html>""")
                     return
                 search = query.get("q", [""])[0]
@@ -9690,9 +9753,10 @@ def start_local_ui(args):
                         if route == "/gateway/setup":
                             result = gateway_setup(payload)
                         elif route == "/gateway/unlock":
-                            result = gateway_unlock(payload.get("passphrase", ""))
+                            result = gateway_open_local(payload.get("passphrase", ""))
                         elif route == "/gateway/lock":
-                            result = gateway_lock()
+                            clear_gateway_runtime_caches()
+                            result = gateway_status()
                         elif route == "/gateway/tmux/configure":
                             result = gateway_tmux_configure(payload)
                         elif route == "/gateway/terminal/restart":
@@ -9918,17 +9982,17 @@ def raw_tools():
         },
         {
             "name": "nap_gateway_status",
-            "description": "Show whether the encrypted local gateway vault is configured and unlocked. Does not reveal secrets.",
+            "description": "Show local gateway, relay, and project status. Does not reveal secrets.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
         {
             "name": "nap_gateway_setup",
-            "description": "Create or migrate the encrypted local gateway vault using a master passphrase and default managed agent command.",
+            "description": "Create or migrate local gateway storage and configure the remote relay passphrase.",
             "inputSchema": {
                 "type": "object",
                 "required": ["passphrase"],
                 "properties": {
-                    "passphrase": {"type": "string", "description": "Master passphrase used only locally to encrypt the gateway vault."},
+                    "passphrase": {"type": "string", "description": "Remote relay passphrase. Local access is protected by the machine/user session, not an interactive unlock gate."},
                     "default_command": {"type": "string", "description": "Command Napseer should launch in its managed tmux window, for example bash -l."},
                     "overwrite": {"type": "boolean"},
                 },
@@ -9966,7 +10030,7 @@ def raw_tools():
         },
         {
             "name": "nap_gateway_vault_process",
-            "description": "Complete pending project vault setup requests assigned to this unlocked gateway by uploading opaque client-wrapped key bundle records for backend-owned HashiCorp storage.",
+            "description": "Complete pending project vault setup requests assigned to this local gateway by uploading opaque client-wrapped key bundle records for backend-owned HashiCorp storage.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -9978,7 +10042,7 @@ def raw_tools():
         },
         {
             "name": "nap_gateway_vault_secret_rotate",
-            "description": "Rotate one project secret version from the unlocked gateway by uploading an opaque client-wrapped key bundle record for backend-owned HashiCorp storage.",
+            "description": "Rotate one project secret version from this local gateway by uploading an opaque client-wrapped key bundle record for backend-owned HashiCorp storage.",
             "inputSchema": {
                 "type": "object",
                 "required": ["secret_kind"],
@@ -9988,21 +10052,6 @@ def raw_tools():
                 },
                 "additionalProperties": False,
             },
-        },
-        {
-            "name": "nap_gateway_unlock",
-            "description": "Unlock the encrypted local gateway vault with the master passphrase.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["passphrase"],
-                "properties": {"passphrase": {"type": "string"}},
-                "additionalProperties": False,
-            },
-        },
-        {
-            "name": "nap_gateway_lock",
-            "description": "Lock the local gateway and clear decrypted secrets from memory.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
         {
             "name": "nap_gateway_restart",
@@ -10918,10 +10967,8 @@ TOOL_CATEGORIES = {
         "nap_gateway_vault_ls",
         "nap_gateway_vault_process",
         "nap_gateway_vault_secret_rotate",
-        "nap_gateway_unlock",
         "nap_gateway_restart",
         "nap_gateway_kill",
-        "nap_gateway_lock",
         "nap_ui_open",
     ],
     "maintenance": [
@@ -10993,13 +11040,11 @@ LOCAL_FILE_TOOLS = {
     "nap_gateway_configure",
     "nap_gateway_vault_process",
     "nap_gateway_vault_secret_rotate",
-    "nap_gateway_unlock",
-    "nap_gateway_lock",
 }
 
 PROCESS_CONTROL_TOOLS = {"nap_ui_open"}
 TERMINAL_CONTROL_TOOLS = {"nap_gateway_restart", "nap_gateway_kill"}
-SECRET_ACCEPTING_TOOLS = {"nap_gateway_setup", "nap_gateway_unlock"}
+SECRET_ACCEPTING_TOOLS = {"nap_gateway_setup", "nap_gateway_configure"}
 AUTO_LOCK_TOOLS = {
     "nap_create_node",
     "nap_tee",
@@ -11045,7 +11090,7 @@ def tool_auth_mode(name):
     if name in {"nap_apropos", "nap_man", "nap_contract", "nap_update_status"}:
         return "public"
     if category == "gateway":
-        return "gateway-vault" if name in SECRET_ACCEPTING_TOOLS or name.startswith("nap_gateway_") else "local-only"
+        return "local-gateway"
     if name in {"nap_grep_local", "nap_index_status", "nap_index_clear", "nap_reindex_project", "nap_ui_open", "nap_update_self"}:
         return "local-only"
     if category in {"explore", "update", "coordination", "agent", "project", "schedules", "maintenance"}:
@@ -11268,14 +11313,10 @@ def call_tool_impl(name, args):
         return gateway_process_vault_setup_requests(args)
     if name == "nap_gateway_vault_secret_rotate":
         return gateway_rotate_project_vault_secret(args)
-    if name == "nap_gateway_unlock":
-        return gateway_unlock(args.get("passphrase", ""))
     if name == "nap_gateway_restart":
         return gateway_terminal_restart(args)
     if name == "nap_gateway_kill":
         return gateway_terminal_kill(args)
-    if name == "nap_gateway_lock":
-        return gateway_lock()
     if name == "nap_login":
         return renew_auth()
     if name == "nap_update_status":
@@ -11762,13 +11803,7 @@ def cli_main(argv):
                 "new_passphrase": cli_option(args, "--new-passphrase", "--passphrase", default=None),
             }), indent=2))
             return
-        if subcommand == "unlock":
-            print(json.dumps(gateway_unlock(cli_option(args, "--passphrase", default=None) or getpass.getpass("Gateway passphrase: ")), indent=2))
-            return
-        if subcommand == "lock":
-            print(json.dumps(gateway_lock(), indent=2))
-            return
-        print("Usage: napseer_mcp_server.py gateway [status|configure [--command CMD] [--target session:window.pane]|vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway|memory] [--all]|terminal [list|create|close|capture|input]|schedule [list|create|update|delete|run]|restart [--passphrase TEXT]|kill [--passphrase TEXT]|setup|rotate-passphrase --new-passphrase TEXT|unlock|lock]")
+        print("Usage: napseer_mcp_server.py gateway [status|configure [--command CMD] [--target session:window.pane]|vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway|memory] [--all]|terminal [list|create|close|capture|input]|schedule [list|create|update|delete|run]|restart|kill|setup|rotate-passphrase --new-passphrase TEXT]")
         return
     if command == "feedback":
         subcommand = argv[2] if len(argv) > 2 else "list"

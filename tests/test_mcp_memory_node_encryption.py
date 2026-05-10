@@ -321,8 +321,7 @@ def run():
     mod.vault_exists = lambda: True
     cache_secret(mod, version=4, active=False)
     assert mod.MEMORY_SECRET_CACHE
-    locked = mod.gateway_lock()
-    assert locked["status"] == "locked"
+    mod.clear_gateway_runtime_caches()
     assert mod.MEMORY_SECRET_CACHE == {}
     assert mod.ACTIVE_MEMORY_SECRET_VERSIONS == {}
 

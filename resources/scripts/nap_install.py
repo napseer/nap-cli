@@ -591,18 +591,18 @@ def handle_gateway(args):
     subcommand = args[0] if args else "ls"
     rest = args[1:] if args else []
     if subcommand in {"help", "-h", "--help"}:
-        print("Usage: nap gateway [start|stop|status|logs|configure|setup|unlock|lock|restart|kill|vault|terminal|schedule|service]")
+        print("Usage: nap gateway [start|stop|status|logs|configure|setup|restart|kill|vault|terminal|schedule|service]")
         print("  nap gateway start [--port PORT]       Start the local gateway service.")
         print("  nap gateway status                    Show the managed gateway process.")
         print("  nap gateway configure [--command CMD] Configure the local gateway command.")
-        print("  nap gateway setup                     Create or unlock the encrypted gateway vault.")
+        print("  nap gateway setup                     Create or migrate local gateway storage.")
         print("  nap gateway vault                     Show gateway vault status and pending setup requests.")
         print("  nap gateway vault process             Complete pending setup requests.")
         print("  nap gateway vault rotate-secret --kind chat|tabs|gateway|memory")
         return 0
     if subcommand == "vault" and rest and rest[0] in {"help", "-h", "--help"}:
         print("Usage: nap gateway vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway|memory] [--all] [--project-id ID]")
-        print("  status        Show configured/locked state and pending setup requests.")
+        print("  status        Show local gateway state and pending setup requests.")
         print("  process       Upload opaque client-wrapped key bundle records for backend-owned HashiCorp storage.")
         print("  rotate-secret Rotate one encrypted project secret.")
         return 0
@@ -616,9 +616,9 @@ def handle_gateway(args):
         return print_json(service_logs("gateway", rest)) or 0
     if subcommand == "configure":
         return run_wrapper("gateway", ["configure", *rest])
-    if subcommand in {"setup", "unlock", "lock", "restart", "kill", "vault", "terminal", "schedule", "service"}:
+    if subcommand in {"setup", "restart", "kill", "vault", "terminal", "schedule", "service"}:
         return run_wrapper("gateway", [subcommand, *rest])
-    raise RuntimeError("unknown gateway command; use nap gateway start|stop|configure|setup|unlock|lock|restart|kill|logs|status|vault|terminal|schedule|service")
+    raise RuntimeError("unknown gateway command; use nap gateway start|stop|configure|setup|restart|kill|logs|status|vault|terminal|schedule|service")
 
 
 def print_json(value):
@@ -675,8 +675,8 @@ def main(argv):
         print("              Example: nap auth login-local")
         print("  project     Project commands: create, status, encryption.")
         print("              Examples: nap project create, nap project status, nap project encryption status")
-        print("              Encrypted project setup is completed by an unlocked gateway: nap gateway vault process")
-        print("  gateway     Gateway commands: start, stop, configure, setup, unlock, lock, restart, kill, logs, status, vault.")
+        print("              Encrypted project setup is completed by the local gateway: nap gateway vault process")
+        print("  gateway     Gateway commands: start, stop, configure, setup, restart, kill, logs, status, vault.")
         print("              Start auto-selects a local port; use --port to pin one.")
         print("              Examples: nap gateway start, nap gateway vault, nap gateway vault rotate-secret --kind chat")
         print("  agent       Agent commands: list, workspaces, create, show, edit.")

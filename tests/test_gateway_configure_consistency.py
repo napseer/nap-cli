@@ -24,7 +24,7 @@ def assert_equal(actual, expected, message):
 
 def run():
     mod = load_module()
-    calls = {"preregister": [], "setup": [], "unlock": [], "tmux": []}
+    calls = {"preregister": [], "setup": [], "open": [], "tmux": []}
 
     mod.AUTH = {}
     mod.TOKEN = None
@@ -32,7 +32,7 @@ def run():
     mod.vault_exists = lambda: False
     mod.gateway_is_unlocked = lambda: False
     mod.gateway_setup = lambda payload: calls["setup"].append(payload) or {"status": "configured"}
-    mod.gateway_unlock = lambda passphrase: calls["unlock"].append(passphrase) or {"status": "unlocked"}
+    mod.gateway_open_local = lambda passphrase=None: calls["open"].append(passphrase) or {"status": "local_available"}
     mod.gateway_tmux_configure = lambda payload: calls["tmux"].append(payload) or {"status": "configured"}
     mod.gateway_status = lambda: {"status": "ok"}
     mod.gateway_log = lambda *args, **kwargs: None
@@ -83,19 +83,19 @@ def run():
     assert_equal(invalid_cli["status"], "bootstrap_token_invalid", "cli invalid token fallback")
 
     calls["preregister"].clear()
-    calls["unlock"].clear()
+    calls["open"].clear()
     calls["tmux"].clear()
     mod.gateway_service_preregister = preregister
     mod.TOKEN = None
     mod.vault_exists = lambda: True
     mod.gateway_is_unlocked = lambda: False
 
-    def unlock_existing(passphrase):
-        calls["unlock"].append(passphrase)
+    def open_existing(passphrase=None):
+        calls["open"].append(passphrase)
         mod.TOKEN = "np_existing_worker"
-        return {"status": "unlocked"}
+        return {"status": "local_available"}
 
-    mod.gateway_unlock = unlock_existing
+    mod.gateway_open_local = open_existing
     preserved_mcp = mod.mcp_gateway_configure({
         "bootstrap_token": "npb_existing",
         "passphrase": "pw_existing",
@@ -109,31 +109,31 @@ def run():
     assert_equal(preserved_mcp["status"], "configured", "mcp preserved gateway should skip preregister")
     assert_equal(preserved_cli["status"], "configured", "cli preserved gateway should skip preregister")
     assert_equal(calls["preregister"], [], "preserved gateway preregister calls")
-    assert_equal(calls["unlock"], ["pw_existing", "pw_existing"], "preserved gateway unlocks before preregister")
+    assert_equal(calls["open"], ["pw_existing", "pw_existing"], "preserved gateway opens local storage before preregister")
     assert_equal(len(calls["tmux"]), 2, "preserved gateway command updates")
 
     calls["preregister"].clear()
-    calls["unlock"].clear()
+    calls["open"].clear()
     mod.TOKEN = None
     mod.vault_exists = lambda: True
-    service_unlocked = {"value": False}
-    mod.gateway_is_unlocked = lambda: service_unlocked["value"]
+    service_available = {"value": False}
+    mod.gateway_is_unlocked = lambda: service_available["value"]
     os.environ["NAPSEER_GATEWAY_PASSPHRASE"] = "pw_service"
     os.environ["NAPSEER_GATEWAY_BOOTSTRAP_TOKEN"] = "npb_service"
     mod.start_local_ui = lambda payload: {"status": "started", "payload": payload}
 
-    def service_unlock(passphrase):
-        calls["unlock"].append(passphrase)
+    def service_open(passphrase=None):
+        calls["open"].append(passphrase)
         mod.TOKEN = "np_existing_worker"
-        service_unlocked["value"] = True
-        return {"status": "unlocked"}
+        service_available["value"] = True
+        return {"status": "local_available"}
 
-    mod.gateway_unlock = service_unlock
+    mod.gateway_open_local = service_open
     mod.threading.Event = lambda: type("StopEvent", (), {"wait": lambda self: (_ for _ in ()).throw(KeyboardInterrupt())})()
     service_result = mod.gateway_service_run({"timeout_seconds": 0})
     assert_equal(service_result["status"], "started", "service run with preserved token")
     assert_equal(calls["preregister"], [], "service run preserved gateway preregister calls")
-    assert_equal(calls["unlock"], ["pw_service"], "service run unlocks before preregister")
+    assert_equal(calls["open"], ["pw_service"], "service run opens local storage before preregister")
 
     print("ok: gateway configure CLI/MCP parity smoke passed")
 
