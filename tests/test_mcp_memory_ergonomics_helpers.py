@@ -80,6 +80,30 @@ def test_node_discovery_allows_large_requested_limit(mod):
     assert len(calls) == 1
 
 
+def test_recent_memory_defaults_to_titles(mod):
+    recent = node(
+        "/notes/recent-title",
+        "active",
+        metadata={"title": "Readable Recent Title", "priority": "high"},
+        tags=["recent"],
+        content="large body that should not appear in the default recent response",
+        node_type="note",
+    )
+
+    def fake_request(method, path, payload=None, **kwargs):
+        assert method == "GET"
+        assert "/nodes?" in path
+        return {"items": [recent], "next_cursor": None}
+
+    mod.request_json = fake_request
+    result = mod.recent_memory({})
+    assert result["ok"] is True
+    assert result["view"] == "titles"
+    assert result["items"] == [{"title": "Readable Recent Title", "full_path": "/notes/recent-title"}]
+    assert "content_text" not in result["items"][0]
+    assert "metadata_summary" not in result["items"][0]
+
+
 def test_rest_query_string_serializes_booleans_lowercase(mod):
     query = mod.rest_query_string({
         "folder_path": "/kanban",

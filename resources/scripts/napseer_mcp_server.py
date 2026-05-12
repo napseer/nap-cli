@@ -49,7 +49,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-DISCOVERY_VIEWS = {"paths", "summary", "metadata", "full"}
+DISCOVERY_VIEWS = {"titles", "paths", "summary", "metadata", "full"}
 DISCOVERY_DEFAULT_LIMIT = 25
 DISCOVERY_COMPACT_MAX_LIMIT = 10_000
 DISCOVERY_FULL_MAX_LIMIT = 10_000
@@ -5196,7 +5196,7 @@ def normalize_discovery_view(args, default="summary"):
     warnings = []
     if requested:
         if requested not in DISCOVERY_VIEWS:
-            raise RuntimeError("view must be paths, summary, metadata, or full")
+            raise RuntimeError("view must be titles, paths, summary, metadata, or full")
         return requested, warnings
     if as_bool(args.get("include_content"), False):
         return "full", warnings
@@ -5276,6 +5276,12 @@ def summarize_node(node, view="summary", preview_chars=240):
         return node
     metadata = node_metadata(node)
     status = node_status(node)
+    if view == "titles":
+        item = {
+            "title": node.get("title") or metadata.get("title") or node.get("name") or pathlib.PurePosixPath(str(node.get("full_path") or "")).name,
+            "full_path": node.get("full_path"),
+        }
+        return {key: value for key, value in item.items() if value not in (None, "")}
     if view == "paths":
         item = {
             "full_path": node.get("full_path"),
@@ -8687,7 +8693,7 @@ def search_memory(args):
 
 def recent_memory(args):
     limit = max(1, min(int(args.get("limit", 25)), 100))
-    view, _warnings = normalize_discovery_view(args)
+    view, _warnings = normalize_discovery_view(args, default="titles")
     query = {**args, "limit": limit, "view": view}
     for key in ["folder_path", "tag", "updated_before", "updated_after", "cursor"]:
         if args.get(key):
@@ -10221,7 +10227,7 @@ def raw_tools():
                     "q": {"type": "string", "description": "Search text. Natural language is accepted; distinctive nouns, paths, tags, or quoted phrases produce better matches than full instructions."},
                     "mode": {"type": "string", "enum": ["hybrid", "server", "local"], "default": "hybrid"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "view": {"type": "string", "enum": ["paths", "summary", "metadata", "full"], "default": "summary"},
+                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "summary"},
                     "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
                     "active_only": {"type": "boolean", "default": False},
                     "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
@@ -10243,7 +10249,7 @@ def raw_tools():
                     "q": {"type": "string"},
                     "cursor": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 10000},
-                    "view": {"type": "string", "enum": ["paths", "summary", "metadata", "full"], "default": "summary"},
+                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "summary"},
                     "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
                     "include_archived": {"type": "boolean", "default": False},
                     "archived_only": {"type": "boolean", "default": False},
@@ -10337,8 +10343,8 @@ def raw_tools():
                 "properties": {
                     "path": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "view": {"type": "string", "enum": ["paths", "summary", "metadata", "full"], "default": "summary"},
-                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
+                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "titles"},
+                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set. nap_recent defaults to title-only output."},
                     "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
                 },
                 "additionalProperties": False,
@@ -10346,7 +10352,7 @@ def raw_tools():
         },
         {
             "name": "nap_recent",
-            "description": "List recently updated project memory with optional folder, tag, and cursor filters.",
+            "description": "List recently updated project memory as title/path pairs by default, with optional folder, tag, and cursor filters.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -10356,8 +10362,8 @@ def raw_tools():
                     "updated_before": {"type": "string"},
                     "updated_after": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "view": {"type": "string", "enum": ["paths", "summary", "metadata", "full"], "default": "summary"},
-                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
+                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "titles"},
+                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set. nap_recent defaults to title-only output."},
                     "active_only": {"type": "boolean", "default": False},
                     "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
                     "exclude_status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
