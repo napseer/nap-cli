@@ -350,7 +350,11 @@ def run():
     mod.try_get_node_by_path = lambda path, allow_agent=False: None
     created = mod.upsert_node({"path": "/notes/beta", "content_text": "tee secret", "metadata": {"private": "tee"}})
     tee_body = writes[-1][2]
-    assert created["node"]["content_text"] == "tee secret"
+    assert created["ok"] is True
+    assert created["created"] is True
+    assert created["path"] == "/notes/beta"
+    assert "content_text" not in created
+    assert "metadata" not in created
     assert tee_body["content_text"] == ""
     assert tee_body["metadata"] == {}
     assert tee_body["wrapping_epoch"] == 1
@@ -363,7 +367,10 @@ def run():
     writes.clear()
     patched = mod.update_node_by_path({"path": "/notes/beta", "content_text": "patch secret"})
     patch_body = writes[-1][2]
-    assert patched["node"]["content_text"] == "patch secret"
+    assert patched["ok"] is True
+    assert patched["updated"] is True
+    assert patched["path"] == "/notes/beta"
+    assert "content_text" not in patched
     assert patch_body["encrypted_content_envelope"]["aad_subject"] == "node_id:node-1"
 
     bulk_writes = []
@@ -386,7 +393,9 @@ def run():
         "encrypted_metadata_envelope": payload.get("encrypted_metadata_envelope"),
     }
     bulk = mod.bulk_upsert_nodes({"nodes": [{"path": "/bulk/one", "content_text": "bulk secret"}]})
-    assert bulk["items"][0]["node"]["content_text"] == "bulk secret"
+    assert bulk["items"][0]["path"] == "/bulk/one"
+    assert "node" not in bulk["items"][0]
+    assert "content_text" not in bulk["items"][0]
     assert bulk_writes[0][2]["content_text"] == ""
     assert bulk_writes[0][2]["encrypted_content_envelope"]["aad_subject"].startswith("encryption_id:")
 

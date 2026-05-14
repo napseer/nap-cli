@@ -5318,6 +5318,22 @@ def summarize_node(node, view="summary", preview_chars=240):
     return {key: value for key, value in item.items() if value not in (None, "")}
 
 
+def node_write_reference(node):
+    metadata = node_metadata(node)
+    item = {
+        "id": node.get("id"),
+        "path": node.get("full_path"),
+        "full_path": node.get("full_path"),
+        "type": node.get("type"),
+        "status": node_status(node),
+        "updated_at": node.get("updated_at"),
+    }
+    title = node.get("title") or metadata.get("title")
+    if title:
+        item["title"] = title
+    return {key: value for key, value in item.items() if value not in (None, "")}
+
+
 def discovery_envelope(project_id, items, args, *, view=None, next_cursor=None, has_more=None, diagnostics=None, query_analysis=None, warnings=None):
     view = view or normalize_discovery_view(args)[0]
     limit = normalize_int(args.get("limit"), DISCOVERY_DEFAULT_LIMIT, 1, discovery_max_limit(view))
@@ -7285,7 +7301,25 @@ def guarded_node_patch(args):
     node = ((result.get("data") or {}).get("node") or {}) if isinstance(result, dict) else {}
     if node:
         index_node(node)
-    return result
+    if not isinstance(result, dict):
+        return {"ok": True, "changed": True, "path": path}
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    compact = {
+        "ok": bool(result.get("ok", True)),
+        "status": result.get("status") or ("dry_run" if args.get("dry_run") else "updated"),
+        "changed": not bool(data.get("dry_run")),
+        "dry_run": bool(data.get("dry_run")),
+        "path": node.get("full_path") or path,
+    }
+    if data.get("revision"):
+        compact["revision"] = data["revision"]
+    if data.get("read_fingerprint"):
+        compact["read_fingerprint"] = data["read_fingerprint"]
+    if result.get("warnings"):
+        compact["warnings"] = result["warnings"]
+    if result.get("diagnostics"):
+        compact["diagnostics"] = result["diagnostics"]
+    return compact
 
 
 def try_get_node_by_path(path, allow_agent=False):
@@ -7343,7 +7377,8 @@ def upsert_node(args):
             existing["full_path"],
         )
         index_node(updated)
-        return {"created": False, "node": decrypt_node_for_return(updated, project_id=project_id)}
+        node = decrypt_node_for_return(updated, project_id=project_id)
+        return {"ok": True, "changed": True, "created": False, "updated": True, **node_write_reference(node)}
     write_path = normalize_node_path(args["path"])
     created = request_project_write(
         "POST",
@@ -7355,7 +7390,8 @@ def upsert_node(args):
         write_path,
     )
     index_node(created)
-    return {"created": True, "node": decrypt_node_for_return(created, project_id=project_id)}
+    node = decrypt_node_for_return(created, project_id=project_id)
+    return {"ok": True, "changed": True, "created": True, **node_write_reference(node)}
 
 
 def update_node_by_path(args):
@@ -7372,7 +7408,8 @@ def update_node_by_path(args):
         existing["full_path"],
     )
     index_node(updated)
-    return {"updated": True, "node": decrypt_node_for_return(updated, project_id=project_id)}
+    node = decrypt_node_for_return(updated, project_id=project_id)
+    return {"ok": True, "changed": True, "updated": True, **node_write_reference(node)}
 
 
 def archive_node_by_path(args):
@@ -7451,11 +7488,12 @@ def link_nodes(args):
         updated = source
 
     return {
+        "ok": True,
+        "changed": created,
         "created": created,
         "relation": relation,
         "source": {"id": source["id"], "full_path": source["full_path"]},
         "target": {"id": target["id"], "full_path": target["full_path"]},
-        "updated_node": updated,
     }
 
 
@@ -8171,9 +8209,15 @@ def create_kanban_card(args):
             path,
         )
         index_node(created)
-        result = {"created": True, "node": decrypt_node_for_return(created, project_id=project_id)}
-    node = result.get("node", result)
-    return {"ok": True, "created": bool(result.get("created", True)), "path": node.get("full_path"), "node": kanban_compact_card(node, view="summary")}
+        node = decrypt_node_for_return(created, project_id=project_id)
+        result = {"created": True, **node_write_reference(node)}
+    return {
+        "ok": True,
+        "changed": True,
+        "created": bool(result.get("created", True)),
+        "path": result.get("path") or result.get("full_path"),
+        "column": column,
+    }
 
 
 def update_kanban_card(args):
@@ -8196,7 +8240,7 @@ def update_kanban_card(args):
     if "content_text" in args or "body" in args:
         payload["content_text"] = args.get("content_text") if "content_text" in args else args.get("body")
     updated = update_node_by_path(payload)
-    return {"ok": True, "updated": True, "node": kanban_compact_card(updated["node"], view="summary")}
+    return {"ok": True, "changed": True, "updated": True, "path": updated.get("path") or existing["full_path"], "column": kanban_column(existing)}
 
 
 def move_kanban_card(args, target_column):
@@ -8224,7 +8268,7 @@ def move_kanban_card(args, target_column):
     remove_indexed_node(existing["id"])
     index_node(updated)
     node = decrypt_node_for_return(updated, project_id=project_id)
-    return {"ok": True, "changed": True, "from": source, "to": node.get("full_path"), "node": kanban_compact_card(node, view="summary")}
+    return {"ok": True, "changed": True, "from": source, "to": node.get("full_path"), "path": node.get("full_path"), "column": target_column}
 
 
 def block_kanban_card(args, blocked):
@@ -8426,7 +8470,11 @@ def plan_lifecycle_update(args, *, action, terminal_status, required_target_key,
 
     updated = node
     if planned_changes != ["archive node"]:
-        updated = update_node_by_path({"path": path, "metadata": metadata, "tags": tags, "links": links}).get("node") or updated
+        update_node_by_path({"path": path, "metadata": metadata, "tags": tags, "links": links})
+        updated = dict(node)
+        updated["metadata"] = metadata
+        updated["tags"] = tags
+        updated["links"] = links
     archive_result = archive_node_by_path({"path": path})
     return plan_lifecycle_result(
         action,
@@ -8839,7 +8887,6 @@ def move_node(args):
         "paths": [updated["full_path"]],
         "references_rewritten": references_to_rewrite,
         "links_rewritten": len(references_to_rewrite),
-        "node": updated,
     }
 
 
@@ -8895,14 +8942,14 @@ def move_folder(args):
             payload = {"folder_path": None if next_folder == "/" else next_folder}
             saved = request_json("PATCH", f"/v1/projects/{project_id}/nodes/{node['id']}", payload, extra_headers=headers)
             index_node(saved)
-            updated.append(saved)
+            updated.append(node_write_reference(saved))
     finally:
         try:
             release_project_lock({"lock_id": lock["id"], "lease_token": lock["lease_token"]})
         except Exception:
             pass
     links_rewritten = sum(len(item["references_to_rewrite"]) for item in reference_plan)
-    return {"ok": True, "changed": bool(updated), "dry_run": False, "moved": len(updated), "from_folder": from_folder, "to_folder": to_folder, "items": updated, "reference_plan": reference_plan, "links_rewritten": links_rewritten}
+    return {"ok": True, "changed": bool(updated), "dry_run": False, "moved": len(updated), "from_folder": from_folder, "to_folder": to_folder, "paths": [item.get("path") for item in updated if item.get("path")], "items": updated, "reference_plan": reference_plan, "links_rewritten": links_rewritten}
 
 
 def bulk_upsert_nodes(args):
@@ -8932,13 +8979,14 @@ def bulk_upsert_nodes(args):
                 saved = request_json("POST", f"/v1/projects/{project_id}/nodes", payload, extra_headers=headers)
                 created = True
             index_node(saved)
-            results.append({"created": created, "node": decrypt_node_for_return(saved, project_id=project_id)})
+            node = decrypt_node_for_return(saved, project_id=project_id)
+            results.append({"created": created, **node_write_reference(node)})
     finally:
         try:
             release_project_lock({"lock_id": lock["id"], "lease_token": lock["lease_token"]})
         except Exception:
             pass
-    return {"ok": True, "changed": bool(results), "dry_run": False, "count": len(results), "paths": [item["node"].get("full_path") for item in results], "items": results}
+    return {"ok": True, "changed": bool(results), "dry_run": False, "count": len(results), "paths": [item.get("path") for item in results if item.get("path")], "items": results}
 
 
 def agent_node_args(args, key="path"):
@@ -8983,7 +9031,7 @@ def upsert_agent_node(args):
             f"update agent node {existing['full_path']}",
         )
         index_node(updated)
-        return {"created": False, "node": updated}
+        return {"ok": True, "changed": True, "created": False, "updated": True, **node_write_reference(updated)}
     created = request_project_write(
         "POST",
         f"/v1/projects/{project_id}/nodes",
@@ -8992,7 +9040,7 @@ def upsert_agent_node(args):
         f"create agent node {scoped['path']}",
     )
     index_node(created)
-    return {"created": True, "node": created}
+    return {"ok": True, "changed": True, "created": True, **node_write_reference(created)}
 
 
 def update_agent_node(args):
@@ -9007,7 +9055,7 @@ def update_agent_node(args):
         f"update agent node {existing['full_path']}",
     )
     index_node(updated)
-    return {"updated": True, "node": updated}
+    return {"ok": True, "changed": True, "updated": True, **node_write_reference(updated)}
 
 
 def archive_agent_node(args):
@@ -9056,11 +9104,12 @@ def link_agent_node(args):
     else:
         updated = source
     return {
+        "ok": True,
+        "changed": created,
         "created": created,
         "relation": relation,
         "source": {"id": source["id"], "full_path": source["full_path"]},
         "target": {"id": target["id"], "full_path": target["full_path"]},
-        "updated_node": updated,
     }
 
 
@@ -9079,8 +9128,8 @@ def create_agent(args):
                 "links": [],
             }
         )
-        created.append(result["node"])
-    return {"agent_slug": slug, "root_path": agent_root_path(slug), "nodes": created}
+        created.append(result)
+    return {"ok": True, "changed": bool(created), "agent_slug": slug, "root_path": agent_root_path(slug), "items": created}
 
 
 def show_agent(args):

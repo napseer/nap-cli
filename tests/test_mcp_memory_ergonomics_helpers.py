@@ -371,6 +371,7 @@ def test_kanban_workflow_create_move_and_block(mod):
 
     created = mod.create_kanban_card({"title": "Add MCP commands", "priority": "HIGH"})
     assert created["created"] is True
+    assert "node" not in created
     assert writes[0][0] == "POST"
     assert writes[0][2]["folder_path"] == "/kanban/todo"
     assert writes[0][2]["metadata"]["priority"] == "high"
@@ -378,6 +379,7 @@ def test_kanban_workflow_create_move_and_block(mod):
 
     moved = mod.move_kanban_card({"path": "/kanban/todo/add-mcp-commands"}, "doing")
     assert moved["to"] == "/kanban/doing/add-mcp-commands"
+    assert "node" not in moved
     assert writes[1][0] == "PATCH"
     assert writes[1][2]["folder_path"] == "/kanban/doing"
     assert writes[1][2]["metadata"]["column"] == "doing"
@@ -385,6 +387,7 @@ def test_kanban_workflow_create_move_and_block(mod):
 
     blocked = mod.block_kanban_card({"path": "/kanban/todo/add-mcp-commands", "blocked_reason": "waiting"}, True)
     assert blocked["updated"] is True
+    assert "node" not in blocked
     assert writes[2][2]["metadata"]["blocked"] is True
     assert writes[2][2]["metadata"]["blocked_by"] == "waiting"
 
@@ -411,6 +414,7 @@ def test_kanban_create_deduplicates_overlapping_titles(mod):
 
     created = mod.create_kanban_card({"title": "Add MCP commands", "column": "todo", "now": "2026-05-10T12:34:56Z"})
     assert created["path"] == "/kanban/todo/add-mcp-commands-20260510123456-2"
+    assert "node" not in created
     assert writes[0][2]["name"] == "add-mcp-commands-20260510123456-2"
 
 
