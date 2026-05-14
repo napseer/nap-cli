@@ -7469,12 +7469,13 @@ def get_backlinks_by_path(args):
 
 def list_project_nodes(args):
     project_id = resolve_project_id(args)
-    view, view_warnings = normalize_discovery_view(args)
+    view, view_warnings = normalize_discovery_view(args, default="paths")
     filters = status_filter_from_args(args)
     limit = normalize_int(args.get("limit"), DISCOVERY_DEFAULT_LIMIT, 1, discovery_max_limit(view))
     allowed = {"tag", "folder_path", "q", "limit", "cursor", "updated_before", "updated_after", "type", "include_archived", "archived_only"}
     base_query = {key: value for key, value in args.items() if key in allowed and value not in (None, "")}
     base_query["limit"] = limit
+    base_query["view"] = "summary" if view == "titles" else view
     if filters["active_only"]:
         base_query["include_archived"] = False
         base_query["archived_only"] = False
@@ -8614,7 +8615,7 @@ def search_memory(args):
         raise RuntimeError("q is required")
     query_analysis = analyze_search_query(q)
     limit = max(1, min(int(args.get("limit", 25)), 100))
-    view, view_warnings = normalize_discovery_view(args)
+    view, view_warnings = normalize_discovery_view(args, default="paths")
     filters = status_filter_from_args(args)
     mode = str(args.get("mode") or "hybrid").strip().lower()
     if mode not in {"hybrid", "server", "local"}:
@@ -8693,7 +8694,7 @@ def search_memory(args):
 
 def recent_memory(args):
     limit = max(1, min(int(args.get("limit", 25)), 100))
-    view, _warnings = normalize_discovery_view(args, default="titles")
+    view, _warnings = normalize_discovery_view(args, default="paths")
     query = {**args, "limit": limit, "view": view}
     for key in ["folder_path", "tag", "updated_before", "updated_after", "cursor"]:
         if args.get(key):
@@ -8749,7 +8750,7 @@ def get_memory_context(args):
 
 def find_related_nodes(args):
     path = args["path"]
-    view, _warnings = normalize_discovery_view(args)
+    view, _warnings = normalize_discovery_view(args, default="paths")
     limit = max(1, min(int(args.get("limit", 25)), 100))
     target = get_node_by_path({"path": path}, allow_agent=is_agent_namespace_path(path))
     related = []
@@ -10227,7 +10228,7 @@ def raw_tools():
                     "q": {"type": "string", "description": "Search text. Natural language is accepted; distinctive nouns, paths, tags, or quoted phrases produce better matches than full instructions."},
                     "mode": {"type": "string", "enum": ["hybrid", "server", "local"], "default": "hybrid"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "summary"},
+                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "paths"},
                     "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
                     "active_only": {"type": "boolean", "default": False},
                     "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
@@ -10240,7 +10241,7 @@ def raw_tools():
         },
         {
             "name": "nap_find",
-            "description": "Structured active memory search by folder, tag, path, or query. Returns compact summaries by default; use view='full' or nap_cat for body text.",
+            "description": "Structured active memory search by folder, tag, path, or query. Returns path/date rows by default; use view='full' or nap_cat for body text.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -10249,7 +10250,7 @@ def raw_tools():
                     "q": {"type": "string"},
                     "cursor": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 10000},
-                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "summary"},
+                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "paths"},
                     "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
                     "include_archived": {"type": "boolean", "default": False},
                     "archived_only": {"type": "boolean", "default": False},
@@ -10343,8 +10344,8 @@ def raw_tools():
                 "properties": {
                     "path": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "titles"},
-                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set. nap_recent defaults to title-only output."},
+                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "paths"},
+                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set. nap_recent and nap_find default to path/date output."},
                     "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
                 },
                 "additionalProperties": False,
@@ -10352,7 +10353,7 @@ def raw_tools():
         },
         {
             "name": "nap_recent",
-            "description": "List recently updated project memory as title/path pairs by default, with optional folder, tag, and cursor filters.",
+            "description": "List recently updated project memory as path/date rows by default, with optional folder, tag, and cursor filters.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -10362,8 +10363,8 @@ def raw_tools():
                     "updated_before": {"type": "string"},
                     "updated_after": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "titles"},
-                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set. nap_recent defaults to title-only output."},
+                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "paths"},
+                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set. nap_recent and nap_find default to path/date output."},
                     "active_only": {"type": "boolean", "default": False},
                     "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
                     "exclude_status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},

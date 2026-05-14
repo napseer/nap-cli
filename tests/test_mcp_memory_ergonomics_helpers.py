@@ -80,7 +80,7 @@ def test_node_discovery_allows_large_requested_limit(mod):
     assert len(calls) == 1
 
 
-def test_recent_memory_defaults_to_titles(mod):
+def test_recent_memory_defaults_to_paths(mod):
     recent = node(
         "/notes/recent-title",
         "active",
@@ -93,15 +93,70 @@ def test_recent_memory_defaults_to_titles(mod):
     def fake_request(method, path, payload=None, **kwargs):
         assert method == "GET"
         assert "/nodes?" in path
+        assert "view=paths" in path
         return {"items": [recent], "next_cursor": None}
 
     mod.request_json = fake_request
     result = mod.recent_memory({})
     assert result["ok"] is True
-    assert result["view"] == "titles"
-    assert result["items"] == [{"title": "Readable Recent Title", "full_path": "/notes/recent-title"}]
+    assert result["view"] == "paths"
+    assert result["items"] == [{
+        "full_path": "/notes/recent-title",
+        "type": "note",
+        "status": "active",
+        "updated_at": "2026-05-06T12:00:00Z",
+    }]
     assert "content_text" not in result["items"][0]
     assert "metadata_summary" not in result["items"][0]
+
+
+def test_find_defaults_to_paths_and_requests_compact_rest_view(mod):
+    found = node(
+        "/plans/found",
+        "planned",
+        content="large body that should not be fetched by default",
+    )
+
+    def fake_request(method, path, payload=None, **kwargs):
+        assert method == "GET"
+        assert "/nodes?" in path
+        assert "folder_path=%2Fplans" in path
+        assert "view=paths" in path
+        return {"items": [found], "next_cursor": None}
+
+    mod.request_json = fake_request
+    result = mod.list_project_nodes({"folder_path": "/plans"})
+    assert result["ok"] is True
+    assert result["view"] == "paths"
+    assert result["items"] == [{
+        "full_path": "/plans/found",
+        "type": "plan",
+        "status": "planned",
+        "updated_at": "2026-05-06T12:00:00Z",
+    }]
+    assert "content_text" not in result["items"][0]
+
+
+def test_title_view_requests_summary_rest_view_without_content(mod):
+    found = node(
+        "/notes/titled",
+        "active",
+        metadata={"title": "Readable Title"},
+        content="large body that should not be fetched by title view",
+    )
+
+    def fake_request(method, path, payload=None, **kwargs):
+        assert method == "GET"
+        assert "/nodes?" in path
+        assert "view=summary" in path
+        return {"items": [found], "next_cursor": None}
+
+    mod.request_json = fake_request
+    result = mod.list_project_nodes({"view": "titles"})
+    assert result["ok"] is True
+    assert result["view"] == "titles"
+    assert result["items"] == [{"title": "Readable Title", "full_path": "/notes/titled"}]
+    assert "content_text" not in result["items"][0]
 
 
 def test_rest_query_string_serializes_booleans_lowercase(mod):
@@ -438,6 +493,12 @@ def run():
     test_active_plan_listing(mod)
     mod = load_module()
     test_node_discovery_allows_large_requested_limit(mod)
+    mod = load_module()
+    test_recent_memory_defaults_to_paths(mod)
+    mod = load_module()
+    test_find_defaults_to_paths_and_requests_compact_rest_view(mod)
+    mod = load_module()
+    test_title_view_requests_summary_rest_view_without_content(mod)
     mod = load_module()
     test_kanban_list_grouping_and_filters(mod)
     mod = load_module()

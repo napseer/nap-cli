@@ -262,10 +262,9 @@ def run():
     mod.request_json = lambda method, path, payload=None, **kwargs: {"items": [moved]}
     compact = mod.list_project_nodes({"limit": 10})
     assert compact["ok"] is True
-    assert compact["view"] == "summary"
+    assert compact["view"] == "paths"
     assert "content_text" not in compact["items"][0]
-    assert compact["items"][0]["preview"] == "secret needle"
-    assert compact["items"][0]["metadata_summary"] == {}
+    assert compact["items"][0]["full_path"] == "/renamed/alpha"
     full = mod.list_project_nodes({"limit": 10, "view": "full"})
     assert full["items"][0]["content_text"] == "secret needle"
 
