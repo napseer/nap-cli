@@ -143,6 +143,21 @@ KANBAN_COLUMN_LIFECYCLE = {
     "review": "review",
     "done": "done",
 }
+PLANNING_SOURCE_RELATIONS = {
+    "created_from",
+    "derived_from",
+    "implements",
+    "references",
+    "tracks",
+    "verifies",
+}
+PLAN_ORIGIN_RELATIONS = {
+    "created_from",
+    "derived_from",
+    "implements",
+    "references",
+    "tracks",
+}
 
 
 def discovery_max_limit(view):
@@ -8220,6 +8235,166 @@ def create_kanban_card(args):
     }
 
 
+def normalize_relation_slug(value):
+    return re.sub(r"[\s-]+", "_", str(value or "").strip().lower())
+
+
+def is_plan_node_path(path):
+    parts = [part for part in normalize_node_path(path).strip("/").split("/") if part]
+    return len(parts) >= 2 and parts[0] == "plans"
+
+
+def is_kanban_card_node_path(path):
+    parts = [part for part in normalize_node_path(path).strip("/").split("/") if part]
+    return len(parts) >= 3 and parts[0] == "kanban"
+
+
+def plan_source_paths(node):
+    paths = []
+    for link in node.get("links") or []:
+        if not isinstance(link, dict):
+            continue
+        path = normalize_node_path(link.get("path") or "")
+        relation = normalize_relation_slug(link.get("relation") or "references")
+        if path and not is_plan_node_path(path) and not is_kanban_card_node_path(path) and relation in PLANNING_SOURCE_RELATIONS:
+            paths.append(path)
+    metadata = node_metadata(node)
+    for key in ("source_record_path", "source_path", "requirement_path", "spec_path"):
+        value = metadata.get(key)
+        if value not in (None, ""):
+            path = normalize_node_path(value)
+            if path and path not in paths:
+                paths.append(path)
+    return unique_nonempty_strings(paths)
+
+
+def card_source_plan_path(node):
+    for link in node.get("links") or []:
+        if not isinstance(link, dict):
+            continue
+        path = normalize_node_path(link.get("path") or "")
+        relation = normalize_relation_slug(link.get("relation") or "references")
+        if is_plan_node_path(path) and relation in PLAN_ORIGIN_RELATIONS:
+            return path
+    metadata = node_metadata(node)
+    for key in ("source_plan_path", "origin_plan_path", "plan_path"):
+        value = metadata.get(key)
+        if value not in (None, ""):
+            path = normalize_node_path(value)
+            if is_plan_node_path(path):
+                return path
+    return None
+
+
+def lineage_status(args):
+    args = dict(args or {})
+    limit = normalize_int(args.get("limit"), DISCOVERY_DEFAULT_LIMIT, 1, DISCOVERY_COMPACT_MAX_LIMIT)
+    include_archived = as_bool(args.get("include_archived"), False)
+    include_items = as_bool(args.get("include_items"), True)
+    plans = list_project_nodes({
+        "folder_path": "/plans",
+        "limit": limit,
+        "view": "full",
+        "include_archived": include_archived,
+    }).get("items", [])
+    kanban_nodes = list_project_nodes({
+        "q": "/kanban",
+        "limit": limit,
+        "view": "full",
+        "include_archived": True,
+    }).get("items", [])
+    cards = [node for node in kanban_nodes if is_kanban_card_node_path(node.get("full_path") or "")]
+
+    plan_items = []
+    card_items = []
+    warnings = []
+    for plan in plans:
+        sources = plan_source_paths(plan)
+        item = summarize_node(plan, view="metadata")
+        item["source_record_paths"] = sources
+        item["source_linked"] = bool(sources)
+        plan_items.append(item)
+        if not sources:
+            warnings.append({
+                "type": "plan_missing_source_record",
+                "path": plan.get("full_path"),
+                "message": "Plan has no link or metadata pointer to a source record.",
+            })
+
+    for card in cards:
+        source_plan_path = card_source_plan_path(card)
+        item = kanban_compact_card(card, view="metadata")
+        item["source_plan_path"] = source_plan_path
+        item["plan_linked"] = bool(source_plan_path)
+        card_items.append(item)
+        if not source_plan_path:
+            warnings.append({
+                "type": "kanban_card_missing_origin_plan",
+                "path": card.get("full_path"),
+                "message": "Kanban card has no origin plan link.",
+            })
+
+    result = {
+        "ok": not warnings,
+        "status": "ok" if not warnings else "warnings",
+        "chain": ["source-record", "/plans/<plan-slug>", "/kanban/<column>/<card-slug>"],
+        "counts": {
+            "plans": len(plan_items),
+            "plans_with_source_record": sum(1 for item in plan_items if item.get("source_linked")),
+            "kanban_cards": len(card_items),
+            "kanban_cards_with_origin_plan": sum(1 for item in card_items if item.get("plan_linked")),
+            "warnings": len(warnings),
+        },
+        "rules": {
+            "plan_to_source_record": "A plan should link to the source record it implements, verifies, tracks, or references.",
+            "kanban_to_plan": "A kanban card created from a plan should link to that plan with relation derived-from.",
+        },
+        "warnings": warnings,
+    }
+    if include_items:
+        result["plans"] = plan_items
+        result["kanban_cards"] = card_items
+    return result
+
+
+def plan_to_kanban_card(args):
+    args = dict(args or {})
+    plan_path = normalize_node_path(args.get("plan_path") or args.get("path") or "")
+    if not is_plan_node_path(plan_path):
+        raise RuntimeError("plan_path must be a /plans/<plan-slug> path")
+    plan = get_node_by_path({"path": plan_path})
+    metadata = node_metadata(plan)
+    title = str(args.get("title") or metadata.get("title") or plan.get("name") or "").strip()
+    if not title:
+        raise RuntimeError("title is required")
+    content_text = args.get("content_text") if args.get("content_text") not in (None, "") else args.get("body")
+    if content_text in (None, ""):
+        body = str(plan.get("content_text") or "").strip()
+        excerpt = body[:4000]
+        content_text = f"Origin plan: {plan['full_path']}\n\n{excerpt}" if excerpt else f"Origin plan: {plan['full_path']}"
+    links = add_link_once(args.get("links") or [], plan["full_path"], "derived-from")
+    card_metadata = dict(args.get("metadata") or {})
+    card_metadata["source_plan_path"] = plan["full_path"]
+    card_metadata.setdefault("origin", "plan")
+    card_args = {
+        "title": title,
+        "slug": args.get("slug") or normalize_kanban_slug(title),
+        "column": args.get("column") or "todo",
+        "content_text": content_text,
+        "priority": args.get("priority") or metadata.get("priority") or "normal",
+        "owner": args.get("owner") or metadata.get("owner"),
+        "assignee": args.get("assignee") or metadata.get("assignee"),
+        "due_date": args.get("due_date"),
+        "links": links,
+        "tags": unique_preserve_order(list(args.get("tags") or []) + ["kanban", "plan-derived"]),
+        "metadata": card_metadata,
+        "upsert": as_bool(args.get("upsert"), False),
+        "now": args.get("now"),
+    }
+    created = create_kanban_card({key: value for key, value in card_args.items() if value not in (None, "")})
+    return {**created, "source_plan_path": plan["full_path"], "origin_relation": "derived-from"}
+
+
 def update_kanban_card(args):
     args = dict(args or {})
     path = args.get("path")
@@ -10331,6 +10506,19 @@ def raw_tools():
             },
         },
         {
+            "name": "nap_lineage_status",
+            "description": "Report generic source-record -> plan -> kanban-card lineage coverage without assuming a product methodology.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 25},
+                    "include_archived": {"type": "boolean", "default": False},
+                    "include_items": {"type": "boolean", "default": True},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "nap_kanban_list",
             "description": "List node-based kanban cards under /kanban, grouped and filtered without using ticket tables.",
             "inputSchema": {
@@ -10683,6 +10871,31 @@ def raw_tools():
             },
         },
         {
+            "name": "nap_plan_to_kanban",
+            "description": "Create a node-backed kanban card from any /plans node and preserve the origin plan with a derived-from link.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["plan_path"],
+                "properties": {
+                    "plan_path": {"type": "string"},
+                    "title": {"type": "string"},
+                    "slug": {"type": "string"},
+                    "column": {"type": "string", "enum": DEFAULT_KANBAN_COLUMNS, "default": "todo"},
+                    "content_text": {"type": "string"},
+                    "body": {"type": "string"},
+                    "priority": {"type": "string", "enum": DEFAULT_KANBAN_PRIORITIES},
+                    "owner": {"type": "string"},
+                    "assignee": {"type": "string"},
+                    "due_date": {"type": "string"},
+                    "links": {"type": "array", "items": {"type": "object"}},
+                    "tags": {"type": "array", "items": {"type": "string"}},
+                    "metadata": {"type": "object"},
+                    "upsert": {"type": "boolean", "default": False},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "nap_cat",
             "description": "Read one node by canonical full_path. Use this before linking if you know the path but need the node id or normalized path.",
             "inputSchema": {
@@ -10958,6 +11171,7 @@ TOOL_CATEGORIES = {
         "nap_grep",
         "nap_find",
         "nap_plan_list_active",
+        "nap_lineage_status",
         "nap_kanban_list",
         "nap_kanban_get_pending",
         "nap_kanban_get_backlog",
@@ -10991,6 +11205,7 @@ TOOL_CATEGORIES = {
         "nap_plan_complete",
         "nap_plan_supersede",
         "nap_plan_cancel",
+        "nap_plan_to_kanban",
         "nap_kanban_create",
         "nap_kanban_start",
         "nap_kanban_send_review",
@@ -11060,6 +11275,7 @@ READ_ONLY_TOOLS = {
     "nap_grep",
     "nap_find",
     "nap_plan_list_active",
+    "nap_lineage_status",
     "nap_kanban_list",
     "nap_kanban_get_pending",
     "nap_kanban_get_backlog",
@@ -11110,6 +11326,7 @@ AUTO_LOCK_TOOLS = {
     "nap_plan_complete",
     "nap_plan_supersede",
     "nap_plan_cancel",
+    "nap_plan_to_kanban",
     "nap_kanban_create",
     "nap_kanban_start",
     "nap_kanban_send_review",
@@ -11165,6 +11382,7 @@ def tool_contract_metadata(name):
         "nap_plan_complete",
         "nap_plan_supersede",
         "nap_plan_cancel",
+        "nap_plan_to_kanban",
     }
     return {
         "contract_version": CONTRACT_VERSION,
@@ -11407,6 +11625,8 @@ def call_tool_impl(name, args):
         return list_project_nodes(args)
     if name == "nap_plan_list_active":
         return list_active_plans(args)
+    if name == "nap_lineage_status":
+        return lineage_status(args)
     if name == "nap_kanban_list":
         return list_kanban_cards(args)
     if name == "nap_kanban_get_pending":
@@ -11492,6 +11712,8 @@ def call_tool_impl(name, args):
         return supersede_plan(args)
     if name == "nap_plan_cancel":
         return cancel_plan(args)
+    if name == "nap_plan_to_kanban":
+        return plan_to_kanban_card(args)
     if name == "nap_kanban_create":
         return create_kanban_card(args)
     if name == "nap_kanban_start":
@@ -11693,6 +11915,47 @@ def cli_main(argv):
             }), indent=2))
             return
         print("Usage: napseer_mcp_server.py project [create [slug] [--name NAME] [--description TEXT] [--encryption plaintext]|claim [--no-browser] [--timeout SECONDS] [--return-url URL]|status|encryption [status|set plaintext|plaintext]]")
+        return
+    if command == "lineage":
+        subcommand = argv[2] if len(argv) > 2 else "status"
+        args = argv[3:]
+        if subcommand in {"status", "ls", "list", "check"}:
+            print(json.dumps(lineage_status({
+                "limit": cli_option(args, "--limit", default=None),
+                "include_archived": cli_flag(args, "--include-archived", "--archived"),
+                "include_items": not cli_flag(args, "--summary-only", "--no-items"),
+            }), indent=2))
+            return
+        print("Usage: napseer_mcp_server.py lineage [status|check] [--limit N] [--include-archived] [--summary-only]")
+        return
+    if command == "plan":
+        subcommand = argv[2] if len(argv) > 2 else "list"
+        args = argv[3:]
+        if subcommand in {"list", "ls", "active"}:
+            print(json.dumps(list_active_plans({
+                "limit": cli_option(args, "--limit", default=None),
+                "view": cli_option(args, "--view", default="summary"),
+            }), indent=2))
+            return
+        if subcommand in {"to-kanban", "card-from", "create-card"}:
+            plan_path = cli_option(args, "--plan-path", "--path", default=None)
+            if not plan_path:
+                plan_path = next((value for value in args if not value.startswith("-")), None)
+            payload = {
+                "plan_path": plan_path,
+                "title": cli_option(args, "--title", default=None),
+                "slug": cli_option(args, "--slug", default=None),
+                "column": cli_option(args, "--column", default="todo"),
+                "priority": cli_option(args, "--priority", default=None),
+                "owner": cli_option(args, "--owner", default=None),
+                "assignee": cli_option(args, "--assignee", default=None),
+                "due_date": cli_option(args, "--due-date", default=None),
+                "content_text": cli_option(args, "--content", "--content-text", "--body", default=None),
+                "upsert": cli_flag(args, "--upsert"),
+            }
+            print(json.dumps(plan_to_kanban_card(payload), indent=2))
+            return
+        print("Usage: napseer_mcp_server.py plan [list|to-kanban <plan-path> [--column todo|doing|review|done|backlog] [--title TEXT] [--priority low|normal|high|urgent] [--upsert]]")
         return
     if command == "gateway":
         subcommand = argv[2] if len(argv) > 2 else "status"
@@ -11938,7 +12201,7 @@ def cli_main(argv):
         print("Usage: napseer_mcp_server.py agent [list|workspaces|create <slug>|show <slug>|edit <slug>]")
         return
     if command in {"help", "-h", "--help"}:
-        print("Usage: napseer_mcp_server.py [configure|open-ui|ui|update-status|update|auth|project|gateway|feedback|agent]")
+        print("Usage: napseer_mcp_server.py [configure|open-ui|ui|update-status|update|auth|project|plan|lineage|gateway|feedback|agent]")
         return
     main()
 

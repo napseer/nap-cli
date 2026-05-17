@@ -418,6 +418,82 @@ def test_kanban_create_deduplicates_overlapping_titles(mod):
     assert writes[0][2]["name"] == "add-mcp-commands-20260510123456-2"
 
 
+def test_lineage_status_reports_generic_plan_and_card_coverage(mod):
+    linked_plan = node("/plans/linked", "planned", links=[{"path": "/decisions/source", "relation": "implements"}])
+    unlinked_plan = node("/plans/unlinked", "planned")
+    linked_card = node(
+        "/kanban/todo/linked",
+        "todo",
+        metadata={"column": "todo"},
+        tags=["kanban"],
+        node_type="kanban_card",
+        links=[{"path": "/plans/linked", "relation": "derived-from"}],
+    )
+    unlinked_card = node(
+        "/kanban/todo/unlinked",
+        "todo",
+        metadata={"column": "todo"},
+        tags=["kanban"],
+        node_type="kanban_card",
+    )
+
+    def fake_list(args):
+        if args.get("folder_path") == "/plans":
+            return {"items": [linked_plan, unlinked_plan]}
+        if args.get("q") == "/kanban":
+            return {"items": [linked_card, unlinked_card, node("/notes/not-kanban", "active")]}
+        return {"items": []}
+
+    mod.list_project_nodes = fake_list
+    result = mod.lineage_status({})
+    assert result["status"] == "warnings"
+    assert result["counts"]["plans"] == 2
+    assert result["counts"]["plans_with_source_record"] == 1
+    assert result["counts"]["kanban_cards"] == 2
+    assert result["counts"]["kanban_cards_with_origin_plan"] == 1
+    assert [warning["type"] for warning in result["warnings"]] == [
+        "plan_missing_source_record",
+        "kanban_card_missing_origin_plan",
+    ]
+
+
+def test_plan_to_kanban_creates_card_with_origin_plan_link(mod):
+    writes = []
+    plan = node(
+        "/plans/generic-work",
+        "planned",
+        metadata={"title": "Generic Work", "priority": "high", "owner": "codex"},
+        tags=["plan"],
+        content="Implement a generic record to plan to kanban flow.",
+    )
+
+    mod.get_node_by_path = lambda args, allow_agent=False: plan
+    mod.list_kanban_cards = lambda args: {"items": []}
+    mod.request_project_write = lambda method, path, payload, *args, **kwargs: writes.append((method, path, payload)) or {
+        "id": "id-generic-work",
+        "project_id": "project-1",
+        "full_path": f"{payload.get('folder_path')}/{payload.get('name')}",
+        "folder_path": payload.get("folder_path"),
+        "name": payload.get("name"),
+        "type": payload.get("type"),
+        "metadata": payload.get("metadata", {}),
+        "tags": payload.get("tags", []),
+        "links": payload.get("links", []),
+        "content_text": payload.get("content_text", ""),
+        "updated_at": "2026-05-06T12:00:00Z",
+    }
+    mod.index_node = lambda node: None
+
+    created = mod.plan_to_kanban_card({"plan_path": "/plans/generic-work", "column": "todo"})
+    assert created["path"] == "/kanban/todo/generic-work"
+    assert created["source_plan_path"] == "/plans/generic-work"
+    assert writes[0][0] == "POST"
+    assert writes[0][2]["links"] == [{"path": "/plans/generic-work", "relation": "derived-from"}]
+    assert writes[0][2]["metadata"]["source_plan_path"] == "/plans/generic-work"
+    assert writes[0][2]["metadata"]["priority"] == "high"
+    assert writes[0][2]["metadata"]["owner"] == "codex"
+
+
 def test_plan_lifecycle_dry_run_and_write(mod):
     plan = node("/plans/example", "in_progress", tags=["plan"])
     outcome = node("/implementation-notes/example", "completed", node_type="implementation-note")
@@ -476,6 +552,7 @@ def test_tool_registry(mod):
     names = {tool["name"] for tool in mod.raw_tools()}
     for name in [
         "nap_plan_list_active",
+        "nap_lineage_status",
         "nap_kanban_list",
         "nap_kanban_get_pending",
         "nap_kanban_pick_next",
@@ -484,11 +561,14 @@ def test_tool_registry(mod):
         "nap_plan_complete",
         "nap_plan_supersede",
         "nap_plan_cancel",
+        "nap_plan_to_kanban",
     ]:
         assert name in names
     assert mod.tool_contract_metadata("nap_plan_complete")["dry_run_supported"] is True
     assert mod.tool_contract_metadata("nap_plan_list_active")["side_effect"] == "none"
+    assert mod.tool_contract_metadata("nap_lineage_status")["side_effect"] == "none"
     assert mod.tool_contract_metadata("nap_kanban_get_pending")["side_effect"] == "none"
+    assert mod.tool_contract_metadata("nap_plan_to_kanban")["side_effect"] == "remote-write"
     assert mod.tool_contract_metadata("nap_kanban_start")["side_effect"] == "remote-write"
 
 
@@ -515,6 +595,10 @@ def run():
     test_kanban_workflow_create_move_and_block(mod)
     mod = load_module()
     test_kanban_create_deduplicates_overlapping_titles(mod)
+    mod = load_module()
+    test_lineage_status_reports_generic_plan_and_card_coverage(mod)
+    mod = load_module()
+    test_plan_to_kanban_creates_card_with_origin_plan_link(mod)
     mod = load_module()
     test_plan_lifecycle_dry_run_and_write(mod)
     mod = load_module()

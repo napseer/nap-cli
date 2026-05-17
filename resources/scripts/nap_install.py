@@ -646,6 +646,10 @@ def main(argv):
         if args[0] == "bootstrap":
             raise RuntimeError("unknown project command: bootstrap")
         return run_wrapper("project", args)
+    if command == "lineage":
+        return run_wrapper("lineage", args or ["status"])
+    if command == "plan":
+        return run_wrapper("plan", args or ["list"])
     if command == "agent":
         return run_wrapper("agent", args)
     if command == "auth":
@@ -670,12 +674,16 @@ def main(argv):
         )
         return 0
     if command in {"help", "-h", "--help"}:
-        print("Usage: nap [auth|project|gateway|agent|feedback|status|update|where|install]")
+        print("Usage: nap [auth|project|plan|lineage|gateway|agent|feedback|status|update|where|install]")
         print("  auth        Auth commands: login-local, status.")
         print("              Example: nap auth login-local")
         print("  project     Project commands: create, status, encryption.")
         print("              Examples: nap project create, nap project status, nap project encryption status")
         print("              Encrypted project setup is completed by the local gateway: nap gateway vault process")
+        print("  plan        Plan commands: list, to-kanban.")
+        print("              Example: nap plan to-kanban /plans/example --column todo")
+        print("  lineage     Generic source-record -> plan -> kanban lineage checks.")
+        print("              Example: nap lineage status")
         print("  gateway     Gateway commands: start, stop, configure, setup, restart, kill, logs, status, vault.")
         print("              Start auto-selects a local port; use --port to pin one.")
         print("              Examples: nap gateway start, nap gateway vault, nap gateway vault rotate-secret --kind chat")
