@@ -139,7 +139,7 @@ def run():
     active_bundle = mod.wrapped_project_key_bundle_record(
         PROJECT_ID,
         ACCOUNT_ID,
-        "chat",
+        "memory",
         mod.generate_project_data_key_bundle(PROJECT_ID, ACCOUNT_ID, data_key_epoch=1),
         wrapping_epoch=1,
         bundle_version=1,
@@ -147,9 +147,9 @@ def run():
     )
 
     def request_json(method, path, payload=None, **kwargs):
-        assert (method, path) == ("GET", f"/v1/projects/{PROJECT_ID}/vault/secrets/chat/active")
+        assert (method, path) == ("GET", f"/v1/projects/{PROJECT_ID}/vault/secrets/memory/active")
         return {
-            "secret_kind": "chat",
+            "secret_kind": "memory",
             "version": 1,
             "wrapping_epoch": 1,
             "bundle_version": 1,
@@ -165,13 +165,20 @@ def run():
     ) or {
         "id": "secret-version-2",
         "version": 2,
-        "secret_kind": "chat",
+        "secret_kind": "memory",
     }
-    rotated = mod.gateway_rotate_project_vault_secret({"project_id": PROJECT_ID, "secret_kind": "chat"})
+    try:
+        mod.gateway_rotate_project_vault_secret({"project_id": PROJECT_ID, "secret_kind": "chat"})
+    except RuntimeError as exc:
+        assert "requires operator authorization" in str(exc)
+    else:
+        raise AssertionError("chat rotation must not run through the gateway worker path")
+
+    rotated = mod.gateway_rotate_project_vault_secret({"project_id": PROJECT_ID, "secret_kind": "memory"})
     assert rotated["version"] == 2
     assert not writes, "rotation must not persist project secret material locally"
     assert calls[0][0] == "POST"
-    assert calls[0][1] == f"/v1/projects/{PROJECT_ID}/vault/secrets/chat/rotate"
+    assert calls[0][1] == f"/v1/projects/{PROJECT_ID}/vault/secrets/memory/rotate"
     assert calls[0][5] == "encryption"
     assert set(calls[0][2]) == {
         "previous_wrapping_epoch",
@@ -186,7 +193,7 @@ def run():
     assert calls[0][2]["previous_data_key_epoch"] == 1
     assert calls[0][2]["previous_aad_hash"] == active_bundle["aad_hash"]
     assert calls[0][2]["previous_ciphertext_sha256"] == active_bundle["ciphertext_sha256"]
-    assert_wrapped_record(mod, calls[0][2]["wrapped_key_bundle"], "chat", data_key_epoch=2)
+    assert_wrapped_record(mod, calls[0][2]["wrapped_key_bundle"], "memory", data_key_epoch=2)
     assert "secret_b64" not in str(calls[0][2])
     assert mod.VAULT_SECRETS == local_before
 

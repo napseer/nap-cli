@@ -598,14 +598,18 @@ def handle_gateway(args):
         print("  nap gateway setup                     Create or migrate local gateway storage.")
         print("  nap gateway vault                     Show gateway vault status and pending setup requests.")
         print("  nap gateway vault process             Complete pending setup requests.")
-        print("  nap gateway vault rotate-secret --kind chat|tabs|gateway|memory")
+        print("  nap gateway vault rotate-secret --kind memory")
+        print("  nap chat secret setup                 Configure chat secret state through the gateway.")
         return 0
     if subcommand == "vault" and rest and rest[0] in {"help", "-h", "--help"}:
-        print("Usage: nap gateway vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway|memory] [--all] [--project-id ID]")
+        print("Usage: nap gateway vault [status|list|process|rotate-secret] [--kind memory] [--all] [--project-id ID]")
         print("  status        Show local gateway state and pending setup requests.")
         print("  process       Upload opaque client-wrapped key bundle records for backend-owned HashiCorp storage.")
-        print("  rotate-secret Rotate one encrypted project secret.")
+        print("  rotate-secret Rotate the memory project secret from the gateway worker path.")
+        print("  Chat secrets use: nap chat secret setup|status|rotate")
         return 0
+    if subcommand == "process":
+        return run_wrapper("gateway", ["vault", "process", *rest])
     if subcommand == "start":
         return print_json(start_service("gateway", ["--no-browser", *rest])) or 0
     if subcommand == "stop":
@@ -638,6 +642,8 @@ def main(argv):
         return 0
     if command == "gateway":
         return handle_gateway(args)
+    if command == "chat":
+        return run_wrapper("chat", args or ["secret", "status"])
     if command == "status":
         return run_wrapper("configure", args)
     if command == "project":
@@ -674,19 +680,21 @@ def main(argv):
         )
         return 0
     if command in {"help", "-h", "--help"}:
-        print("Usage: nap [auth|project|plan|lineage|gateway|agent|feedback|status|update|where|install]")
+        print("Usage: nap [auth|project|chat|plan|lineage|gateway|agent|feedback|status|update|where|install]")
         print("  auth        Auth commands: login-local, status.")
         print("              Example: nap auth login-local")
         print("  project     Project commands: create, status, encryption.")
         print("              Examples: nap project create, nap project status, nap project encryption status")
         print("              Encrypted project setup is completed by the local gateway: nap gateway vault process")
+        print("  chat        Chat secret commands: secret status, secret setup, secret rotate.")
+        print("              Examples: nap chat secret setup, nap chat secret status")
         print("  plan        Plan commands: list, to-kanban.")
         print("              Example: nap plan to-kanban /plans/example --column todo")
         print("  lineage     Generic source-record -> plan -> kanban lineage checks.")
         print("              Example: nap lineage status")
         print("  gateway     Gateway commands: start, stop, configure, setup, restart, kill, logs, status, vault.")
         print("              Start auto-selects a local port; use --port to pin one.")
-        print("              Examples: nap gateway start, nap gateway vault, nap gateway vault rotate-secret --kind chat")
+        print("              Examples: nap gateway start, nap gateway vault, nap gateway vault process --all")
         print("  agent       Agent commands: list, workspaces, create, show, edit.")
         print("              list shows registered project agents; workspaces shows /agents folders.")
         print("  feedback    Feedback commands: list, global, status, resolve.")

@@ -3874,6 +3874,12 @@ def gateway_rotate_project_vault_secret(args=None):
     secret_kind = str(args.get("secret_kind") or args.get("kind") or "chat").strip().lower()
     if secret_kind not in GATEWAY_PROJECT_SECRET_KINDS:
         raise RuntimeError("secret_kind must be chat, tabs, gateway, or memory")
+    if secret_kind != MEMORY_SECRET_KIND:
+        raise RuntimeError(
+            f"{secret_kind} secret rotation requires operator authorization and is not available "
+            "through the gateway worker token. Use `nap chat secret setup` to initialize chat "
+            "secret state, and rotate chat secrets from an operator-authorized session."
+        )
     current = request_json("GET", f"/v1/projects/{project_id}/vault/secrets/{urllib.parse.quote(secret_kind, safe='')}/active")
     if current.get("secret_kind") != secret_kind:
         raise RuntimeError("active project secret is unavailable")
@@ -3929,6 +3935,110 @@ def gateway_rotate_project_vault_secret(args=None):
         version=result.get("version"),
     )
     return result
+
+
+def project_secret_versions(project_id, secret_kind=None):
+    path = f"/v1/projects/{project_id}/vault/secrets"
+    if secret_kind:
+        path = f"{path}?secret_kind={urllib.parse.quote(str(secret_kind), safe='')}"
+    return request_json("GET", path)
+
+
+def chat_secret_status(args=None):
+    args = args or {}
+    project_id = str(args.get("project_id") or current_project_id()).strip()
+    vault = gateway_vault_status({"project_id": project_id})
+    response = {
+        "status": "ok",
+        "project_id": project_id,
+        "locked": vault.get("locked"),
+        "vault_configured": vault.get("vault_configured"),
+        "pending_setup_requests": vault.get("pending_setup_requests", 0),
+        "chat_secret_configured": None,
+        "active_chat_secret": None,
+    }
+    try:
+        versions = project_secret_versions(project_id, "chat").get("items", [])
+    except Exception as exc:
+        return {
+            **response,
+            "status": "operator_auth_required",
+            "message": (
+                "Could not read chat secret status with the current token. "
+                "Chat/tabs/gateway secret status and rotation require operator authorization. "
+                "Run `nap auth login-local`, then retry `nap chat secret status`."
+            ),
+            "error": str(exc),
+        }
+    active = next(
+        (
+            item for item in versions
+            if item.get("secret_kind") == "chat"
+            and item.get("status") == "active"
+            and item.get("activation_status") == "active"
+        ),
+        None,
+    )
+    if active:
+        return {
+            **response,
+            "chat_secret_configured": True,
+            "active_chat_secret": {
+                "version": active.get("version"),
+                "last_rotated_at": active.get("last_rotated_at"),
+                "storage_provider": active.get("storage_provider"),
+            },
+            "message": "Chat secret is configured.",
+        }
+    if response["pending_setup_requests"]:
+        return {
+            **response,
+            "chat_secret_configured": False,
+            "message": "Chat secret setup is pending. Run `nap chat secret setup`.",
+        }
+    return {
+        **response,
+        "chat_secret_configured": False,
+        "message": (
+            "No active chat secret and no pending gateway vault setup request. "
+            "Enable encrypted project setup from the cloud UI, then run `nap chat secret setup`."
+        ),
+    }
+
+
+def chat_secret_setup(args=None):
+    args = args or {}
+    project_id = str(args.get("project_id") or current_project_id()).strip()
+    status = chat_secret_status({"project_id": project_id})
+    if status.get("chat_secret_configured") is True:
+        return status
+    if status.get("locked"):
+        return {
+            **status,
+            "status": "locked",
+            "message": "Gateway vault is locked. Run `nap gateway setup` or unlock the gateway, then retry `nap chat secret setup`.",
+        }
+    if status.get("pending_setup_requests", 0) > 0:
+        processed = gateway_process_vault_setup_requests({"project_id": project_id, "complete_all": True})
+        return {
+            **chat_secret_status({"project_id": project_id}),
+            "processed_setup": processed,
+        }
+    return status
+
+
+def chat_secret_rotate(args=None):
+    args = args or {}
+    project_id = str(args.get("project_id") or current_project_id()).strip()
+    return {
+        "status": "operator_auth_required",
+        "project_id": project_id,
+        "message": (
+            "Chat secret rotation is not available through the gateway worker token. "
+            "This preserves the boundary that worker tokens cannot read active chat secrets. "
+            "Use an operator-authorized rotation flow."
+        ),
+    }
 
 
 def gateway_vault_setup_loop():
@@ -10273,14 +10383,41 @@ def raw_tools():
         },
         {
             "name": "nap_gateway_vault_secret_rotate",
-            "description": "Rotate one project secret version from this local gateway by uploading an opaque client-wrapped key bundle record for backend-owned HashiCorp storage.",
+            "description": "Rotate the memory project secret version from this local gateway by uploading an opaque client-wrapped key bundle record for backend-owned HashiCorp storage. Chat, tabs, and gateway secrets require operator authorization.",
             "inputSchema": {
                 "type": "object",
                 "required": ["secret_kind"],
                 "properties": {
                     "project_id": {"type": "string"},
-                    "secret_kind": {"type": "string", "enum": ["chat", "tabs", "gateway", "memory"]},
+                    "secret_kind": {"type": "string", "enum": ["memory"]},
                 },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "nap_chat_secret_status",
+            "description": "Show chat secret setup status without exposing secret material.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"project_id": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "nap_chat_secret_setup",
+            "description": "Complete pending gateway vault setup needed for chat secrets, or report the next required action.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"project_id": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "nap_chat_secret_rotate",
+            "description": "Explain the operator authorization required to rotate chat secrets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"project_id": {"type": "string"}},
                 "additionalProperties": False,
             },
         },
@@ -11238,6 +11375,9 @@ TOOL_CATEGORIES = {
         "nap_gateway_vault_ls",
         "nap_gateway_vault_process",
         "nap_gateway_vault_secret_rotate",
+        "nap_chat_secret_status",
+        "nap_chat_secret_setup",
+        "nap_chat_secret_rotate",
         "nap_gateway_restart",
         "nap_gateway_kill",
         "nap_ui_open",
@@ -11266,6 +11406,7 @@ def tool_category(name):
 READ_ONLY_TOOLS = {
     "nap_whoami",
     "nap_gateway_status",
+    "nap_chat_secret_status",
     "nap_update_status",
     "nap_apropos",
     "nap_man",
@@ -11312,6 +11453,9 @@ LOCAL_FILE_TOOLS = {
     "nap_gateway_configure",
     "nap_gateway_vault_process",
     "nap_gateway_vault_secret_rotate",
+    "nap_chat_secret_status",
+    "nap_chat_secret_setup",
+    "nap_chat_secret_rotate",
 }
 
 PROCESS_CONTROL_TOOLS = {"nap_ui_open"}
@@ -11587,6 +11731,12 @@ def call_tool_impl(name, args):
         return gateway_process_vault_setup_requests(args)
     if name == "nap_gateway_vault_secret_rotate":
         return gateway_rotate_project_vault_secret(args)
+    if name == "nap_chat_secret_status":
+        return chat_secret_status(args)
+    if name == "nap_chat_secret_setup":
+        return chat_secret_setup(args)
+    if name == "nap_chat_secret_rotate":
+        return chat_secret_rotate(args)
     if name == "nap_gateway_restart":
         return gateway_terminal_restart(args)
     if name == "nap_gateway_kill":
@@ -12092,7 +12242,8 @@ def cli_main(argv):
             action = args[0] if args else "status"
             vault_args = args[1:] if args else []
             if action in {"help", "-h", "--help"}:
-                print("Usage: napseer_mcp_server.py gateway vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway|memory] [--all] [--project-id ID]")
+                print("Usage: napseer_mcp_server.py gateway vault [status|list|process|rotate-secret] [--kind memory] [--all] [--project-id ID]")
+                print("Chat secrets use: nap chat secret setup|status|rotate")
                 return
             payload = {
                 "project_id": cli_option(vault_args, "--project-id", default=None),
@@ -12107,7 +12258,7 @@ def cli_main(argv):
                 return
             if action == "rotate-secret":
                 if not payload.get("secret_kind"):
-                    payload["secret_kind"] = vault_args[0] if vault_args and not vault_args[0].startswith("-") else "chat"
+                    payload["secret_kind"] = vault_args[0] if vault_args and not vault_args[0].startswith("-") else "memory"
                 print(json.dumps(gateway_rotate_project_vault_secret(payload), indent=2))
                 return
             raise RuntimeError("unknown gateway vault action; use status|list|process|rotate-secret")
@@ -12122,7 +12273,30 @@ def cli_main(argv):
                 "new_passphrase": cli_option(args, "--new-passphrase", "--passphrase", default=None),
             }), indent=2))
             return
-        print("Usage: napseer_mcp_server.py gateway [status|configure [--command CMD] [--target session:window.pane]|vault [status|list|process|rotate-secret] [--kind chat|tabs|gateway|memory] [--all]|terminal [list|create|close|capture|input]|schedule [list|create|update|delete|run]|restart|kill|setup|rotate-passphrase --new-passphrase TEXT]")
+        print("Usage: napseer_mcp_server.py gateway [status|configure [--command CMD] [--target session:window.pane]|vault [status|list|process|rotate-secret] [--kind memory] [--all]|terminal [list|create|close|capture|input]|schedule [list|create|update|delete|run]|restart|kill|setup|rotate-passphrase --new-passphrase TEXT]")
+        return
+    if command == "chat":
+        subcommand = argv[2] if len(argv) > 2 else "secret"
+        args = argv[3:]
+        if subcommand == "secret":
+            action = args[0] if args else "status"
+            secret_args = args[1:] if args else []
+        else:
+            action = subcommand
+            secret_args = args
+        payload = {
+            "project_id": cli_option(secret_args, "--project-id", default=None),
+        }
+        if action in {"status", "show", "ls", "list"}:
+            print(json.dumps(chat_secret_status(payload), indent=2))
+            return
+        if action in {"setup", "configure", "init"}:
+            print(json.dumps(chat_secret_setup(payload), indent=2))
+            return
+        if action in {"rotate", "rotate-secret"}:
+            print(json.dumps(chat_secret_rotate(payload), indent=2))
+            return
+        print("Usage: napseer_mcp_server.py chat secret [status|setup|rotate] [--project-id ID]")
         return
     if command == "feedback":
         subcommand = argv[2] if len(argv) > 2 else "list"

@@ -30,8 +30,14 @@ def run():
     assert mod.handle_gateway(["vault", "list"]) == 0
     assert calls[-1] == ("gateway", ["vault", "list"])
 
-    assert mod.handle_gateway(["vault", "rotate-secret", "--kind", "chat"]) == 0
-    assert calls[-1] == ("gateway", ["vault", "rotate-secret", "--kind", "chat"])
+    assert mod.handle_gateway(["vault", "rotate-secret", "--kind", "memory"]) == 0
+    assert calls[-1] == ("gateway", ["vault", "rotate-secret", "--kind", "memory"])
+
+    assert mod.handle_gateway(["process", "--all"]) == 0
+    assert calls[-1] == ("gateway", ["vault", "process", "--all"])
+
+    assert mod.main(["nap", "chat", "secret", "setup"]) == 0
+    assert calls[-1] == ("chat", ["secret", "setup"])
 
     try:
         mod.handle_gateway(["config"])
