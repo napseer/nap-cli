@@ -1,7 +1,7 @@
 {
   "name": "nap-cli",
   "source": "backend-split-import",
-  "contract_version": "2026-05-03",
+  "contract_version": "2026-05-19",
   "owned_surface": [
     "nap installer",
     "project commands",
