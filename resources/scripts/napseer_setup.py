@@ -117,16 +117,16 @@ def ensure_local_files():
     chmod_best_effort(pathlib.Path(str(KEY_PATH) + ".pub"), 0o644)
 
 
-def read_master_passphrase():
-    value = os.environ.get("NAPSEER_MASTER_PASSPHRASE")
+def read_gateway_passphrase():
+    value = os.environ.get("NAPSEER_GATEWAY_PASSPHRASE") or os.environ.get("NAPSEER_MASTER_PASSPHRASE")
     if value:
         return value
     if not sys.stdin.isatty():
-        raise RuntimeError("NAPSEER_MASTER_PASSPHRASE is required in non-interactive mode")
-    first = getpass.getpass("Create gateway master passphrase: ")
-    second = getpass.getpass("Confirm gateway master passphrase: ")
+        raise RuntimeError("NAPSEER_GATEWAY_PASSPHRASE is required in non-interactive mode")
+    first = getpass.getpass("Create gateway relay/storage passphrase: ")
+    second = getpass.getpass("Confirm gateway relay/storage passphrase: ")
     if first != second:
-        raise RuntimeError("gateway master passphrases did not match")
+        raise RuntimeError("gateway relay/storage passphrases did not match")
     return first
 
 
@@ -278,7 +278,7 @@ def wait_for_claim_result(receiver, timeout_seconds):
 
 def main():
     ensure_local_files()
-    master_passphrase = read_master_passphrase()
+    gateway_passphrase = read_gateway_passphrase()
     public_key = pathlib.Path(str(KEY_PATH) + ".pub").read_text(encoding="utf-8").strip()
     private_key = KEY_PATH.read_text(encoding="utf-8")
     project_slug = os.environ.get("NAPSEER_PROJECT_SLUG", default_slug())
@@ -357,7 +357,7 @@ def main():
     if account_claim:
         secret_auth["account_claim_url"] = account_claim["claim_url"]
         secret_auth["account_claim_expires_at"] = account_claim["expires_at"]
-    write_gateway_vault(master_passphrase, public_auth, secret_auth)
+    write_gateway_vault(gateway_passphrase, public_auth, secret_auth)
     remove_plain_private_key()
 
     output = {

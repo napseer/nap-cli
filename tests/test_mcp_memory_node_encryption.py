@@ -115,7 +115,7 @@ def encrypted_node(mod, full_path="/notes/alpha", content="secret needle", metad
 def run():
     mod = load_module()
     mod.AUTH = {"account_id": ACCOUNT_ID, "token": "token", "token_expires_at": "later"}
-    mod.GATEWAY_PROJECT_BUNDLE_PASSPHRASE = PASSPHRASE
+    mod.PROJECT_VAULT_PASSPHRASE = PASSPHRASE
     mod.DEFAULT_PROJECT_ID = "project-1"
     mod.MEMORY_SECRET_CACHE.clear()
     mod.ACTIVE_MEMORY_SECRET_VERSIONS.clear()

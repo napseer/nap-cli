@@ -40,7 +40,8 @@ def run():
         return {"items": []}
 
     mod.request_json = request_json
-    setup = mod.chat_secret_setup({"project_id": PROJECT_ID})
+    setup = mod.chat_secret_setup({"project_id": PROJECT_ID, "vault_passphrase": "vault-content"})
+    assert mod.PROJECT_VAULT_PASSPHRASE == "vault-content"
     assert processed and processed[-1]["complete_all"] is True
     assert setup["chat_secret_configured"] is False
 
@@ -56,6 +57,7 @@ def run():
         }]
     }
     status = mod.chat_secret_status({"project_id": PROJECT_ID})
+    assert status["passphrase_authority"] == "vault"
     assert status["chat_secret_configured"] is True
     assert status["active_chat_secret"]["version"] == 3
 

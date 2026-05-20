@@ -597,16 +597,16 @@ def handle_gateway(args):
         print("  nap gateway configure [--command CMD] Configure the local gateway command.")
         print("  nap gateway setup                     Create or migrate local gateway storage.")
         print("  nap gateway vault                     Show gateway vault status and pending setup requests.")
-        print("  nap gateway vault process             Complete pending setup requests.")
+        print("  nap gateway vault process             Complete pending setup requests with the vault/content passphrase.")
         print("  nap gateway vault rotate-secret --kind memory")
-        print("  nap chat secret setup                 Configure chat secret state through the gateway.")
+        print("  nap chat secret setup                 Configure chat secret state with the vault/content passphrase.")
         return 0
     if subcommand == "vault" and rest and rest[0] in {"help", "-h", "--help"}:
-        print("Usage: nap gateway vault [status|list|process|rotate-secret] [--kind memory] [--all] [--project-id ID]")
+        print("Usage: nap gateway vault [status|list|process|rotate-secret] [--kind memory] [--all] [--project-id ID] [--vault-passphrase TEXT]")
         print("  status        Show local gateway state and pending setup requests.")
         print("  process       Upload opaque client-wrapped key bundle records for backend-owned HashiCorp storage.")
         print("  rotate-secret Rotate the memory project secret from the gateway worker path.")
-        print("  Chat secrets use: nap chat secret setup|status|rotate")
+        print("  Chat secrets use: nap chat secret setup|status|rotate; setup uses the same vault/content passphrase.")
         return 0
     if subcommand == "process":
         return run_wrapper("gateway", ["vault", "process", *rest])
@@ -687,7 +687,7 @@ def main(argv):
         print("              Examples: nap project create, nap project status, nap project encryption status")
         print("              Encrypted project setup is completed by the local gateway: nap gateway vault process")
         print("  chat        Chat secret commands: secret status, secret setup, secret rotate.")
-        print("              Examples: nap chat secret setup, nap chat secret status")
+        print("              Examples: nap chat secret setup --vault-passphrase TEXT, nap chat secret status")
         print("  plan        Plan commands: list, to-kanban.")
         print("              Example: nap plan to-kanban /plans/example --column todo")
         print("  lineage     Generic source-record -> plan -> kanban lineage checks.")

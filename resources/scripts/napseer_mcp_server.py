@@ -531,7 +531,7 @@ MEMORY_NODE_HKDF_INFO_PREFIX = "napseer-memory-node-v1"
 MEMORY_NODE_LEGACY_HKDF_INFO_PREFIX = "napseer-memory-local-mcp-v1"
 MEMORY_SECRET_CACHE = {}
 ACTIVE_MEMORY_SECRET_VERSIONS = {}
-GATEWAY_PROJECT_BUNDLE_PASSPHRASE = None
+PROJECT_VAULT_PASSPHRASE = None
 
 VAULT_SECRETS = {}
 VAULT_KEY = None
@@ -720,17 +720,31 @@ def _derive_vault_key(passphrase, salt, iterations):
     return hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt, iterations, dklen=32)
 
 
-def read_master_passphrase(create=False):
-    value = os.environ.get("NAPSEER_MASTER_PASSPHRASE")
+def read_gateway_relay_passphrase(create=False):
+    value = os.environ.get("NAPSEER_GATEWAY_PASSPHRASE")
     if value:
         return value
     if not sys.stdin.isatty():
-        raise RuntimeError("NAPSEER_MASTER_PASSPHRASE is required in non-interactive mode")
+        raise RuntimeError("NAPSEER_GATEWAY_PASSPHRASE is required in non-interactive mode")
     first = getpass.getpass("Create gateway relay passphrase: " if create else "Gateway relay passphrase: ")
     if create:
         second = getpass.getpass("Confirm gateway relay passphrase: ")
         if first != second:
             raise RuntimeError("gateway relay passphrases did not match")
+    return first
+
+
+def read_project_vault_passphrase(create=False):
+    value = os.environ.get("NAPSEER_VAULT_PASSPHRASE") or os.environ.get("NAPSEER_MASTER_PASSPHRASE")
+    if value:
+        return value
+    if not sys.stdin.isatty():
+        raise RuntimeError("NAPSEER_VAULT_PASSPHRASE is required in non-interactive mode")
+    first = getpass.getpass("Create project vault passphrase: " if create else "Project vault passphrase: ")
+    if create:
+        second = getpass.getpass("Confirm project vault passphrase: ")
+        if first != second:
+            raise RuntimeError("project vault passphrases did not match")
     return first
 
 
@@ -1098,8 +1112,8 @@ def touch_gateway():
 
 
 def clear_gateway_runtime_caches():
-    global GATEWAY_PROJECT_BUNDLE_PASSPHRASE
-    GATEWAY_PROJECT_BUNDLE_PASSPHRASE = None
+    global PROJECT_VAULT_PASSPHRASE
+    PROJECT_VAULT_PASSPHRASE = None
     MEMORY_SECRET_CACHE.clear()
     ACTIVE_MEMORY_SECRET_VERSIONS.clear()
 
@@ -1222,7 +1236,7 @@ def apply_vault_secrets(secrets_payload):
 
 
 def gateway_open_local(passphrase=None):
-    global VAULT_SECRETS, VAULT_KEY, GATEWAY_UNLOCKED, AUTH, BASE_URL, TOKEN, DEFAULT_PROJECT_ID, TOKEN_EXPIRES_AT, GATEWAY_PROJECT_BUNDLE_PASSPHRASE
+    global VAULT_SECRETS, VAULT_KEY, GATEWAY_UNLOCKED, AUTH, BASE_URL, TOKEN, DEFAULT_PROJECT_ID, TOKEN_EXPIRES_AT
     if not vault_exists():
         raise RuntimeError("gateway vault is not configured")
     local_key = read_local_vault_key(create=False)
@@ -1286,7 +1300,6 @@ def gateway_open_local(passphrase=None):
         DEFAULT_PROJECT_ID = AUTH["project_id"]
         TOKEN_EXPIRES_AT = AUTH["token_expires_at"]
         if passphrase:
-            GATEWAY_PROJECT_BUNDLE_PASSPHRASE = str(passphrase)
             write_gateway_relay_secret(passphrase)
         persist_vault_secrets()
         touch_gateway()
@@ -1333,7 +1346,7 @@ def normalize_gateway_command(value=None):
 
 
 def gateway_setup(args):
-    passphrase = args.get("passphrase") or os.environ.get("NAPSEER_GATEWAY_PASSPHRASE") or read_master_passphrase(create=True)
+    passphrase = args.get("passphrase") or os.environ.get("NAPSEER_GATEWAY_PASSPHRASE") or read_gateway_relay_passphrase(create=True)
     if vault_exists() and not args.get("overwrite"):
         result = gateway_open_local(passphrase)
         capability_result = ensure_gateway_worker_capability(refresh=True)
@@ -1388,7 +1401,6 @@ def gateway_rotate_passphrase(args):
         apply_vault_secrets(vault_payload)
         globals()["VAULT_KEY"] = vault_key
         globals()["VAULT_SECRETS"] = gateway_vault_secret_subset(secrets_map)
-        globals()["GATEWAY_PROJECT_BUNDLE_PASSPHRASE"] = new_passphrase
         write_gateway_relay_secret(new_passphrase)
         touch_gateway()
     return {
@@ -3156,13 +3168,23 @@ def current_account_id():
     return account_id
 
 
+def set_project_vault_passphrase(passphrase):
+    global PROJECT_VAULT_PASSPHRASE
+    if not isinstance(passphrase, str) or not passphrase.strip():
+        raise RuntimeError("project vault passphrase is required")
+    PROJECT_VAULT_PASSPHRASE = passphrase.strip()
+    return PROJECT_VAULT_PASSPHRASE
+
+
 def project_bundle_passphrase():
-    if GATEWAY_PROJECT_BUNDLE_PASSPHRASE:
-        return GATEWAY_PROJECT_BUNDLE_PASSPHRASE
-    value = os.environ.get("NAPSEER_MASTER_PASSPHRASE")
+    if PROJECT_VAULT_PASSPHRASE:
+        return PROJECT_VAULT_PASSPHRASE
+    value = os.environ.get("NAPSEER_VAULT_PASSPHRASE") or os.environ.get("NAPSEER_MASTER_PASSPHRASE")
     if value:
         return value
-    raise RuntimeError("gateway relay passphrase is required before handling project key bundles")
+    if sys.stdin.isatty():
+        return set_project_vault_passphrase(read_project_vault_passphrase(create=False))
+    raise RuntimeError("project vault passphrase is required before handling project key bundles; set NAPSEER_VAULT_PASSPHRASE")
 
 
 def project_bundle_hkdf_info(project_id, secret_kind, wrapping_epoch, bundle_version, data_key_epoch):
@@ -3752,6 +3774,7 @@ def gateway_generate_project_vault_setup_payload(project_id, setup_request_id):
     project_id = str(project_id or current_project_id()).strip()
     if not project_id:
         raise RuntimeError("project_id is required")
+    project_bundle_passphrase()
     account_id = current_account_id()
     plaintext_bundle = generate_project_data_key_bundle(project_id, account_id, data_key_epoch=1)
     project_secrets = []
@@ -3826,6 +3849,8 @@ def gateway_complete_vault_setup_request(setup_request, project_id=None):
 
 def gateway_process_vault_setup_requests(args=None):
     args = args or {}
+    if args.get("passphrase") or args.get("vault_passphrase"):
+        set_project_vault_passphrase(args.get("passphrase") or args.get("vault_passphrase"))
     project_id = args.get("project_id") or current_project_id()
     items = gateway_vault_setup_requests({"project_id": project_id}).get("items", [])
     pending = [item for item in items if item.get("status") == "pending"]
@@ -3951,6 +3976,7 @@ def chat_secret_status(args=None):
     response = {
         "status": "ok",
         "project_id": project_id,
+        "passphrase_authority": "vault",
         "locked": vault.get("locked"),
         "vault_configured": vault.get("vault_configured"),
         "pending_setup_requests": vault.get("pending_setup_requests", 0),
@@ -4008,6 +4034,8 @@ def chat_secret_status(args=None):
 
 def chat_secret_setup(args=None):
     args = args or {}
+    if args.get("passphrase") or args.get("vault_passphrase"):
+        set_project_vault_passphrase(args.get("passphrase") or args.get("vault_passphrase"))
     project_id = str(args.get("project_id") or current_project_id()).strip()
     status = chat_secret_status({"project_id": project_id})
     if status.get("chat_secret_configured") is True:
@@ -4033,10 +4061,11 @@ def chat_secret_rotate(args=None):
     return {
         "status": "operator_auth_required",
         "project_id": project_id,
+        "passphrase_authority": "vault",
         "message": (
             "Chat secret rotation is not available through the gateway worker token. "
             "This preserves the boundary that worker tokens cannot read active chat secrets. "
-            "Use an operator-authorized rotation flow."
+            "Use an operator-authorized rotation flow with the project vault passphrase."
         ),
     }
 
@@ -7026,6 +7055,7 @@ def cli_positionals(args):
         "--image-ref",
         "--secret-kind",
         "--kind",
+        "--vault-passphrase",
         "--root-path",
         "--name",
         "--target",
@@ -10328,12 +10358,12 @@ def raw_tools():
         },
         {
             "name": "nap_gateway_setup",
-            "description": "Create or migrate local gateway storage and configure the remote relay passphrase.",
+            "description": "Create or migrate local gateway storage and configure the remote relay passphrase. This does not configure the project vault/content passphrase used for chat or memory.",
             "inputSchema": {
                 "type": "object",
                 "required": ["passphrase"],
                 "properties": {
-                    "passphrase": {"type": "string", "description": "Remote relay passphrase. Local access is protected by the machine/user session, not an interactive unlock gate."},
+                    "passphrase": {"type": "string", "description": "Gateway relay passphrase for remote terminal/relay access only. It is not the chat/vault passphrase."},
                     "default_command": {"type": "string", "description": "Command Napseer should launch in its managed tmux window, for example bash -l."},
                     "overwrite": {"type": "boolean"},
                 },
@@ -10405,10 +10435,13 @@ def raw_tools():
         },
         {
             "name": "nap_chat_secret_setup",
-            "description": "Complete pending gateway vault setup needed for chat secrets, or report the next required action.",
+            "description": "Complete pending gateway vault setup needed for chat secrets using the project vault/content passphrase, or report the next required action.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"project_id": {"type": "string"}},
+                "properties": {
+                    "project_id": {"type": "string"},
+                    "vault_passphrase": {"type": "string"},
+                },
                 "additionalProperties": False,
             },
         },
@@ -12249,6 +12282,7 @@ def cli_main(argv):
                 "project_id": cli_option(vault_args, "--project-id", default=None),
                 "secret_kind": cli_option(vault_args, "--secret-kind", "--kind", default=None),
                 "complete_all": cli_flag(vault_args, "--all", "--complete-all"),
+                "vault_passphrase": cli_option(vault_args, "--vault-passphrase", "--passphrase", default=None),
             }
             if action in {"list", "ls", "status"}:
                 print(json.dumps(gateway_vault_status(payload), indent=2))
@@ -12286,6 +12320,7 @@ def cli_main(argv):
             secret_args = args
         payload = {
             "project_id": cli_option(secret_args, "--project-id", default=None),
+            "vault_passphrase": cli_option(secret_args, "--vault-passphrase", "--passphrase", default=None),
         }
         if action in {"status", "show", "ls", "list"}:
             print(json.dumps(chat_secret_status(payload), indent=2))
@@ -12296,7 +12331,7 @@ def cli_main(argv):
         if action in {"rotate", "rotate-secret"}:
             print(json.dumps(chat_secret_rotate(payload), indent=2))
             return
-        print("Usage: napseer_mcp_server.py chat secret [status|setup|rotate] [--project-id ID]")
+        print("Usage: napseer_mcp_server.py chat secret [status|setup|rotate] [--project-id ID] [--vault-passphrase TEXT]")
         return
     if command == "feedback":
         subcommand = argv[2] if len(argv) > 2 else "list"

@@ -49,7 +49,7 @@ def run():
     writes = []
 
     mod.AUTH = {"agent_id": "gateway-agent-1", "account_id": ACCOUNT_ID}
-    mod.GATEWAY_PROJECT_BUNDLE_PASSPHRASE = PASSPHRASE
+    mod.PROJECT_VAULT_PASSPHRASE = PASSPHRASE
     mod.VAULT_KEY = bytes(range(32))
     mod.VAULT_SECRETS = {}
     mod.persist_vault_secrets = lambda: writes.append(dict(mod.VAULT_SECRETS))
