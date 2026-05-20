@@ -467,6 +467,7 @@ PUBLIC_TOOLS = {
     "nap_update_self",
     "nap_apropos",
     "nap_contract",
+    "nap_classify_query",
     "nap_lock_acquire",
     "nap_lock_renew",
     "nap_lock_release",
@@ -475,6 +476,7 @@ PUBLIC_TOOLS = {
     "nap_grep_local",
     "nap_index_status",
     "nap_index_clear",
+    "nap_discover",
     "nap_grep",
     "nap_context",
     "nap_find_related",
@@ -5371,6 +5373,12 @@ def node_status(node):
     return str(value).strip() if value not in (None, "") else None
 
 
+def node_date(node):
+    metadata = node_metadata(node)
+    value = metadata.get("date") or metadata.get("updated_at") or metadata.get("created_at")
+    return str(value).strip() if value not in (None, "") else None
+
+
 def node_archived(node):
     return bool(node.get("archived_at")) or node_status(node) == "archived"
 
@@ -5411,6 +5419,50 @@ def preview_text(value, limit):
     return text[: max(0, limit - 3)].rstrip() + "..."
 
 
+def normalize_datetime_filter(value, *, end_of_day=False):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        suffix = "23:59:59Z" if end_of_day else "00:00:00Z"
+        return f"{text}T{suffix}"
+    if text.endswith("Z"):
+        return text
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?", text):
+        if len(text) == 16:
+            text = f"{text}:00"
+        return f"{text}Z"
+    return text
+
+
+def normalize_discovery_ranges(args):
+    normalized = dict(args or {})
+    if normalized.get("after") and not normalized.get("updated_after"):
+        normalized["updated_after"] = normalized["after"]
+    if normalized.get("since") and not normalized.get("updated_after"):
+        normalized["updated_after"] = normalized["since"]
+    if normalized.get("before") and not normalized.get("updated_before"):
+        normalized["updated_before"] = normalized["before"]
+    if normalized.get("until") and not normalized.get("updated_before"):
+        normalized["updated_before"] = normalized["until"]
+    if normalized.get("updated_after"):
+        normalized["updated_after"] = normalize_datetime_filter(normalized["updated_after"], end_of_day=False)
+    if normalized.get("updated_before"):
+        normalized["updated_before"] = normalize_datetime_filter(normalized["updated_before"], end_of_day=True)
+    return normalized
+
+
+def node_in_updated_range(node, args):
+    updated_at = str(node.get("updated_at") or "")
+    after = args.get("updated_after")
+    before = args.get("updated_before")
+    if after and updated_at <= str(after):
+        return False
+    if before and updated_at >= str(before):
+        return False
+    return True
+
+
 def metadata_summary(node):
     metadata = node_metadata(node)
     if not metadata and isinstance(node.get("metadata_summary"), dict):
@@ -5441,6 +5493,8 @@ def summarize_node(node, view="summary", preview_chars=240):
             "full_path": node.get("full_path"),
             "type": node.get("type"),
             "status": status,
+            "date": node_date(node),
+            "created_at": node.get("created_at"),
             "updated_at": node.get("updated_at"),
         }
         if node_archived(node):
@@ -5456,6 +5510,8 @@ def summarize_node(node, view="summary", preview_chars=240):
         "folder_path": node.get("folder_path"),
         "tags": node.get("tags") or [],
         "status": status,
+        "date": node_date(node),
+        "created_at": node.get("created_at"),
         "metadata_summary": metadata_summary(node),
         "updated_at": node.get("updated_at"),
         "links_count": len(node.get("links") or []) if isinstance(node.get("links"), list) else 0,
@@ -6034,6 +6090,7 @@ def local_index_diagnostics(project_id, conn=None):
 
 
 def search_local_index(args):
+    args = normalize_discovery_ranges(args)
     project_id = resolve_project_id(args)
     query_analysis, variants = fts_query_variants(args.get("q"))
     limit = max(1, min(int(args.get("limit", 25)), 100))
@@ -6055,11 +6112,22 @@ def search_local_index(args):
                                bm25(local_index_fts) AS rank
                         FROM local_index_fts
                         JOIN local_index_nodes n ON n.node_id = local_index_fts.node_id
-                        WHERE local_index_fts MATCH ? AND n.project_id = ?
+                        WHERE local_index_fts MATCH ?
+                          AND n.project_id = ?
+                          AND (? IS NULL OR n.updated_at > ?)
+                          AND (? IS NULL OR n.updated_at < ?)
                         ORDER BY rank ASC, n.updated_at DESC
                         LIMIT ?
                         """,
-                        (variant["query"], project_id, limit),
+                        (
+                            variant["query"],
+                            project_id,
+                            args.get("updated_after"),
+                            args.get("updated_after"),
+                            args.get("updated_before"),
+                            args.get("updated_before"),
+                            limit,
+                        ),
                     ).fetchall()
                 except sqlite3.Error as exc:
                     attempts.append({"strategy": variant["strategy"], "matched": 0, "error": str(exc)})
@@ -7661,11 +7729,12 @@ def get_backlinks_by_path(args):
 
 
 def list_project_nodes(args):
+    args = normalize_discovery_ranges(args)
     project_id = resolve_project_id(args)
     view, view_warnings = normalize_discovery_view(args, default="paths")
     filters = status_filter_from_args(args)
     limit = normalize_int(args.get("limit"), DISCOVERY_DEFAULT_LIMIT, 1, discovery_max_limit(view))
-    allowed = {"tag", "folder_path", "q", "limit", "cursor", "updated_before", "updated_after", "type", "include_archived", "archived_only"}
+    allowed = {"tag", "folder_path", "q", "limit", "cursor", "updated_before", "updated_after", "type", "include_archived", "archived_only", "active_only", "status", "exclude_status"}
     base_query = {key: value for key, value in args.items() if key in allowed and value not in (None, "")}
     base_query["limit"] = limit
     base_query["view"] = "summary" if view == "titles" else view
@@ -8972,6 +9041,7 @@ def server_search_queries(query_analysis):
 
 
 def search_memory(args):
+    args = normalize_discovery_ranges(args)
     project_id = resolve_project_id(args)
     q = str(args.get("q") or "").strip()
     if not q:
@@ -8995,7 +9065,12 @@ def search_memory(args):
 
     if mode in {"hybrid", "local"} and INDEX_PATH.exists():
         try:
-            local_result = search_local_index({"q": q, "limit": limit})
+            local_result = search_local_index({
+                "q": q,
+                "limit": limit,
+                "updated_after": args.get("updated_after"),
+                "updated_before": args.get("updated_before"),
+            })
             diagnostics["local_index"] = local_result.get("index", diagnostics["local_index"])
             diagnostics["local_strategies"] = local_result.get("search_strategies", [])
             local = local_result.get("items", [])
@@ -9036,7 +9111,8 @@ def search_memory(args):
                 sources.append("server")
             remaining = max(1, limit - len(unique_nodes(collected)))
 
-    items = apply_status_filters(unique_nodes(collected), filters)[:limit]
+    items = [node for node in unique_nodes(collected) if node_in_updated_range(node, args)]
+    items = apply_status_filters(items, filters)[:limit]
     if not items and query_analysis["is_long_query"]:
         diagnostics["hint"] = "Long natural-language query produced no matches; retry with quoted exact phrases or 2-5 distinctive nouns if the target memory exists."
     response = discovery_envelope(
@@ -9056,6 +9132,7 @@ def search_memory(args):
 
 
 def recent_memory(args):
+    args = normalize_discovery_ranges(args)
     limit = max(1, min(int(args.get("limit", 25)), 100))
     view, _warnings = normalize_discovery_view(args, default="paths")
     query = {**args, "limit": limit, "view": view}
@@ -9063,6 +9140,67 @@ def recent_memory(args):
         if args.get(key):
             query[key] = args[key]
     return list_project_nodes(query)
+
+
+def discover_memory(args):
+    args = normalize_discovery_ranges(args)
+    q = str(args.get("q") or args.get("keywords") or "").strip()
+    if q:
+        result = search_memory({**args, "q": q, "view": args.get("view") or "summary"})
+        result["tool_intent"] = "search"
+    else:
+        result = list_project_nodes({**args, "view": args.get("view") or "summary"})
+        result["tool_intent"] = "list"
+    result["range"] = {
+        "updated_after": args.get("updated_after"),
+        "updated_before": args.get("updated_before"),
+    }
+    result["awareness"] = {
+        "default_sort": "search_relevance_then_updated_desc" if q else "updated_desc",
+        "date_fields_in_rows": ["date", "created_at", "updated_at"],
+        "next_step": "Use nap_context or nap_cat on important paths when the preview is not enough.",
+    }
+    return result
+
+
+def classify_memory_query(args):
+    args = normalize_discovery_ranges(args or {})
+    raw = str(args.get("q") or args.get("query") or "").strip()
+    analysis = analyze_search_query(raw) if raw else {"raw": "", "is_long_query": False, "phrases": [], "terms": [], "simplified_query": ""}
+    exact_paths = [token for token in raw.split() if token.startswith("/") and len(token) > 1]
+    recent_intent = any(term in raw.lower().split() for term in ["recent", "latest", "new", "newest", "updated"])
+    if exact_paths:
+        primary_tool = "nap_context"
+        reason = "query contains explicit node path(s)"
+    elif recent_intent and not raw.strip('"'):
+        primary_tool = "nap_recent"
+        reason = "query asks for recent or latest memory"
+    elif analysis.get("terms") or analysis.get("phrases"):
+        primary_tool = "nap_discover"
+        reason = "query has searchable keywords and may need filters or ranges"
+    else:
+        primary_tool = "nap_ls"
+        reason = "no distinctive search terms were detected"
+    return {
+        "ok": True,
+        "classification": {
+            "primary_tool": primary_tool,
+            "reason": reason,
+            "exact_paths": exact_paths,
+            "recent_intent": recent_intent,
+            "range": {
+                "updated_after": args.get("updated_after"),
+                "updated_before": args.get("updated_before"),
+            },
+        },
+        "query_analysis": analysis,
+        "suggested_calls": [
+            {"tool": "nap_context", "when": "You already know one or more canonical paths and need surrounding links/backlinks."},
+            {"tool": "nap_discover", "when": "You need search plus folder/tag/type/status/date filters in one call."},
+            {"tool": "nap_recent", "when": "You need latest project changes by time window."},
+            {"tool": "nap_cat", "when": "You selected a path and need the full body."},
+        ],
+    }
 
 
 def get_memory_context(args):
@@ -10537,6 +10675,22 @@ def raw_tools():
             },
         },
         {
+            "name": "nap_classify_query",
+            "description": "Classify a memory-retrieval request into the best Napseer MCP tool, extracted search terms, exact paths, recent intent, and normalized date range.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "q": {"type": "string"},
+                    "query": {"type": "string"},
+                    "updated_after": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD lower bound on updated_at."},
+                    "updated_before": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD upper bound on updated_at."},
+                    "since": {"type": "string", "description": "Alias for updated_after."},
+                    "until": {"type": "string", "description": "Alias for updated_before."},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "nap_lock_acquire",
             "description": "Acquire a renewable project write lease. All project mutations require lock headers.",
             "inputSchema": {
@@ -10591,12 +10745,16 @@ def raw_tools():
         },
         {
             "name": "nap_grep_local",
-            "description": "Search the local SQLite FTS index. Encrypted nodes are indexed by safe path, name, tags, aliases, and links only.",
+            "description": "Search the local SQLite FTS index with optional updated_at range filters. Encrypted nodes are indexed by safe path, name, tags, aliases, and links only.",
             "inputSchema": {
                 "type": "object",
                 "required": ["q"],
                 "properties": {
                     "q": {"type": "string", "description": "Search text. Natural language is accepted; distinctive nouns, paths, tags, or quoted phrases produce better matches than full instructions."},
+                    "updated_after": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD lower bound on updated_at."},
+                    "updated_before": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD upper bound on updated_at."},
+                    "since": {"type": "string", "description": "Alias for updated_after."},
+                    "until": {"type": "string", "description": "Alias for updated_before."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                 },
                 "additionalProperties": False,
@@ -10614,7 +10772,7 @@ def raw_tools():
         },
         {
             "name": "nap_grep",
-            "description": "Preferred search tool. Hybrid search over server-indexed fields and the local SQLite FTS safe metadata index.",
+            "description": "Preferred search tool. Hybrid search over server-indexed fields and the local SQLite FTS safe metadata index, with optional updated_at ranges.",
             "inputSchema": {
                 "type": "object",
                 "required": ["q"],
@@ -10623,11 +10781,44 @@ def raw_tools():
                     "mode": {"type": "string", "enum": ["hybrid", "server", "local"], "default": "hybrid"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                     "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "paths"},
+                    "updated_after": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD lower bound on updated_at."},
+                    "updated_before": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD upper bound on updated_at."},
+                    "since": {"type": "string", "description": "Alias for updated_after."},
+                    "until": {"type": "string", "description": "Alias for updated_before."},
                     "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
                     "active_only": {"type": "boolean", "default": False},
                     "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
                     "exclude_status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
                     "verbose": {"type": "boolean", "default": False},
+                    "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "nap_discover",
+            "description": "Intent-shaped project memory discovery. Combine keywords, folder/tag/type/status filters, updated_at ranges, recent sorting, and compact date-aware rows before using nap_context or nap_cat.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "q": {"type": "string", "description": "Keywords or natural-language query. Omit to list recent nodes by filters."},
+                    "keywords": {"type": "string", "description": "Alias for q."},
+                    "folder_path": {"type": "string"},
+                    "tag": {"type": "string"},
+                    "type": {"type": "string"},
+                    "updated_after": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD lower bound on updated_at."},
+                    "updated_before": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD upper bound on updated_at."},
+                    "since": {"type": "string", "description": "Alias for updated_after."},
+                    "until": {"type": "string", "description": "Alias for updated_before."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "summary"},
+                    "mode": {"type": "string", "enum": ["hybrid", "server", "local"], "default": "hybrid"},
+                    "include_archived": {"type": "boolean", "default": False},
+                    "archived_only": {"type": "boolean", "default": False},
+                    "active_only": {"type": "boolean", "default": False},
+                    "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "exclude_status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "verbose": {"type": "boolean", "default": True},
                     "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
                 },
                 "additionalProperties": False,
@@ -10643,6 +10834,10 @@ def raw_tools():
                     "tag": {"type": "string"},
                     "q": {"type": "string"},
                     "cursor": {"type": "string"},
+                    "updated_after": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD lower bound on updated_at."},
+                    "updated_before": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD upper bound on updated_at."},
+                    "since": {"type": "string", "description": "Alias for updated_after."},
+                    "until": {"type": "string", "description": "Alias for updated_before."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 10000},
                     "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "paths"},
                     "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
@@ -10767,8 +10962,10 @@ def raw_tools():
                     "folder_path": {"type": "string"},
                     "tag": {"type": "string"},
                     "cursor": {"type": "string"},
-                    "updated_before": {"type": "string"},
-                    "updated_after": {"type": "string"},
+                    "updated_before": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD upper bound on updated_at."},
+                    "updated_after": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD lower bound on updated_at."},
+                    "since": {"type": "string", "description": "Alias for updated_after."},
+                    "until": {"type": "string", "description": "Alias for updated_before."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                     "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "paths"},
                     "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set. nap_recent and nap_find default to path/date output."},
@@ -11338,6 +11535,8 @@ TOOL_CATEGORIES = {
         "nap_apropos",
         "nap_man",
         "nap_contract",
+        "nap_classify_query",
+        "nap_discover",
         "nap_grep",
         "nap_find",
         "nap_plan_list_active",
@@ -11444,6 +11643,8 @@ READ_ONLY_TOOLS = {
     "nap_apropos",
     "nap_man",
     "nap_contract",
+    "nap_classify_query",
+    "nap_discover",
     "nap_grep_local",
     "nap_index_status",
     "nap_grep",
@@ -11786,6 +11987,8 @@ def call_tool_impl(name, args):
         return man_tool(args)
     if name == "nap_contract":
         return contract_profile(args)
+    if name == "nap_classify_query":
+        return classify_memory_query(args)
     if name == "nap_lock_acquire":
         return acquire_project_lock(args)
     if name == "nap_lock_renew":
@@ -11802,6 +12005,8 @@ def call_tool_impl(name, args):
         return index_status(args)
     if name == "nap_index_clear":
         return clear_local_index(args)
+    if name == "nap_discover":
+        return discover_memory(args)
     if name == "nap_grep":
         return search_memory(args)
     if name == "nap_find":

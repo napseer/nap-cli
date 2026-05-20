@@ -110,6 +110,34 @@ def test_recent_memory_defaults_to_paths(mod):
     assert "metadata_summary" not in result["items"][0]
 
 
+def test_recent_memory_accepts_date_aliases_and_returns_dates(mod):
+    recent = node(
+        "/notes/recent-title",
+        "active",
+        metadata={"date": "2026-05-06"},
+        tags=["recent"],
+        node_type="note",
+    )
+    recent["created_at"] = "2026-05-05T10:00:00Z"
+
+    def fake_request(method, path, payload=None, **kwargs):
+        assert method == "GET"
+        assert "updated_after=2026-05-05T00%3A00%3A00Z" in path
+        assert "updated_before=2026-05-06T23%3A59%3A59Z" in path
+        return {"items": [recent], "next_cursor": None}
+
+    mod.request_json = fake_request
+    result = mod.recent_memory({"since": "2026-05-05", "until": "2026-05-06"})
+    assert result["items"] == [{
+        "full_path": "/notes/recent-title",
+        "type": "note",
+        "status": "active",
+        "date": "2026-05-06",
+        "created_at": "2026-05-05T10:00:00Z",
+        "updated_at": "2026-05-06T12:00:00Z",
+    }]
+
+
 def test_find_defaults_to_paths_and_requests_compact_rest_view(mod):
     found = node(
         "/plans/found",
@@ -135,6 +163,29 @@ def test_find_defaults_to_paths_and_requests_compact_rest_view(mod):
         "updated_at": "2026-05-06T12:00:00Z",
     }]
     assert "content_text" not in result["items"][0]
+
+
+def test_discover_uses_search_when_keywords_present(mod):
+    calls = []
+
+    def fake_search(args):
+        calls.append(args)
+        return {"ok": True, "items": [], "view": args.get("view")}
+
+    mod.search_memory = fake_search
+    result = mod.discover_memory({"keywords": "gateway relay", "since": "2026-05-01"})
+    assert result["tool_intent"] == "search"
+    assert result["range"]["updated_after"] == "2026-05-01T00:00:00Z"
+    assert calls and calls[-1]["q"] == "gateway relay"
+    assert calls[-1]["view"] == "summary"
+    assert "date" in result["awareness"]["date_fields_in_rows"]
+
+
+def test_classify_query_points_exact_paths_to_context(mod):
+    result = mod.classify_memory_query({"q": "explain /documentation/security/overview since May", "since": "2026-05-01"})
+    assert result["classification"]["primary_tool"] == "nap_context"
+    assert result["classification"]["exact_paths"] == ["/documentation/security/overview"]
+    assert result["classification"]["range"]["updated_after"] == "2026-05-01T00:00:00Z"
 
 
 def test_title_view_requests_summary_rest_view_without_content(mod):
