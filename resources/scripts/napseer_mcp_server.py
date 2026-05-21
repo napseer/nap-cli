@@ -6593,29 +6593,58 @@ def oauth_loopback_authorize(args):
     return token
 
 
+LOCAL_PROJECT_OAUTH_SCOPE = (
+    "openid profile email "
+    "napseer.projects.read "
+    "napseer.nodes.read napseer.nodes.write "
+    "napseer.locks.write "
+    "napseer.schedules.read napseer.schedules.write "
+    "napseer.agents.read napseer.agents.write "
+    "napseer.service_registrations.read napseer.service_registrations.write "
+    "napseer.encryption.read napseer.vault.read "
+    "napseer.chat.read napseer.chat.write "
+    "napseer.gateway.read napseer.gateway.connect"
+)
+
+
 def operator_loopback_login(args=None):
     args = args or {}
     result = oauth_loopback_authorize({
         **args,
         "flow": "local_operator_access",
-        "scope": "openid profile email napseer.feedback.read",
+        "scope": args.get("scope") or LOCAL_PROJECT_OAUTH_SCOPE,
     })
+    project_id = result.get("project_id")
+    if not project_id:
+        raise RuntimeError("OAuth authorization did not return a selected project_id")
     operator_auth = {
         "base_url": result["api_base_url"],
         "token": result["access_token"],
         "token_expires_at": iso_timestamp_after_seconds(int(result.get("expires_in") or 0)),
-        "account_mode": "operator",
+        "project_id": project_id,
+        "account_mode": "operator_project",
         "oauth_client_id": "nap-cli",
         "oauth_scope": result.get("scope"),
     }
     save_auth_file_credentials(operator_auth)
+    try:
+        project = request_json("GET", f"/v1/projects/{project_id}")
+        save_auth_file_credentials({
+            "project_slug": project.get("slug"),
+            "project_name": project.get("name"),
+            "project_encryption_state": project.get("encryption_state"),
+        })
+    except Exception:
+        project = None
     return {
         "status": "authenticated",
         "auth_path": str(AUTH_PATH),
         "base_url": result["api_base_url"],
+        "project_id": project_id,
+        "project": project,
         "scope": result.get("scope"),
         "token_expires_at": operator_auth["token_expires_at"],
-        "message": "OAuth2 PKCE loopback token stored in the repo-local Napseer auth state.",
+        "message": "OAuth2 PKCE loopback token and selected project stored in this folder's Napseer auth state.",
     }
 
 
@@ -12275,6 +12304,15 @@ def cli_main(argv):
         return
     if command == "project":
         subcommand = argv[2] if len(argv) > 2 else "help"
+        if subcommand in {"init", "attach", "bootstrap-existing"}:
+            print(json.dumps(operator_loopback_login({
+                "frontend_url": cli_option(argv[3:], "--frontend-url", default=None),
+                "api_base_url": cli_option(argv[3:], "--api-base-url", "--base-url", default=None),
+                "open_browser": not cli_flag(argv[3:], "--no-browser"),
+                "timeout_seconds": int(cli_option(argv[3:], "--timeout", "--timeout-seconds", default="300")),
+                "port": cli_option(argv[3:], "--port", default=0),
+            }), indent=2))
+            return
         if subcommand == "create":
             print(json.dumps(cli_project_create(argv[3:]), indent=2))
             return
@@ -12302,7 +12340,7 @@ def cli_main(argv):
                 "passphrase": cli_option(argv[4:], "--passphrase", default=None),
             }), indent=2))
             return
-        print("Usage: napseer_mcp_server.py project [create [slug] [--name NAME] [--description TEXT] [--encryption plaintext]|claim [--no-browser] [--timeout SECONDS] [--return-url URL]|status|encryption [status|set plaintext|plaintext]]")
+        print("Usage: napseer_mcp_server.py project [init|attach [--no-browser] [--timeout SECONDS]|create [slug] [--name NAME] [--description TEXT] [--encryption plaintext]|claim [--no-browser] [--timeout SECONDS] [--return-url URL]|status|encryption [status|set plaintext|plaintext]]")
         return
     if command == "lineage":
         subcommand = argv[2] if len(argv) > 2 else "status"
