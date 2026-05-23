@@ -5,6 +5,8 @@ import importlib.util
 import pathlib
 import sys
 
+import pytest
+
 
 def load_module():
     script_path = pathlib.Path(__file__).resolve().parents[1] / "resources" / "scripts" / "napseer_mcp_server.py"
@@ -17,6 +19,11 @@ def load_module():
     module.DEFAULT_PROJECT_ID = "project-1"
     module.project_memory_encryption_active = lambda project_id: False
     return module
+
+
+@pytest.fixture
+def mod():
+    return load_module()
 
 
 def node(path, status="planned", metadata=None, tags=None, content="body text", archived_at=None, node_type="plan", links=None):
@@ -78,6 +85,143 @@ def test_node_discovery_allows_large_requested_limit(mod):
     assert result["budget"]["max_limit"] > 200
     assert "content_text" not in result["items"][0]
     assert len(calls) == 1
+
+
+def test_node_by_path_returns_canonical_identity_uri(mod):
+    mod.AUTH["project_slug"] = "napseer"
+    found = node("/documentation/product/prd", "active", node_type="product_spec")
+    found["id"] = "node-123"
+
+    def fake_request(method, path, payload=None, **kwargs):
+        assert method == "GET"
+        assert "/nodes/by-path?" in path
+        assert "path=%2Fdocumentation%2Fproduct%2Fprd" in path
+        assert "view=render" in path
+        return found
+
+    mod.request_json = fake_request
+    result = mod.node_by_path({"path": "documentation/product/prd"})
+    assert result["ok"] is True
+    assert result["status"] == "resolved"
+    assert result["identity"] == {
+        "node_id": "node-123",
+        "canonical_uri": "nap://napseer/project-1/node-123",
+        "project_id": "project-1",
+        "project_name": "napseer",
+        "lookup_kind": "path",
+        "lookup_value": "/documentation/product/prd",
+        "legacy_full_path": "/documentation/product/prd",
+    }
+    assert result["route"]["full_path"] == "/documentation/product/prd"
+    assert "content_text" not in result["route"]
+    assert "preview" not in result["route"]
+    assert "read_fingerprint" not in result["route"]
+    assert "Path lookup is index/route resolution only" in result["warnings"][0]
+
+
+def test_node_by_id_returns_canonical_identity_uri(mod):
+    mod.AUTH["project_slug"] = "napseer"
+    found = node("/documentation/product/prd", "active", node_type="product_spec")
+    found["id"] = "node-123"
+
+    def fake_request(method, path, payload=None, **kwargs):
+        assert method == "GET"
+        assert path == "/v1/projects/project-1/nodes/node-123"
+        return found
+
+    mod.request_json = fake_request
+    result = mod.node_by_id({"node_id": "node-123"})
+    assert result["ok"] is True
+    assert result["identity"]["lookup_kind"] == "node_id"
+    assert result["identity"]["canonical_uri"] == "nap://napseer/project-1/node-123"
+    assert result["node"]["id"] == "node-123"
+
+
+def test_node_by_uri_resolves_canonical_uri(mod):
+    mod.AUTH["project_slug"] = "napseer"
+    found = node("/documentation/product/prd", "active", node_type="product_spec")
+    found["id"] = "node-123"
+
+    def fake_request(method, path, payload=None, **kwargs):
+        assert method == "GET"
+        assert path == "/v1/projects/project-1/nodes/node-123"
+        return found
+
+    mod.request_json = fake_request
+    result = mod.node_by_uri({"uri": "nap://napseer/project-1/node-123"})
+    assert result["ok"] is True
+    assert result["identity"]["lookup_kind"] == "uri"
+    assert result["identity"]["lookup_value"] == "nap://napseer/project-1/node-123"
+    assert result["identity"]["canonical_uri"] == "nap://napseer/project-1/node-123"
+
+
+def test_node_get_accepts_node_id_without_path(mod):
+    found = node("/documentation/product/prd", "active", node_type="product_spec")
+    found["id"] = "node-123"
+
+    def fake_request(method, path, payload=None, **kwargs):
+        assert method == "GET"
+        assert path == "/v1/projects/project-1/nodes/node-123"
+        return found
+
+    mod.request_json = fake_request
+    result = mod.node_get({"node_id": "node-123", "view": "render"})
+    assert result["id"] == "node-123"
+    assert result["full_path"] == "/documentation/product/prd"
+
+
+def test_node_get_edit_view_uses_id_route_not_by_path(mod):
+    edit_payload = {
+        "node": node("/documentation/product/prd", "active", node_type="product_spec"),
+        "revision": "2026-05-06T12:00:00Z",
+        "read_fingerprint": "fingerprint-1",
+        "content_lines": ["body text"],
+        "line_count": 1,
+        "ends_with_newline": False,
+    }
+    edit_payload["node"]["id"] = "node-123"
+
+    def fake_request(method, path, payload=None, **kwargs):
+        assert method == "GET"
+        assert path == "/v1/projects/project-1/nodes/node-123?view=edit"
+        return edit_payload
+
+    mod.request_json = fake_request
+    result = mod.node_get({"node_id": "node-123", "view": "edit"})
+    assert result["revision"] == "2026-05-06T12:00:00Z"
+    assert result["node"]["id"] == "node-123"
+
+
+def test_node_get_rejects_path_reads(mod):
+    try:
+        mod.node_get({"path": "/documentation/product/prd", "view": "render"})
+    except RuntimeError as exc:
+        assert "path is an index/route only" in str(exc)
+    else:
+        raise AssertionError("path reads should be rejected")
+
+
+def test_tools_include_node_by_path_descriptor(mod):
+    get_tool = next(item for item in mod.tools() if item["name"] == "nap_node_get")
+    assert get_tool["inputSchema"].get("required") is None
+    assert "node_id" in get_tool["inputSchema"]["properties"]
+    assert "uri" in get_tool["inputSchema"]["properties"]
+    assert "path" not in get_tool["inputSchema"]["properties"]
+
+    by_id = next(item for item in mod.tools() if item["name"] == "nap_node_by_id")
+    assert by_id["inputSchema"]["required"] == ["node_id"]
+    assert "nap:// URI" in by_id["description"]
+
+    by_uri = next(item for item in mod.tools() if item["name"] == "nap_node_by_uri")
+    assert by_uri["inputSchema"]["required"] == ["uri"]
+    assert "nap://" in by_uri["description"]
+
+    tool = next(item for item in mod.tools() if item["name"] == "nap_node_by_path")
+    assert tool["inputSchema"]["required"] == ["path"]
+    assert "preview_chars" not in tool["inputSchema"]["properties"]
+    assert "does not read full node content" in tool["description"]
+
+    assert all(item["name"] != "nap_cat" for item in mod.tools())
 
 
 def test_recent_memory_defaults_to_paths(mod):
@@ -628,6 +772,18 @@ def run():
     test_active_plan_listing(mod)
     mod = load_module()
     test_node_discovery_allows_large_requested_limit(mod)
+    mod = load_module()
+    test_node_by_path_returns_canonical_identity_uri(mod)
+    mod = load_module()
+    test_node_by_id_returns_canonical_identity_uri(mod)
+    mod = load_module()
+    test_node_by_uri_resolves_canonical_uri(mod)
+    mod = load_module()
+    test_node_get_accepts_node_id_without_path(mod)
+    mod = load_module()
+    test_node_get_rejects_path_reads(mod)
+    mod = load_module()
+    test_tools_include_node_by_path_descriptor(mod)
     mod = load_module()
     test_recent_memory_defaults_to_paths(mod)
     mod = load_module()

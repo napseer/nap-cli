@@ -492,9 +492,11 @@ PUBLIC_TOOLS = {
     "nap_tee",
     "nap_patch",
     "nap_node_get",
+    "nap_node_by_id",
+    "nap_node_by_uri",
+    "nap_node_by_path",
     "nap_node_patch",
     "nap_rm",
-    "nap_cat",
     "nap_ln",
     "nap_backlinks",
     "nap_ls",
@@ -3737,6 +3739,48 @@ def decrypt_nodes_for_return(nodes, project_id=None):
     return [decrypt_node_for_return(node, project_id=project_id) for node in (nodes or [])]
 
 
+def nap_project_route_name():
+    value = AUTH.get("project_slug") or AUTH.get("project_name") or pathlib.Path.cwd().name or "project"
+    slug = re.sub(r"[^a-zA-Z0-9._~-]+", "-", str(value).strip()).strip("-")
+    return slug or "project"
+
+
+def nap_node_uri(project_id, node_id):
+    project_name = urllib.parse.quote(nap_project_route_name(), safe="._~-")
+    project = urllib.parse.quote(str(project_id or current_project_id() or ""), safe="")
+    node = urllib.parse.quote(str(node_id or ""), safe="")
+    if not project or not node:
+        return ""
+    return f"nap://{project_name}/{project}/{node}"
+
+
+def node_identity_payload(node, project_id=None, lookup_kind=None, lookup_value=None):
+    resolved_project_id = project_id or node.get("project_id") or current_project_id()
+    return {
+        "node_id": node.get("id"),
+        "canonical_uri": nap_node_uri(resolved_project_id, node.get("id")),
+        "project_id": resolved_project_id,
+        "project_name": nap_project_route_name(),
+        "lookup_kind": lookup_kind,
+        "lookup_value": lookup_value,
+        "legacy_full_path": node.get("full_path"),
+    }
+
+
+def parse_nap_node_uri(value):
+    parsed = urllib.parse.urlparse(str(value or "").strip())
+    if parsed.scheme != "nap":
+        raise RuntimeError("uri must use nap://project-name/project-id/node-id")
+    segments = [urllib.parse.unquote(part) for part in parsed.path.split("/") if part]
+    if len(segments) != 2:
+        raise RuntimeError("uri must use nap://project-name/project-id/node-id")
+    return {
+        "project_name": urllib.parse.unquote(parsed.netloc),
+        "project_id": segments[0],
+        "node_id": segments[1],
+    }
+
+
 def decrypt_relay_frame(key, frame_text, context_hash, relay_lane, expected_direction, expected_seq):
     envelope = json.loads(frame_text)
     if (
@@ -5541,6 +5585,23 @@ def node_write_reference(node):
     title = node.get("title") or metadata.get("title")
     if title:
         item["title"] = title
+    return {key: value for key, value in item.items() if value not in (None, "")}
+
+
+def node_route_reference(node):
+    item = {
+        "id": node.get("id"),
+        "project_id": node.get("project_id"),
+        "full_path": node.get("full_path"),
+        "type": node.get("type"),
+        "name": node.get("name"),
+        "folder_path": node.get("folder_path"),
+        "status": node_status(node),
+        "date": node_date(node),
+        "created_at": node.get("created_at"),
+        "updated_at": node.get("updated_at"),
+        "archived": node_archived(node),
+    }
     return {key: value for key, value in item.items() if value not in (None, "")}
 
 
@@ -7504,11 +7565,79 @@ def get_node_by_path(args, allow_agent=False):
     return decrypt_node_for_return(node, project_id=project_id)
 
 
+def get_node_by_id(args):
+    project_id = str(args.get("project_id") or resolve_project_id(args)).strip()
+    node_id = str(args.get("node_id") or args.get("id") or "").strip()
+    if not node_id:
+        raise RuntimeError("node_id is required")
+    view = args.get("view", "render")
+    if view not in {"render", "edit", "json"}:
+        raise RuntimeError("view must be render, edit, or json")
+    params = "" if view == "render" else f"?{rest_query_string({'view': view})}"
+    node = request_json("GET", f"/v1/projects/{project_id}/nodes/{urllib.parse.quote(node_id, safe='')}{params}")
+    if view == "render":
+        return decrypt_node_for_return(node, project_id=project_id)
+    if isinstance(node, dict) and isinstance(node.get("node"), dict):
+        node["node"] = decrypt_node_for_return(node["node"], project_id=project_id)
+    return node
+
+
 def node_get(args):
     view = args.get("view", "edit")
     if view not in {"render", "edit", "json"}:
         raise RuntimeError("view must be render, edit, or json")
-    return get_node_by_path({"path": args["path"], "view": view})
+    if args.get("uri"):
+        return node_by_uri({"uri": args["uri"], "view": view})["node"]
+    if args.get("node_id") or args.get("id"):
+        return get_node_by_id({"node_id": args.get("node_id") or args.get("id"), "view": view})
+    if args.get("path"):
+        raise RuntimeError("path is an index/route only; resolve it with nap_node_by_path, then read with node_id or uri")
+    raise RuntimeError("one of node_id or uri is required")
+
+
+def node_by_id(args):
+    view = args.get("view", "render")
+    if view not in {"render", "edit", "json"}:
+        raise RuntimeError("view must be render, edit, or json")
+    node_id = str(args.get("node_id") or args.get("id") or "").strip()
+    node = get_node_by_id({"node_id": node_id, "view": view})
+    return {
+        "ok": True,
+        "status": "resolved",
+        "identity": node_identity_payload(node, project_id=node.get("project_id"), lookup_kind="node_id", lookup_value=node_id),
+        "node": node,
+    }
+
+
+def node_by_uri(args):
+    view = args.get("view", "render")
+    if view not in {"render", "edit", "json"}:
+        raise RuntimeError("view must be render, edit, or json")
+    parsed = parse_nap_node_uri(args["uri"])
+    configured_project_id = current_project_id()
+    if configured_project_id and parsed["project_id"] != configured_project_id:
+        raise RuntimeError("nap:// URI project_id does not match the configured local project")
+    node = get_node_by_id({"project_id": parsed["project_id"], "node_id": parsed["node_id"], "view": view})
+    return {
+        "ok": True,
+        "status": "resolved",
+        "identity": node_identity_payload(node, project_id=parsed["project_id"], lookup_kind="uri", lookup_value=args["uri"]),
+        "node": node,
+    }
+
+
+def node_by_path(args):
+    path = normalize_node_path(args["path"])
+    node = get_node_by_path({"path": path, "view": "render"})
+    return {
+        "ok": True,
+        "status": "resolved",
+        "identity": node_identity_payload(node, project_id=node.get("project_id"), lookup_kind="path", lookup_value=path),
+        "route": node_route_reference(node),
+        "warnings": [
+            "Path lookup is index/route resolution only. Read node content with identity.canonical_uri or identity.node_id."
+        ],
+    }
 
 
 def guarded_node_patch(args):
@@ -7822,7 +7951,7 @@ def list_project_nodes(args):
 def list_active_plans(args):
     view, _warnings = normalize_discovery_view(args)
     if view == "full":
-        raise RuntimeError("nap_plan_list_active supports paths, summary, or metadata views; use nap_cat for full plan bodies")
+        raise RuntimeError("nap_plan_list_active supports paths, summary, or metadata views; resolve a path with nap_node_by_path and read by node_id or uri for full plan bodies")
     query = {
         **args,
         "folder_path": args.get("folder_path") or "/plans",
@@ -8169,7 +8298,7 @@ def list_kanban_cards(args):
     project_id = resolve_project_id(args)
     view, view_warnings = normalize_discovery_view(args)
     if view == "full":
-        raise RuntimeError("nap_kanban_list supports paths, summary, or metadata views; use nap_cat for full card bodies")
+        raise RuntimeError("nap_kanban_list supports paths, summary, or metadata views; resolve a path with nap_node_by_path and read by node_id or uri for full card bodies")
     limit = normalize_int(args.get("limit"), DISCOVERY_DEFAULT_LIMIT, 1, DISCOVERY_COMPACT_MAX_LIMIT)
     preview_chars = normalize_int(args.get("preview_chars"), 240, 80, 1000)
     active_only = as_bool(args.get("active_only"), True)
@@ -9187,7 +9316,7 @@ def discover_memory(args):
     result["awareness"] = {
         "default_sort": "search_relevance_then_updated_desc" if q else "updated_desc",
         "date_fields_in_rows": ["date", "created_at", "updated_at"],
-        "next_step": "Use nap_context or nap_cat on important paths when the preview is not enough.",
+        "next_step": "Use nap_node_by_path on important paths, then read by identity with nap_node_get when the preview is not enough.",
     }
     return result
 
@@ -9227,7 +9356,8 @@ def classify_memory_query(args):
             {"tool": "nap_context", "when": "You already know one or more canonical paths and need surrounding links/backlinks."},
             {"tool": "nap_discover", "when": "You need search plus folder/tag/type/status/date filters in one call."},
             {"tool": "nap_recent", "when": "You need latest project changes by time window."},
-            {"tool": "nap_cat", "when": "You selected a path and need the full body."},
+            {"tool": "nap_node_by_path", "when": "You selected a path and need to resolve it to node_id / nap:// URI before reading."},
+            {"tool": "nap_node_get", "when": "You have node_id or nap:// URI and need the full body."},
         ],
     }
 
@@ -10826,7 +10956,7 @@ def raw_tools():
         },
         {
             "name": "nap_discover",
-            "description": "Intent-shaped project memory discovery. Combine keywords, folder/tag/type/status filters, updated_at ranges, recent sorting, and compact date-aware rows before using nap_context or nap_cat.",
+            "description": "Intent-shaped project memory discovery. Combine keywords, folder/tag/type/status filters, updated_at ranges, recent sorting, and compact date-aware rows before resolving paths with nap_node_by_path or reading identity with nap_node_get.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -10855,7 +10985,7 @@ def raw_tools():
         },
         {
             "name": "nap_find",
-            "description": "Structured active memory search by folder, tag, path, or query. Returns path/date rows by default; use view='full' or nap_cat for body text.",
+            "description": "Structured active memory search by folder, tag, path, or query. Returns path/date rows by default; use view='full' for body text or resolve selected paths with nap_node_by_path before identity reads.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -11163,13 +11293,51 @@ def raw_tools():
         },
         {
             "name": "nap_node_get",
-            "description": "Read one node by path with optional edit/json view. Use view='edit' before nap_node_patch to get revision and read_fingerprint.",
+            "description": "Read one node by canonical node_id or nap:// URI. Paths are indexes/routes only; resolve a path with nap_node_by_path, then read by node_id or uri. Use view='edit' before nap_node_patch to get revision and read_fingerprint.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "node_id": {"type": "string", "description": "Canonical node UUID."},
+                    "uri": {"type": "string", "description": "Canonical nap://project-name/project-id/node-id URI."},
+                    "view": {"type": "string", "enum": ["render", "edit", "json"], "default": "edit"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "nap_node_by_id",
+            "description": "Read one node by canonical node id and return identity metadata including its nap:// URI.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["node_id"],
+                "properties": {
+                    "node_id": {"type": "string", "description": "Canonical node UUID."},
+                    "view": {"type": "string", "enum": ["render", "edit", "json"], "default": "render"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "nap_node_by_uri",
+            "description": "Read one node by canonical nap://project-name/project-id/node-id URI.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["uri"],
+                "properties": {
+                    "uri": {"type": "string", "description": "Canonical nap://project-name/project-id/node-id URI."},
+                    "view": {"type": "string", "enum": ["render", "edit", "json"], "default": "render"},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "nap_node_by_path",
+            "description": "Resolve a path index/route to canonical node identity. This does not read full node content; use returned node_id or nap:// URI with nap_node_get, nap_node_by_id, or nap_node_by_uri.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path"],
                 "properties": {
-                    "path": {"type": "string"},
-                    "view": {"type": "string", "enum": ["render", "edit", "json"], "default": "edit"},
+                    "path": {"type": "string", "description": "Index/route path such as /documentation/product/prd."},
                 },
                 "additionalProperties": False,
             },
@@ -11288,16 +11456,6 @@ def raw_tools():
                     "metadata": {"type": "object"},
                     "upsert": {"type": "boolean", "default": False},
                 },
-                "additionalProperties": False,
-            },
-        },
-        {
-            "name": "nap_cat",
-            "description": "Read one node by canonical full_path. Use this before linking if you know the path but need the node id or normalized path.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["path"],
-                "properties": {"path": {"type": "string", "description": "Canonical node path such as /decisions/auth-model."}},
                 "additionalProperties": False,
             },
         },
@@ -11590,7 +11748,9 @@ TOOL_CATEGORIES = {
         "nap_lint",
         "nap_doctor",
         "nap_node_get",
-        "nap_cat",
+        "nap_node_by_id",
+        "nap_node_by_uri",
+        "nap_node_by_path",
         "nap_backlinks",
         "nap_ls",
         "nap_grep_local",
@@ -11700,8 +11860,10 @@ READ_ONLY_TOOLS = {
     "nap_doctor",
     "nap_feedback_admin_ls",
     "nap_ls_tags",
-    "nap_cat",
     "nap_node_get",
+    "nap_node_by_id",
+    "nap_node_by_uri",
+    "nap_node_by_path",
     "nap_backlinks",
     "nap_ls",
     "nap_agent_ls",
@@ -12119,6 +12281,12 @@ def call_tool_impl(name, args):
         return update_node_by_path(args)
     if name == "nap_node_get":
         return node_get(args)
+    if name == "nap_node_by_id":
+        return node_by_id(args)
+    if name == "nap_node_by_uri":
+        return node_by_uri(args)
+    if name == "nap_node_by_path":
+        return node_by_path(args)
     if name == "nap_node_patch":
         return guarded_node_patch(args)
     if name == "nap_rm":
@@ -12147,8 +12315,6 @@ def call_tool_impl(name, args):
         return update_kanban_card(args)
     if name == "nap_kanban_archive":
         return archive_node_by_path(args)
-    if name == "nap_cat":
-        return get_node_by_path(args)
     if name == "nap_ln":
         return link_nodes(args)
     if name == "nap_backlinks":
