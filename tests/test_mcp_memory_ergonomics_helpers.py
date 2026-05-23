@@ -304,7 +304,7 @@ def test_mutation_tools_reject_path_and_patch_by_node_id(mod):
         "set": {"metadata": {"status": "active"}},
     })
     assert patched["id"] == "node-123"
-    assert writes[-1][1] == "/v1/projects/project-1/nodes/node-123"
+    assert writes[-1][1] == "/v1/projects/project-1/nodes/node-123/patch"
 
     archived = mod.archive_node_by_path({"node_id": "node-123"})
     assert archived["archived"] is True

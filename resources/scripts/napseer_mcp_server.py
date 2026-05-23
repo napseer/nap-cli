@@ -7693,7 +7693,7 @@ def guarded_node_patch(args):
             payload[key] = args[key]
     result = request_project_write(
         "PATCH",
-        f"/v1/projects/{project_id}/nodes/{urllib.parse.quote(node_id, safe='')}",
+        f"/v1/projects/{project_id}/nodes/{urllib.parse.quote(node_id, safe='')}/patch",
         payload,
         project_id,
         f"guarded patch node {existing.get('full_path') or node_id}",
