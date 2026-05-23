@@ -7935,10 +7935,10 @@ def link_nodes(args):
 
 
 def get_backlinks_by_path(args):
-    if args.get("path"):
+    if args.get("path") and not args.get("_internal_path_ref"):
         raise RuntimeError("path is an index/route only; resolve it with nap_node_by_path, then use node_id or uri")
     project_id = resolve_project_id(args)
-    target = resolve_existing_node_ref(args)
+    target = get_node_by_path({"path": args["path"]}) if args.get("path") else resolve_existing_node_ref(args)
     backlinks = request_json("GET", f"/v1/projects/{project_id}/nodes/{target['id']}/backlinks")
     return {"target": {"id": target["id"], "full_path": target["full_path"]}, **backlinks}
 
@@ -9455,28 +9455,38 @@ def classify_memory_query(args):
 
 
 def get_memory_context(args):
-    raw_paths = args.get("paths") or ([args["path"]] if args.get("path") else [])
-    if not raw_paths:
-        raise RuntimeError("path or paths is required")
+    if args.get("path") or args.get("paths"):
+        raise RuntimeError("paths are index/routes only; resolve them with nap_node_by_path, then use node_id/uri inputs")
+    raw_node_ids = args.get("node_ids") or ([args["node_id"]] if args.get("node_id") else [])
+    raw_uris = args.get("uris") or ([args["uri"]] if args.get("uri") else [])
+    if not raw_node_ids and not raw_uris:
+        raise RuntimeError("node_id, node_ids, uri, or uris is required")
     max_nodes = max(1, min(int(args.get("max_nodes", 20)), 100))
     depth = max(0, min(int(args.get("depth", 1)), 2))
     default_view = "summary"
     view, _warnings = normalize_discovery_view(args, default=default_view)
-    queue_paths = [normalize_node_path(path) for path in raw_paths]
+    queue = []
+    for node_id in raw_node_ids:
+        queue.append(("node", get_node_by_id({"node_id": node_id})))
+    for uri in raw_uris:
+        queue.append(("node", node_by_uri({"uri": uri})["node"]))
     nodes = []
     edges = []
     seen_paths = set()
     current_depth = 0
-    while queue_paths and len(nodes) < max_nodes and current_depth <= depth:
-        next_paths = []
-        for path in queue_paths:
-            if path in seen_paths or len(nodes) >= max_nodes:
+    while queue and len(nodes) < max_nodes and current_depth <= depth:
+        next_queue = []
+        for kind, value in queue:
+            if len(nodes) >= max_nodes:
                 continue
-            seen_paths.add(path)
             try:
-                node = read_node_by_path({"path": path}, allow_agent=is_agent_namespace_path(path))
+                node = value if kind == "node" else read_node_by_path({"path": value}, allow_agent=is_agent_namespace_path(value))
             except Exception:
                 continue
+            path = node.get("full_path")
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
             nodes.append(summarize_node(node, view=view, preview_chars=normalize_int(args.get("preview_chars"), 240, 80, 1000)))
             links = node.get("links") if isinstance(node.get("links"), list) else []
             for link in links:
@@ -9484,30 +9494,31 @@ def get_memory_context(args):
                 if target_path:
                     edges.append({"source": node["full_path"], "target": target_path, "relation": link.get("relation", "references")})
                     if current_depth < depth:
-                        next_paths.append(target_path)
+                        next_queue.append(("path", target_path))
             if current_depth < depth:
                 try:
-                    backlinks = get_backlinks_by_path({"path": node["full_path"]}).get("items", [])
+                    backlinks = get_backlinks_by_path({"node_id": node["id"]}).get("items", [])
                     for backlink in backlinks:
                         source_path = backlink.get("full_path")
                         if source_path:
                             edges.append({"source": source_path, "target": node["full_path"], "relation": "backlink"})
-                            next_paths.append(source_path)
+                            next_queue.append(("path", source_path))
                 except Exception:
                     pass
-        queue_paths = next_paths
+        queue = next_queue
         current_depth += 1
     return {"items": unique_nodes(nodes), "edges": edges[: max_nodes * 4], "view": view}
 
 
 def find_related_nodes(args):
-    path = args["path"]
+    if args.get("path"):
+        raise RuntimeError("path is an index/route only; resolve it with nap_node_by_path, then use node_id or uri")
     view, _warnings = normalize_discovery_view(args, default="paths")
     limit = max(1, min(int(args.get("limit", 25)), 100))
-    target = read_node_by_path({"path": path}, allow_agent=is_agent_namespace_path(path))
+    target = resolve_node_ref_allow_agent(args)
     related = []
     try:
-        related.extend(get_backlinks_by_path({"path": target["full_path"]}).get("items", []))
+        related.extend(get_backlinks_by_path({"node_id": target["id"]}).get("items", []))
     except Exception:
         pass
     links = target.get("links") if isinstance(target.get("links"), list) else []
@@ -9529,7 +9540,7 @@ def find_related_nodes(args):
 
 def inbound_reference_plan(path):
     try:
-        backlinks = get_backlinks_by_path({"path": path}).get("items", [])
+        backlinks = get_backlinks_by_path({"path": path, "_internal_path_ref": True}).get("items", [])
     except Exception:
         backlinks = []
     return [
@@ -11205,8 +11216,10 @@ def raw_tools():
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "paths": {"type": "array", "items": {"type": "string"}},
+                    "node_id": {"type": "string"},
+                    "node_ids": {"type": "array", "items": {"type": "string"}},
+                    "uri": {"type": "string"},
+                    "uris": {"type": "array", "items": {"type": "string"}},
                     "depth": {"type": "integer", "minimum": 0, "maximum": 2},
                     "max_nodes": {"type": "integer", "minimum": 1, "maximum": 100},
                     "view": {"type": "string", "enum": ["paths", "summary", "metadata"], "default": "summary"},
@@ -11231,9 +11244,9 @@ def raw_tools():
             "description": "Find related memory by outgoing links, backlinks, shared tags, and folder.",
             "inputSchema": {
                 "type": "object",
-                "required": ["path"],
                 "properties": {
-                    "path": {"type": "string"},
+                    "node_id": {"type": "string"},
+                    "uri": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                     "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata"], "default": "paths"},
                     "include_content": {"type": "boolean", "default": False, "description": "Legacy no-op; read full bodies with nap_node_get by node_id or uri."},

@@ -323,6 +323,19 @@ def test_tools_include_node_by_path_descriptor(mod):
     assert "uri" in backlinks_schema["properties"]
     assert "path" not in backlinks_schema["properties"]
 
+    context_schema = next(item for item in mod.tools() if item["name"] == "nap_context")["inputSchema"]
+    assert "node_id" in context_schema["properties"]
+    assert "node_ids" in context_schema["properties"]
+    assert "uri" in context_schema["properties"]
+    assert "uris" in context_schema["properties"]
+    assert "path" not in context_schema["properties"]
+    assert "paths" not in context_schema["properties"]
+
+    related_schema = next(item for item in mod.tools() if item["name"] == "nap_find_related")["inputSchema"]
+    assert "node_id" in related_schema["properties"]
+    assert "uri" in related_schema["properties"]
+    assert "path" not in related_schema["properties"]
+
     complete_schema = next(item for item in mod.tools() if item["name"] == "nap_plan_complete")["inputSchema"]
     assert "plan_node_id" in complete_schema["properties"]
     assert "plan_uri" in complete_schema["properties"]
@@ -564,6 +577,59 @@ def test_agent_tools_create_by_route_and_update_by_identity(mod):
         mod.update_agent_node({"agent_slug": "alice", "path": "/memory/current", "content_text": "bad"})
     with pytest.raises(RuntimeError, match="paths are index/routes only"):
         mod.link_agent_node({"agent_slug": "alice", "source_path": "/memory/current", "target_path": "/notes/target"})
+
+
+def test_context_and_related_use_identity_inputs(mod):
+    root = node("/notes/root", "active", node_type="note", links=[{"path": "/notes/linked", "relation": "references"}], tags=["topic"])
+    root["id"] = "root-123"
+    linked = node("/notes/linked", "active", node_type="note", tags=["topic"])
+    linked["id"] = "linked-123"
+    backlink = node("/notes/backlink", "active", node_type="note")
+    backlink["id"] = "backlink-123"
+    reads = []
+
+    def fake_get_node_by_id(args):
+        reads.append(args)
+        node_id = args.get("node_id")
+        if node_id == "root-123":
+            return root
+        if node_id == "linked-123":
+            return linked
+        raise AssertionError(f"unexpected node_id {node_id}")
+
+    def fake_read_by_path(args, allow_agent=False):
+        if args["path"] == "/notes/linked":
+            return linked
+        if args["path"] == "/notes/backlink":
+            return backlink
+        raise RuntimeError("HTTP 404")
+
+    def fake_request(method, path, payload=None, **kwargs):
+        assert method == "GET"
+        if path == "/v1/projects/project-1/nodes/root-123/backlinks":
+            return {"items": [backlink]}
+        if path == "/v1/projects/project-1/nodes/linked-123/backlinks":
+            return {"items": []}
+        raise AssertionError(path)
+
+    mod.get_node_by_id = fake_get_node_by_id
+    mod.read_node_by_path = fake_read_by_path
+    mod.request_json = fake_request
+    mod.list_project_nodes = lambda args: {"items": [root, linked]}
+
+    context = mod.get_memory_context({"node_id": "root-123", "depth": 1, "view": "paths"})
+    assert [item["full_path"] for item in context["items"]] == ["/notes/root", "/notes/linked", "/notes/backlink"]
+    assert {"source": "/notes/root", "target": "/notes/linked", "relation": "references"} in context["edges"]
+    assert {"source": "/notes/backlink", "target": "/notes/root", "relation": "backlink"} in context["edges"]
+
+    related = mod.find_related_nodes({"node_id": "root-123", "view": "paths"})
+    assert related["target"]["full_path"] == "/notes/root"
+    assert {item["full_path"] for item in related["items"]} >= {"/notes/backlink", "/notes/linked"}
+
+    with pytest.raises(RuntimeError, match="paths are index/routes only"):
+        mod.get_memory_context({"path": "/notes/root"})
+    with pytest.raises(RuntimeError, match="path is an index/route only"):
+        mod.find_related_nodes({"path": "/notes/root"})
 
 
 def test_discovery_rejects_full_content_view(mod):
