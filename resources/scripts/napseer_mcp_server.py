@@ -8549,6 +8549,17 @@ def kanban_card_by_path(path):
     return node
 
 
+def kanban_card_by_ref(args):
+    if args.get("path"):
+        if args.get("_internal_path_ref"):
+            return kanban_card_by_path(args["path"])
+        raise RuntimeError("path is an index/route only; resolve it with nap_node_by_path, then use node_id or uri")
+    node = resolve_existing_node_ref(args)
+    if not normalize_node_path(node.get("full_path") or "").startswith("/kanban/"):
+        raise RuntimeError("kanban command node_id/uri must reference a /kanban card")
+    return node
+
+
 def kanban_target_path(node, column):
     column = normalize_kanban_column(column)
     title_slug = normalize_kanban_slug(node.get("name") or kanban_title(node))
@@ -8805,10 +8816,7 @@ def plan_to_kanban_card(args):
 
 def update_kanban_card(args):
     args = dict(args or {})
-    path = args.get("path")
-    if not path:
-        raise RuntimeError("path is required")
-    existing = kanban_card_by_path(path)
+    existing = kanban_card_by_ref(args)
     metadata = kanban_card_metadata(args, existing=existing, column=kanban_column(existing))
     if "clear_blocked_by" in args and as_bool(args.get("clear_blocked_by"), False):
         metadata.pop("blocked_by", None)
@@ -8822,17 +8830,25 @@ def update_kanban_card(args):
     }
     if "content_text" in args or "body" in args:
         payload["content_text"] = args.get("content_text") if "content_text" in args else args.get("body")
-    updated = update_node_by_path({**payload, "_internal_path_ref": True})
+    project_id = resolve_project_id(args)
+    updated_node = request_project_write(
+        "PATCH",
+        f"/v1/projects/{project_id}/nodes/{existing['id']}",
+        encrypt_node_payload_for_write(project_id, node_payload_from_args(payload, existing=existing), existing=existing),
+        project_id,
+        f"update kanban card {existing['full_path']}",
+        "node",
+        existing["id"],
+    )
+    index_node(updated_node)
+    updated = node_write_reference(decrypt_node_for_return(updated_node, project_id=project_id))
     return {"ok": True, "changed": True, "updated": True, "path": updated.get("path") or existing["full_path"], "column": kanban_column(existing)}
 
 
 def move_kanban_card(args, target_column):
     args = dict(args or {})
-    path = args.get("path")
-    if not path:
-        raise RuntimeError("path is required")
     target_column = normalize_kanban_column(args.get("column") or target_column)
-    existing = kanban_card_by_path(path)
+    existing = kanban_card_by_ref(args)
     source = existing["full_path"]
     target = kanban_target_path(existing, target_column)
     metadata = kanban_card_metadata(args, existing=existing, column=target_column)
@@ -8845,8 +8861,8 @@ def move_kanban_card(args, target_column):
         encrypt_node_payload_for_write(project_id, payload, existing=existing),
         project_id,
         f"move kanban card {source} to {target}",
-        "path",
-        source,
+        "node",
+        existing["id"],
     )
     remove_indexed_node(existing["id"])
     index_node(updated)
@@ -10586,20 +10602,20 @@ def kanban_workflow_tool_schemas():
         },
         "additionalProperties": False,
     }
-    card_path_schema = {
+    card_ref_schema = {
         "type": "object",
-        "required": ["path"],
         "properties": {
-            "path": {"type": "string"},
+            "node_id": {"type": "string", "description": "Canonical node UUID for the Kanban card."},
+            "uri": {"type": "string", "description": "Canonical nap://project-name/project-id/node-id URI for the Kanban card."},
             "rank": {"type": "string"},
         },
         "additionalProperties": False,
     }
     block_schema = {
         "type": "object",
-        "required": ["path"],
         "properties": {
-            "path": {"type": "string"},
+            "node_id": {"type": "string", "description": "Canonical node UUID for the Kanban card."},
+            "uri": {"type": "string", "description": "Canonical nap://project-name/project-id/node-id URI for the Kanban card."},
             "blocked_by": {"type": "string"},
             "blocked_reason": {"type": "string"},
         },
@@ -10607,9 +10623,9 @@ def kanban_workflow_tool_schemas():
     }
     update_schema = {
         "type": "object",
-        "required": ["path"],
         "properties": {
-            "path": {"type": "string"},
+            "node_id": {"type": "string", "description": "Canonical node UUID for the Kanban card."},
+            "uri": {"type": "string", "description": "Canonical nap://project-name/project-id/node-id URI for the Kanban card."},
             "title": {"type": "string"},
             "content_text": {"type": "string"},
             "body": {"type": "string"},
@@ -10661,13 +10677,13 @@ def kanban_workflow_tool_schemas():
                 "additionalProperties": False,
             },
         },
-        {"name": "nap_kanban_start", "description": "Move a Kanban card to working state, canonical /kanban/doing.", "inputSchema": card_path_schema},
-        {"name": "nap_kanban_send_review", "description": "Move a Kanban card to /kanban/review.", "inputSchema": card_path_schema},
-        {"name": "nap_kanban_complete", "description": "Move a Kanban card to /kanban/done.", "inputSchema": card_path_schema},
+        {"name": "nap_kanban_start", "description": "Move a Kanban card to working state by node_id/uri, canonical /kanban/doing.", "inputSchema": card_ref_schema},
+        {"name": "nap_kanban_send_review", "description": "Move a Kanban card to /kanban/review by node_id/uri.", "inputSchema": card_ref_schema},
+        {"name": "nap_kanban_complete", "description": "Move a Kanban card to /kanban/done by node_id/uri.", "inputSchema": card_ref_schema},
         {"name": "nap_kanban_block", "description": "Mark a Kanban card blocked and optionally record a reason.", "inputSchema": block_schema},
-        {"name": "nap_kanban_unblock", "description": "Clear a Kanban card blocked state and reason.", "inputSchema": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}}, "additionalProperties": False}},
-        {"name": "nap_kanban_update", "description": "Update common Kanban card fields while preserving the node-backed model.", "inputSchema": update_schema},
-        {"name": "nap_kanban_archive", "description": "Archive a node-backed Kanban card.", "inputSchema": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}, "dry_run": {"type": "boolean", "default": False}}, "additionalProperties": False}},
+        {"name": "nap_kanban_unblock", "description": "Clear a Kanban card blocked state and reason by node_id/uri.", "inputSchema": {"type": "object", "properties": {"node_id": {"type": "string"}, "uri": {"type": "string"}}, "additionalProperties": False}},
+        {"name": "nap_kanban_update", "description": "Update common Kanban card fields by node_id/uri while preserving the node-backed model.", "inputSchema": update_schema},
+        {"name": "nap_kanban_archive", "description": "Archive a node-backed Kanban card by node_id/uri.", "inputSchema": {"type": "object", "properties": {"node_id": {"type": "string"}, "uri": {"type": "string"}, "dry_run": {"type": "boolean", "default": False}}, "additionalProperties": False}},
     ]
 
 

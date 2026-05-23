@@ -278,6 +278,20 @@ def test_tools_include_node_by_path_descriptor(mod):
         assert "uri" in schema["properties"]
         assert "path" not in schema["properties"]
 
+    for name in [
+        "nap_kanban_start",
+        "nap_kanban_send_review",
+        "nap_kanban_complete",
+        "nap_kanban_block",
+        "nap_kanban_unblock",
+        "nap_kanban_update",
+        "nap_kanban_archive",
+    ]:
+        schema = next(item for item in mod.tools() if item["name"] == name)["inputSchema"]
+        assert "node_id" in schema["properties"]
+        assert "uri" in schema["properties"]
+        assert "path" not in schema["properties"]
+
 
 def test_mutation_tools_reject_path_and_patch_by_node_id(mod):
     found = node("/notes/current", "active", node_type="note")
@@ -670,7 +684,7 @@ def test_kanban_workflow_create_move_and_block(mod):
         "content_text": payload.get("content_text", existing["content_text"]),
         "tags": payload.get("tags", existing["tags"]),
     }
-    mod.get_node_by_path = lambda args, allow_agent=False: existing
+    mod.get_node_by_id = lambda args: {**existing, "id": "id-add-mcp-commands"}
     mod.index_node = lambda node: None
     mod.remove_indexed_node = lambda node_id: None
 
@@ -682,7 +696,7 @@ def test_kanban_workflow_create_move_and_block(mod):
     assert writes[0][2]["metadata"]["priority"] == "high"
     assert writes[0][2]["metadata"]["rank"] == "00001024"
 
-    moved = mod.move_kanban_card({"path": "/kanban/todo/add-mcp-commands"}, "doing")
+    moved = mod.move_kanban_card({"node_id": "id-add-mcp-commands"}, "doing")
     assert moved["to"] == "/kanban/doing/add-mcp-commands"
     assert "node" not in moved
     assert writes[1][0] == "PATCH"
@@ -690,11 +704,14 @@ def test_kanban_workflow_create_move_and_block(mod):
     assert writes[1][2]["metadata"]["column"] == "doing"
     assert writes[1][2]["metadata"]["lifecycle_state"] == "active"
 
-    blocked = mod.block_kanban_card({"path": "/kanban/todo/add-mcp-commands", "blocked_reason": "waiting"}, True)
+    blocked = mod.block_kanban_card({"node_id": "id-add-mcp-commands", "blocked_reason": "waiting"}, True)
     assert blocked["updated"] is True
     assert "node" not in blocked
     assert writes[2][2]["metadata"]["blocked"] is True
     assert writes[2][2]["metadata"]["blocked_by"] == "waiting"
+
+    with pytest.raises(RuntimeError, match="path is an index/route only"):
+        mod.move_kanban_card({"path": "/kanban/todo/add-mcp-commands"}, "doing")
 
 
 def test_kanban_create_deduplicates_overlapping_titles(mod):
