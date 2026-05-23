@@ -304,6 +304,25 @@ def test_tools_include_node_by_path_descriptor(mod):
         assert "uri" in schema["properties"]
         assert "path" not in schema["properties"]
 
+    mv_schema = next(item for item in mod.tools() if item["name"] == "nap_mv")["inputSchema"]
+    assert mv_schema["required"] == ["new_path"]
+    assert "node_id" in mv_schema["properties"]
+    assert "uri" in mv_schema["properties"]
+    assert "path" not in mv_schema["properties"]
+
+    ln_schema = next(item for item in mod.tools() if item["name"] == "nap_ln")["inputSchema"]
+    assert "source_node_id" in ln_schema["properties"]
+    assert "source_uri" in ln_schema["properties"]
+    assert "target_node_id" in ln_schema["properties"]
+    assert "target_uri" in ln_schema["properties"]
+    assert "source_path" not in ln_schema["properties"]
+    assert "target_path" not in ln_schema["properties"]
+
+    backlinks_schema = next(item for item in mod.tools() if item["name"] == "nap_backlinks")["inputSchema"]
+    assert "node_id" in backlinks_schema["properties"]
+    assert "uri" in backlinks_schema["properties"]
+    assert "path" not in backlinks_schema["properties"]
+
 
 def test_mutation_tools_reject_path_and_patch_by_node_id(mod):
     found = node("/notes/current", "active", node_type="note")
@@ -339,6 +358,64 @@ def test_mutation_tools_reject_path_and_patch_by_node_id(mod):
 
     with pytest.raises(RuntimeError, match="path is an index/route only"):
         mod.update_node_by_path({"path": "/notes/current", "content_text": "bad"})
+
+
+def test_graph_tools_use_node_identity_instead_of_paths(mod):
+    source = node("/notes/source", "active", node_type="note")
+    source["id"] = "source-123"
+    target = node("/notes/target", "active", node_type="note")
+    target["id"] = "target-123"
+    writes = []
+    reads = []
+
+    def fake_get_node_by_id(args):
+        reads.append(args)
+        node_id = args.get("node_id")
+        if node_id == "source-123":
+            return source
+        if node_id == "target-123":
+            return target
+        raise AssertionError(f"unexpected node_id {node_id}")
+
+    def fake_write(method, path, payload, *args, **kwargs):
+        writes.append((method, path, payload, args))
+        return {**source, "full_path": "/notes/source-renamed" if payload.get("name") == "source-renamed" else source["full_path"], "links": payload.get("links", source["links"])}
+
+    def fake_request(method, path, payload=None, **kwargs):
+        assert method == "GET"
+        assert path == "/v1/projects/project-1/nodes/target-123/backlinks"
+        return {"items": [source]}
+
+    mod.get_node_by_id = fake_get_node_by_id
+    mod.request_project_write = fake_write
+    mod.request_json = fake_request
+    mod.index_node = lambda node: None
+    mod.inbound_reference_plan = lambda path: [{"id": "other-1", "path": "/notes/other"}]
+    mod.remove_indexed_node = lambda node_id: None
+
+    linked = mod.link_nodes({"source_node_id": "source-123", "target_node_id": "target-123", "relation": "references"})
+    assert linked["created"] is True
+    assert writes[-1][0] == "PATCH"
+    assert writes[-1][1] == "/v1/projects/project-1/nodes/source-123"
+    assert writes[-1][2]["links"] == [{"path": "/notes/target", "relation": "references"}]
+    assert writes[-1][3][2:] == ("node", "source-123")
+
+    backlinks = mod.get_backlinks_by_path({"node_id": "target-123"})
+    assert backlinks["target"]["id"] == "target-123"
+
+    moved = mod.move_node({"node_id": "source-123", "new_path": "/notes/source-renamed"})
+    assert moved["moved"] is True
+    assert writes[-1][1] == "/v1/projects/project-1/nodes/source-123"
+    assert writes[-1][2]["folder_path"] == "/notes"
+    assert writes[-1][2]["name"] == "source-renamed"
+    assert writes[-1][3][2:] == ("node", "source-123")
+
+    with pytest.raises(RuntimeError, match="paths are index/routes only"):
+        mod.link_nodes({"source_path": "/notes/source", "target_path": "/notes/target"})
+    with pytest.raises(RuntimeError, match="path is an index/route only"):
+        mod.get_backlinks_by_path({"path": "/notes/target"})
+    with pytest.raises(RuntimeError, match="path is an index/route only"):
+        mod.move_node({"path": "/notes/source", "new_path": "/notes/source-renamed"})
 
 
 def test_tee_and_bulk_create_by_path_update_by_identity(mod):

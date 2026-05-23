@@ -7893,11 +7893,11 @@ def delete_archived_node(args):
 
 
 def link_nodes(args):
-    reject_agent_namespace_path(args["source_path"], "source_path")
-    reject_agent_namespace_path(args["target_path"], "target_path")
+    if args.get("source_path") or args.get("target_path"):
+        raise RuntimeError("paths are index/routes only; use source_node_id/target_node_id or source_uri/target_uri")
     project_id = resolve_project_id(args)
-    source = read_node_by_path({"path": args["source_path"]})
-    target = read_node_by_path({"path": args["target_path"]})
+    source = resolve_existing_node_ref({"node_id": args.get("source_node_id"), "uri": args.get("source_uri")})
+    target = resolve_existing_node_ref({"node_id": args.get("target_node_id"), "uri": args.get("target_uri")})
     relation = args.get("relation", "references")
     links = source.get("links") or []
     if not isinstance(links, list):
@@ -7917,8 +7917,8 @@ def link_nodes(args):
             {"links": links},
             project_id,
             f"link node {source['full_path']}",
-            "path",
-            source["full_path"],
+            "node",
+            source["id"],
         )
         index_node(updated)
     else:
@@ -7935,9 +7935,10 @@ def link_nodes(args):
 
 
 def get_backlinks_by_path(args):
-    reject_agent_namespace_path(args["path"])
+    if args.get("path"):
+        raise RuntimeError("path is an index/route only; resolve it with nap_node_by_path, then use node_id or uri")
     project_id = resolve_project_id(args)
-    target = get_node_by_path({"path": args["path"]})
+    target = resolve_existing_node_ref(args)
     backlinks = request_json("GET", f"/v1/projects/{project_id}/nodes/{target['id']}/backlinks")
     return {"target": {"id": target["id"], "full_path": target["full_path"]}, **backlinks}
 
@@ -9521,14 +9522,14 @@ def inbound_reference_plan(path):
 
 
 def move_node(args):
-    old_path = args.get("path") or args.get("source_path")
     new_path = args.get("new_path") or args.get("target_path")
-    if not old_path or not new_path:
-        raise RuntimeError("path and new_path are required")
-    reject_agent_namespace_path(old_path)
+    if args.get("path") or args.get("source_path"):
+        raise RuntimeError("path is an index/route only; resolve it with nap_node_by_path, then use node_id or uri")
+    if not new_path:
+        raise RuntimeError("new_path is required")
     reject_agent_namespace_path(new_path)
     project_id = resolve_project_id(args)
-    existing = read_node_by_path({"path": old_path})
+    existing = resolve_existing_node_ref(args)
     old_full_path = existing["full_path"]
     new_full_path = normalize_node_path(new_path)
     references_to_rewrite = [
@@ -9553,7 +9554,9 @@ def move_node(args):
         f"/v1/projects/{project_id}/nodes/{existing['id']}",
         payload,
         project_id,
-        f"move node {old_path} to {new_path} and rewrite inbound references",
+        f"move node {old_full_path} to {new_path} and rewrite inbound references",
+        "node",
+        existing["id"],
     )
     remove_indexed_node(existing["id"])
     index_node(updated)
@@ -11238,11 +11241,16 @@ def raw_tools():
         },
         {
             "name": "nap_mv",
-            "description": "Move or rename one node by path and rewrite inbound links/metadata references in the same backend operation.",
+            "description": "Move or rename one existing node by node_id or nap:// URI and rewrite inbound links/metadata references in the same backend operation.",
             "inputSchema": {
                 "type": "object",
-                "required": ["path", "new_path"],
-                "properties": {"path": {"type": "string"}, "new_path": {"type": "string"}, "dry_run": {"type": "boolean", "default": False}},
+                "required": ["new_path"],
+                "properties": {
+                    "node_id": {"type": "string", "description": "Canonical node id of the node to move."},
+                    "uri": {"type": "string", "description": "Canonical nap://project-name/project-id/node-id URI of the node to move."},
+                    "new_path": {"type": "string", "description": "New route/index path for the node."},
+                    "dry_run": {"type": "boolean", "default": False},
+                },
                 "additionalProperties": False,
             },
         },
@@ -11540,13 +11548,14 @@ def raw_tools():
         },
         {
             "name": "nap_ln",
-            "description": "Create a first-class graph link from source_path to target_path. Use this instead of burying references in prose or metadata.",
+            "description": "Create a first-class graph link between existing nodes identified by node_id or nap:// URI. Use this instead of burying references in prose or metadata.",
             "inputSchema": {
                 "type": "object",
-                "required": ["source_path", "target_path"],
                 "properties": {
-                    "source_path": {"type": "string", "description": "Node that should hold the outgoing link."},
-                    "target_path": {"type": "string", "description": "Node being referenced."},
+                    "source_node_id": {"type": "string", "description": "Canonical node id for the node that should hold the outgoing link."},
+                    "source_uri": {"type": "string", "description": "Canonical nap:// URI for the node that should hold the outgoing link."},
+                    "target_node_id": {"type": "string", "description": "Canonical node id for the node being referenced."},
+                    "target_uri": {"type": "string", "description": "Canonical nap:// URI for the node being referenced."},
                     "relation": {"type": "string", "default": "references", "description": "Short relation slug, for example references, depends-on, supersedes, implements, explains."},
                 },
                 "additionalProperties": False,
@@ -11554,11 +11563,13 @@ def raw_tools():
         },
         {
             "name": "nap_backlinks",
-            "description": "List nodes that link to or mention a target node path. Use this to recover graph context before editing or summarizing.",
+            "description": "List nodes that link to or mention a target node identified by node_id or nap:// URI. Use this to recover graph context before editing or summarizing.",
             "inputSchema": {
                 "type": "object",
-                "required": ["path"],
-                "properties": {"path": {"type": "string", "description": "Target node full_path."}},
+                "properties": {
+                    "node_id": {"type": "string", "description": "Canonical target node id."},
+                    "uri": {"type": "string", "description": "Canonical target nap://project-name/project-id/node-id URI."},
+                },
                 "additionalProperties": False,
             },
         },
