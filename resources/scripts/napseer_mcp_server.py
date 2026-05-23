@@ -8797,10 +8797,11 @@ def lineage_status(args):
 
 def plan_to_kanban_card(args):
     args = dict(args or {})
-    plan_path = normalize_node_path(args.get("plan_path") or args.get("path") or "")
-    if not is_plan_node_path(plan_path):
-        raise RuntimeError("plan_path must be a /plans/<plan-slug> path")
-    plan = read_node_by_path({"path": plan_path})
+    if args.get("plan_path") or args.get("path"):
+        raise RuntimeError("plan_path/path are index/routes only; resolve with nap_node_by_path, then use plan_node_id or plan_uri")
+    plan = resolve_existing_node_ref({"node_id": args.get("plan_node_id"), "uri": args.get("plan_uri")})
+    if not is_plan_node_path(plan.get("full_path") or ""):
+        raise RuntimeError("plan node must be under /plans")
     metadata = node_metadata(plan)
     title = str(args.get("title") or metadata.get("title") or plan.get("name") or "").strip()
     if not title:
@@ -8927,20 +8928,54 @@ def find_archived_node_by_path(path):
     return None
 
 
-def get_plan_for_lifecycle(path):
-    normalized = normalize_node_path(path)
-    if not normalized.startswith("/plans/"):
-        raise RuntimeError("plan lifecycle helpers only operate on /plans/* nodes")
+def find_archived_node_by_id(node_id):
+    result = list_project_nodes({"archived_only": True, "limit": 500, "view": "metadata"})
+    for node in result.get("items", []):
+        if str(node.get("id") or "") == str(node_id):
+            return node
+    return None
+
+
+def node_ref_id_from_args(args):
+    if args.get("node_id") or args.get("id"):
+        return str(args.get("node_id") or args.get("id")).strip()
+    if args.get("plan_node_id"):
+        return str(args.get("plan_node_id")).strip()
+    if args.get("uri") or args.get("plan_uri"):
+        return parse_nap_node_uri(args.get("uri") or args.get("plan_uri"))["node_id"]
+    return ""
+
+
+def get_plan_for_lifecycle(args):
+    if args.get("path") or args.get("plan_path"):
+        raise RuntimeError("path is an index/route only; resolve it with nap_node_by_path, then use plan_node_id or plan_uri")
+    node_id = node_ref_id_from_args(args)
     try:
-        node = read_node_by_path({"path": normalized})
-        return node, False
+        node = resolve_existing_node_ref({"node_id": args.get("plan_node_id") or args.get("node_id") or args.get("id"), "uri": args.get("plan_uri") or args.get("uri")})
+        archived = False
     except RuntimeError as exc:
-        if "HTTP 404" not in str(exc) and "node not found" not in str(exc):
+        if not node_id or ("HTTP 404" not in str(exc) and "node not found" not in str(exc)):
             raise
-        archived = find_archived_node_by_path(normalized)
-        if archived:
-            return archived, True
-        raise
+        node = find_archived_node_by_id(node_id)
+        if not node:
+            raise
+        archived = True
+    if not is_plan_node_path(node.get("full_path") or ""):
+        raise RuntimeError("plan lifecycle helpers only operate on /plans/* nodes")
+    return node, archived
+
+
+def resolve_lifecycle_target(args, required_target_key):
+    if not required_target_key:
+        return None
+    if args.get(required_target_key):
+        raise RuntimeError(f"{required_target_key} is an index/route only; use {required_target_key.replace('_path', '_node_id')} or {required_target_key.replace('_path', '_uri')}")
+    node_key = required_target_key.replace("_path", "_node_id")
+    uri_key = required_target_key.replace("_path", "_uri")
+    if not args.get(node_key) and not args.get(uri_key):
+        raise RuntimeError(f"{node_key} or {uri_key} is required")
+    target = resolve_existing_node_ref({"node_id": args.get(node_key), "uri": args.get(uri_key)})
+    return normalize_node_path(target["full_path"])
 
 
 def plan_lifecycle_matches(node, *, status, target_path=None, metadata_key=None, link_relation=None):
@@ -9013,17 +9048,13 @@ def cancel_plan(args):
 
 
 def plan_lifecycle_update(args, *, action, terminal_status, required_target_key, metadata_target_key, timestamp_key, reason_key, link_relation, terminal_tags, require_reason=False):
-    path = normalize_node_path(args.get("path") or "")
-    if not path or path == "/":
-        raise RuntimeError("path is required")
-    target_path = normalize_node_path(args.get(required_target_key)) if required_target_key else None
-    if required_target_key and not args.get(required_target_key):
-        raise RuntimeError(f"{required_target_key} is required")
+    target_path = resolve_lifecycle_target(args, required_target_key)
     reason = str(args.get("reason") or args.get("notes") or "").strip()
     if require_reason and not reason:
         raise RuntimeError("reason is required")
     dry_run = as_bool(args.get("dry_run"), False)
-    node, already_archived = get_plan_for_lifecycle(path)
+    node, already_archived = get_plan_for_lifecycle(args)
+    path = node["full_path"]
 
     already_terminal = plan_lifecycle_matches(
         node,
@@ -9034,10 +9065,6 @@ def plan_lifecycle_update(args, *, action, terminal_status, required_target_key,
     )
     if already_terminal and already_archived:
         return plan_lifecycle_result(action, path, node, True, False, dry_run)
-    if target_path and not already_terminal:
-        if try_get_node_by_path(target_path, allow_agent=is_agent_namespace_path(target_path)) is None:
-            raise RuntimeError(f"target node not found: {target_path}")
-
     metadata = dict(node_metadata(node))
     links = node.get("links") if isinstance(node.get("links"), list) else []
     tags = list(node.get("tags") or [])
@@ -9088,12 +9115,12 @@ def plan_lifecycle_update(args, *, action, terminal_status, required_target_key,
 
     updated = node
     if planned_changes != ["archive node"]:
-        update_node_by_path({"path": path, "metadata": metadata, "tags": tags, "links": links, "_internal_path_ref": True})
+        update_node_by_path({"node_id": node["id"], "metadata": metadata, "tags": tags, "links": links})
         updated = dict(node)
         updated["metadata"] = metadata
         updated["tags"] = tags
         updated["links"] = links
-    archive_result = archive_node_by_path({"path": path, "_internal_path_ref": True})
+    archive_result = archive_node_by_path({"node_id": node["id"]})
     return plan_lifecycle_result(
         action,
         path,
@@ -11473,13 +11500,14 @@ def raw_tools():
         },
         {
             "name": "nap_plan_complete",
-            "description": "Mark a /plans node completed, link it to an outcome, add terminal tags, and archive it so active plan discovery excludes it.",
+            "description": "Mark a /plans node completed by plan node identity, link it to an outcome node identity, add terminal tags, and archive it so active plan discovery excludes it.",
             "inputSchema": {
                 "type": "object",
-                "required": ["path", "outcome_path"],
                 "properties": {
-                    "path": {"type": "string"},
-                    "outcome_path": {"type": "string"},
+                    "plan_node_id": {"type": "string", "description": "Canonical node id of the /plans node."},
+                    "plan_uri": {"type": "string", "description": "Canonical nap:// URI of the /plans node."},
+                    "outcome_node_id": {"type": "string", "description": "Canonical node id of the outcome node."},
+                    "outcome_uri": {"type": "string", "description": "Canonical nap:// URI of the outcome node."},
                     "reason": {"type": "string"},
                     "notes": {"type": "string"},
                     "dry_run": {"type": "boolean", "default": False},
@@ -11490,13 +11518,15 @@ def raw_tools():
         },
         {
             "name": "nap_plan_supersede",
-            "description": "Mark a /plans node superseded by another plan/node, add terminal tags and link, then archive it.",
+            "description": "Mark a /plans node superseded by another node identity, add terminal tags and link, then archive it.",
             "inputSchema": {
                 "type": "object",
-                "required": ["path", "replacement_path", "reason"],
+                "required": ["reason"],
                 "properties": {
-                    "path": {"type": "string"},
-                    "replacement_path": {"type": "string"},
+                    "plan_node_id": {"type": "string", "description": "Canonical node id of the /plans node."},
+                    "plan_uri": {"type": "string", "description": "Canonical nap:// URI of the /plans node."},
+                    "replacement_node_id": {"type": "string", "description": "Canonical node id of the replacement node."},
+                    "replacement_uri": {"type": "string", "description": "Canonical nap:// URI of the replacement node."},
                     "reason": {"type": "string"},
                     "notes": {"type": "string"},
                     "dry_run": {"type": "boolean", "default": False},
@@ -11507,12 +11537,13 @@ def raw_tools():
         },
         {
             "name": "nap_plan_cancel",
-            "description": "Mark a /plans node cancelled with a reason, add terminal tags, and archive it.",
+            "description": "Mark a /plans node cancelled by plan node identity with a reason, add terminal tags, and archive it.",
             "inputSchema": {
                 "type": "object",
-                "required": ["path", "reason"],
+                "required": ["reason"],
                 "properties": {
-                    "path": {"type": "string"},
+                    "plan_node_id": {"type": "string", "description": "Canonical node id of the /plans node."},
+                    "plan_uri": {"type": "string", "description": "Canonical nap:// URI of the /plans node."},
                     "reason": {"type": "string"},
                     "notes": {"type": "string"},
                     "dry_run": {"type": "boolean", "default": False},
@@ -11523,12 +11554,12 @@ def raw_tools():
         },
         {
             "name": "nap_plan_to_kanban",
-            "description": "Create a node-backed kanban card from any /plans node and preserve the origin plan with a derived-from link.",
+            "description": "Create a node-backed kanban card from a /plans node identity and preserve the origin plan with a derived-from link.",
             "inputSchema": {
                 "type": "object",
-                "required": ["plan_path"],
                 "properties": {
-                    "plan_path": {"type": "string"},
+                    "plan_node_id": {"type": "string", "description": "Canonical node id of the /plans node."},
+                    "plan_uri": {"type": "string", "description": "Canonical nap:// URI of the /plans node."},
                     "title": {"type": "string"},
                     "slug": {"type": "string"},
                     "column": {"type": "string", "enum": DEFAULT_KANBAN_COLUMNS, "default": "todo"},

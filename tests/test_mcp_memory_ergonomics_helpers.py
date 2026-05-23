@@ -323,6 +323,31 @@ def test_tools_include_node_by_path_descriptor(mod):
     assert "uri" in backlinks_schema["properties"]
     assert "path" not in backlinks_schema["properties"]
 
+    complete_schema = next(item for item in mod.tools() if item["name"] == "nap_plan_complete")["inputSchema"]
+    assert "plan_node_id" in complete_schema["properties"]
+    assert "plan_uri" in complete_schema["properties"]
+    assert "outcome_node_id" in complete_schema["properties"]
+    assert "outcome_uri" in complete_schema["properties"]
+    assert "path" not in complete_schema["properties"]
+    assert "outcome_path" not in complete_schema["properties"]
+
+    supersede_schema = next(item for item in mod.tools() if item["name"] == "nap_plan_supersede")["inputSchema"]
+    assert supersede_schema["required"] == ["reason"]
+    assert "plan_node_id" in supersede_schema["properties"]
+    assert "replacement_node_id" in supersede_schema["properties"]
+    assert "path" not in supersede_schema["properties"]
+    assert "replacement_path" not in supersede_schema["properties"]
+
+    cancel_schema = next(item for item in mod.tools() if item["name"] == "nap_plan_cancel")["inputSchema"]
+    assert cancel_schema["required"] == ["reason"]
+    assert "plan_node_id" in cancel_schema["properties"]
+    assert "path" not in cancel_schema["properties"]
+
+    plan_to_kanban_schema = next(item for item in mod.tools() if item["name"] == "nap_plan_to_kanban")["inputSchema"]
+    assert "plan_node_id" in plan_to_kanban_schema["properties"]
+    assert "plan_uri" in plan_to_kanban_schema["properties"]
+    assert "plan_path" not in plan_to_kanban_schema["properties"]
+
 
 def test_mutation_tools_reject_path_and_patch_by_node_id(mod):
     found = node("/notes/current", "active", node_type="note")
@@ -920,7 +945,7 @@ def test_plan_to_kanban_creates_card_with_origin_plan_link(mod):
         content="Implement a generic record to plan to kanban flow.",
     )
 
-    mod.get_node_by_path = lambda args, allow_agent=False: plan
+    mod.get_node_by_id = lambda args: plan
     mod.list_kanban_cards = lambda args: {"items": []}
     mod.request_project_write = lambda method, path, payload, *args, **kwargs: writes.append((method, path, payload)) or {
         "id": "id-generic-work",
@@ -937,7 +962,7 @@ def test_plan_to_kanban_creates_card_with_origin_plan_link(mod):
     }
     mod.index_node = lambda node: None
 
-    created = mod.plan_to_kanban_card({"plan_path": "/plans/generic-work", "column": "todo"})
+    created = mod.plan_to_kanban_card({"plan_node_id": plan["id"], "column": "todo"})
     assert created["path"] == "/kanban/todo/generic-work"
     assert created["source_plan_path"] == "/plans/generic-work"
     assert writes[0][0] == "POST"
@@ -949,29 +974,30 @@ def test_plan_to_kanban_creates_card_with_origin_plan_link(mod):
 
 def test_plan_lifecycle_dry_run_and_write(mod):
     plan = node("/plans/example", "in_progress", tags=["plan"])
+    plan["id"] = "plan-123"
     outcome = node("/implementation-notes/example", "completed", node_type="implementation-note")
+    outcome["id"] = "outcome-123"
     writes = []
 
-    def fake_get(args, allow_agent=False):
-        if args["path"] == "/plans/example":
+    def fake_get_by_id(args):
+        if args["node_id"] == plan["id"]:
             return plan
-        if args["path"] == "/implementation-notes/example":
+        if args["node_id"] == outcome["id"]:
             return outcome
-        raise RuntimeError("HTTP 404")
+        raise AssertionError(f"unexpected node id {args['node_id']}")
 
-    mod.get_node_by_path = fake_get
-    mod.try_get_node_by_path = lambda path, allow_agent=False: outcome if path == "/implementation-notes/example" else None
+    mod.get_node_by_id = fake_get_by_id
     mod.update_node_by_path = lambda args: writes.append(("update", args)) or {"node": {**plan, **args}}
     mod.archive_node_by_path = lambda args: writes.append(("archive", args)) or {"archived": True}
 
-    dry = mod.complete_plan({"path": "/plans/example", "outcome_path": "/implementation-notes/example", "dry_run": True})
+    dry = mod.complete_plan({"plan_node_id": plan["id"], "outcome_node_id": outcome["id"], "dry_run": True})
     assert dry["changed"] is True
     assert dry["dry_run"] is True
     assert dry["status"] == "completed"
     assert "archive node" in dry["planned_changes"]
     assert writes == []
 
-    written = mod.complete_plan({"path": "/plans/example", "outcome_path": "/implementation-notes/example", "reason": "implemented"})
+    written = mod.complete_plan({"plan_node_id": plan["id"], "outcome_node_id": outcome["id"], "reason": "implemented"})
     assert written["changed"] is True
     assert written["archived"] is True
     assert writes[0][0] == "update"
@@ -981,9 +1007,15 @@ def test_plan_lifecycle_dry_run_and_write(mod):
     assert "archived" in writes[0][1]["tags"]
     assert writes[0][1]["links"] == [{"path": "/implementation-notes/example", "relation": "implemented-by"}]
     assert writes[1][0] == "archive"
+    assert writes[1][1]["node_id"] == plan["id"]
+
+    with pytest.raises(RuntimeError, match="path is an index/route only"):
+        mod.complete_plan({"path": "/plans/example", "outcome_path": "/implementation-notes/example"})
 
 
 def test_plan_lifecycle_archived_idempotent(mod):
+    outcome = node("/implementation-notes/example", "completed", node_type="implementation-note")
+    outcome["id"] = "outcome-123"
     archived = node(
         "/plans/example",
         "completed",
@@ -991,11 +1023,17 @@ def test_plan_lifecycle_archived_idempotent(mod):
         tags=["plan", "completed", "archived"],
         archived_at="2026-05-06T12:01:00Z",
     )
+    archived["id"] = "plan-123"
     archived["links"] = [{"path": "/implementation-notes/example", "relation": "implemented-by"}]
 
-    mod.get_node_by_path = lambda args, allow_agent=False: (_ for _ in ()).throw(RuntimeError("HTTP 404"))
+    def fake_get_by_id(args):
+        if args["node_id"] == outcome["id"]:
+            return outcome
+        raise RuntimeError("HTTP 404")
+
+    mod.get_node_by_id = fake_get_by_id
     mod.list_project_nodes = lambda args: {"items": [archived]}
-    result = mod.complete_plan({"path": "/plans/example", "outcome_path": "/implementation-notes/example"})
+    result = mod.complete_plan({"plan_node_id": archived["id"], "outcome_node_id": outcome["id"]})
     assert result["ok"] is True
     assert result["changed"] is False
     assert result["archived"] is True
