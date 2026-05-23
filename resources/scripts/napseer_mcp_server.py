@@ -7784,9 +7784,27 @@ def resolve_existing_node_ref(args, view="render"):
 
 
 def upsert_node(args):
-    reject_agent_namespace_path(args["path"])
     project_id = resolve_project_id(args)
+    if args.get("node_id") or args.get("id") or args.get("uri"):
+        existing = resolve_existing_node_ref(args)
+        updated = request_project_write(
+            "PATCH",
+            f"/v1/projects/{project_id}/nodes/{existing['id']}",
+            encrypt_node_payload_for_write(project_id, node_payload_from_args(args, existing=existing), existing=existing),
+            project_id,
+            f"update node {existing['full_path']}",
+            "node",
+            existing["id"],
+        )
+        index_node(updated)
+        node = decrypt_node_for_return(updated, project_id=project_id)
+        return {"ok": True, "changed": True, "created": False, "updated": True, **node_write_reference(node)}
+    if not args.get("path"):
+        raise RuntimeError("path is required when creating a node; use node_id or uri to update an existing node")
+    reject_agent_namespace_path(args["path"])
     existing = try_get_node_by_path(args["path"])
+    if existing and not args.get("_internal_path_ref"):
+        raise RuntimeError("path already resolves to a node; use node_id or uri to update it")
     if existing:
         updated = request_project_write(
             "PATCH",
@@ -7794,8 +7812,8 @@ def upsert_node(args):
             encrypt_node_payload_for_write(project_id, node_payload_from_args(args, existing=existing), existing=existing),
             project_id,
             f"update node {existing['full_path']}",
-            "path",
-            existing["full_path"],
+            "node",
+            existing["id"],
         )
         index_node(updated)
         node = decrypt_node_for_return(updated, project_id=project_id)
@@ -8628,7 +8646,7 @@ def create_kanban_card(args):
         "metadata": metadata,
         "content_text": args.get("content_text") or args.get("body") or "",
     }
-    result = upsert_node(payload) if as_bool(args.get("upsert"), False) else None
+    result = upsert_node({**payload, "_internal_path_ref": True}) if as_bool(args.get("upsert"), False) else None
     if result is None:
         project_id = resolve_project_id(args)
         created = request_project_write(
@@ -9628,10 +9646,16 @@ def bulk_upsert_nodes(args):
         headers = lock_headers(lock)
         for item in nodes:
             path = item.get("path")
-            if not path:
-                raise RuntimeError("each node requires path")
-            reject_agent_namespace_path(path)
-            existing = try_get_node_by_path(path)
+            existing = None
+            if item.get("node_id") or item.get("id") or item.get("uri"):
+                existing = resolve_existing_node_ref(item)
+            else:
+                if not path:
+                    raise RuntimeError("each new node requires path; updates require node_id or uri")
+                reject_agent_namespace_path(path)
+                existing = try_get_node_by_path(path)
+                if existing and not item.get("_internal_path_ref"):
+                    raise RuntimeError(f"path already resolves to a node; use node_id or uri to update it: {normalize_node_path(path)}")
             payload = node_payload_from_args(item, existing=existing)
             payload = encrypt_node_payload_for_write(project_id, payload, existing=existing)
             if existing:
@@ -11234,7 +11258,7 @@ def raw_tools():
         },
         {
             "name": "nap_bulk",
-            "description": "Create or update multiple path-addressed nodes using one auto-acquired project lock. Prefer this over raw REST writes when operating through the local wrapper.",
+            "description": "Create multiple route-addressed nodes or update existing nodes by node_id/uri using one auto-acquired project lock.",
             "inputSchema": {
                 "type": "object",
                 "required": ["nodes"],
@@ -11245,9 +11269,10 @@ def raw_tools():
                         "type": "array",
                         "items": {
                             "type": "object",
-                            "required": ["path"],
                             "properties": {
-                                "path": {"type": "string"},
+                                "path": {"type": "string", "description": "Route path for creating a new node. Existing-node updates require node_id or uri."},
+                                "node_id": {"type": "string", "description": "Canonical node UUID for updating an existing node."},
+                                "uri": {"type": "string", "description": "Canonical nap://project-name/project-id/node-id URI for updating an existing node."},
                                 "content_text": {"type": "string"},
                                 "type": {"type": "string"},
                                 "tags": {"type": "array", "items": {"type": "string"}},
@@ -11307,12 +11332,13 @@ def raw_tools():
         },
         {
             "name": "nap_tee",
-            "description": "Create or update a node by full path using an auto-acquired project lock. Use this for canonical task lists, current state, and durable project memory.",
+            "description": "Create a new route-addressed node by path, or update an existing node by canonical node_id or nap:// URI.",
             "inputSchema": {
                 "type": "object",
-                "required": ["path"],
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "description": "Route path for creating a new node. Existing-node updates require node_id or uri."},
+                    "node_id": {"type": "string", "description": "Canonical node UUID for updating an existing node."},
+                    "uri": {"type": "string", "description": "Canonical nap://project-name/project-id/node-id URI for updating an existing node."},
                     "content_text": {"type": "string"},
                     "type": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},

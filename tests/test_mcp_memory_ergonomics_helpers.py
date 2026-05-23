@@ -278,6 +278,18 @@ def test_tools_include_node_by_path_descriptor(mod):
         assert "uri" in schema["properties"]
         assert "path" not in schema["properties"]
 
+    tee_schema = next(item for item in mod.tools() if item["name"] == "nap_tee")["inputSchema"]
+    assert tee_schema.get("required") is None
+    assert "path" in tee_schema["properties"]
+    assert "node_id" in tee_schema["properties"]
+    assert "uri" in tee_schema["properties"]
+
+    bulk_node_schema = next(item for item in mod.tools() if item["name"] == "nap_bulk")["inputSchema"]["properties"]["nodes"]["items"]
+    assert bulk_node_schema.get("required") is None
+    assert "path" in bulk_node_schema["properties"]
+    assert "node_id" in bulk_node_schema["properties"]
+    assert "uri" in bulk_node_schema["properties"]
+
     for name in [
         "nap_kanban_start",
         "nap_kanban_send_review",
@@ -327,6 +339,48 @@ def test_mutation_tools_reject_path_and_patch_by_node_id(mod):
 
     with pytest.raises(RuntimeError, match="path is an index/route only"):
         mod.update_node_by_path({"path": "/notes/current", "content_text": "bad"})
+
+
+def test_tee_and_bulk_create_by_path_update_by_identity(mod):
+    existing = node("/notes/current", "active", node_type="note")
+    existing["id"] = "node-123"
+    writes = []
+
+    mod.try_get_node_by_path = lambda path, allow_agent=False: existing if path == "/notes/current" else None
+    mod.get_node_by_id = lambda args: existing
+    mod.request_project_write = lambda method, path, payload, *args, **kwargs: writes.append((method, path, payload, args)) or {
+        **existing,
+        "id": "node-123" if method == "PATCH" else "node-new",
+        "full_path": "/notes/new" if method == "POST" else existing["full_path"],
+        "content_text": payload.get("content_text", existing["content_text"]),
+    }
+    mod.index_node = lambda node: None
+    mod.acquire_project_lock = lambda args: {"id": "lock-1", "lease_token": "lease-1"}
+    mod.lock_headers = lambda lock: {"X-Lock": lock["id"]}
+    mod.release_project_lock = lambda args: None
+    mod.request_json = lambda method, path, payload=None, **kwargs: writes.append((method, path, payload, ())) or {
+        **existing,
+        "content_text": payload.get("content_text", existing["content_text"]) if payload else existing["content_text"],
+    }
+
+    created = mod.upsert_node({"path": "/notes/new", "content_text": "new"})
+    assert created["created"] is True
+    assert writes[-1][0] == "POST"
+
+    updated = mod.upsert_node({"node_id": "node-123", "content_text": "updated"})
+    assert updated["updated"] is True
+    assert writes[-1][0] == "PATCH"
+    assert writes[-1][1] == "/v1/projects/project-1/nodes/node-123"
+
+    with pytest.raises(RuntimeError, match="path already resolves"):
+        mod.upsert_node({"path": "/notes/current", "content_text": "bad"})
+
+    bulk = mod.bulk_upsert_nodes({"nodes": [{"node_id": "node-123", "content_text": "bulk update"}]})
+    assert bulk["items"][0]["created"] is False
+    assert writes[-1][1] == "/v1/projects/project-1/nodes/node-123"
+
+    with pytest.raises(RuntimeError, match="path already resolves"):
+        mod.bulk_upsert_nodes({"nodes": [{"path": "/notes/current", "content_text": "bad"}]})
 
 
 def test_discovery_rejects_full_content_view(mod):
