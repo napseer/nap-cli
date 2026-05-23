@@ -272,6 +272,48 @@ def test_tools_include_node_by_path_descriptor(mod):
         if view:
             assert "full" not in view["enum"]
 
+    for name in ["nap_patch", "nap_node_patch", "nap_rm"]:
+        schema = next(item for item in mod.tools() if item["name"] == name)["inputSchema"]
+        assert "node_id" in schema["properties"]
+        assert "uri" in schema["properties"]
+        assert "path" not in schema["properties"]
+
+
+def test_mutation_tools_reject_path_and_patch_by_node_id(mod):
+    found = node("/notes/current", "active", node_type="note")
+    found["id"] = "node-123"
+    writes = []
+
+    mod.get_node_by_id = lambda args: found
+    mod.request_project_write = lambda method, path, payload, *args, **kwargs: writes.append((method, path, payload, args)) or {
+        **found,
+        "content_text": payload.get("content_text", found["content_text"]) if payload else found["content_text"],
+    }
+    mod.index_node = lambda node: None
+    mod.remove_indexed_node = lambda node_id: None
+
+    updated = mod.update_node_by_path({"node_id": "node-123", "content_text": "updated"})
+    assert updated["updated"] is True
+    assert writes[-1][0] == "PATCH"
+    assert writes[-1][1] == "/v1/projects/project-1/nodes/node-123"
+    assert writes[-1][3][2:] == ("node", "node-123")
+
+    patched = mod.guarded_node_patch({
+        "node_id": "node-123",
+        "precondition": {"revision": "r1", "read_fingerprint": "fp1"},
+        "set": {"metadata": {"status": "active"}},
+    })
+    assert patched["id"] == "node-123"
+    assert writes[-1][1] == "/v1/projects/project-1/nodes/node-123"
+
+    archived = mod.archive_node_by_path({"node_id": "node-123"})
+    assert archived["archived"] is True
+    assert writes[-1][0] == "DELETE"
+    assert writes[-1][1] == "/v1/projects/project-1/nodes/node-123"
+
+    with pytest.raises(RuntimeError, match="path is an index/route only"):
+        mod.update_node_by_path({"path": "/notes/current", "content_text": "bad"})
+
 
 def test_discovery_rejects_full_content_view(mod):
     with pytest.raises(RuntimeError, match="full node bodies require nap_node_get"):

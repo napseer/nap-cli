@@ -7662,8 +7662,9 @@ def node_by_path(args):
 
 
 def guarded_node_patch(args):
-    reject_agent_namespace_path(args["path"])
     project_id = resolve_project_id(args)
+    existing = resolve_existing_node_ref(args, view="edit")
+    node_id = existing["id"]
     precondition = args.get("precondition") or {}
     if not args.get("dry_run"):
         if not precondition.get("revision") or not precondition.get("read_fingerprint"):
@@ -7690,28 +7691,28 @@ def guarded_node_patch(args):
     ]:
         if key in args:
             payload[key] = args[key]
-    path = normalize_node_path(args["path"])
     result = request_project_write(
         "PATCH",
-        f"/v1/projects/{project_id}/nodes/by-path?{rest_query_string({'path': path})}",
+        f"/v1/projects/{project_id}/nodes/{urllib.parse.quote(node_id, safe='')}",
         payload,
         project_id,
-        f"guarded patch node {path}",
-        "path",
-        path,
+        f"guarded patch node {existing.get('full_path') or node_id}",
+        "node",
+        node_id,
     )
     node = ((result.get("data") or {}).get("node") or {}) if isinstance(result, dict) else {}
     if node:
         index_node(node)
     if not isinstance(result, dict):
-        return {"ok": True, "changed": True, "path": path}
+        return {"ok": True, "changed": True, "id": node_id, "path": existing.get("full_path")}
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     compact = {
         "ok": bool(result.get("ok", True)),
         "status": result.get("status") or ("dry_run" if args.get("dry_run") else "updated"),
         "changed": not bool(data.get("dry_run")),
         "dry_run": bool(data.get("dry_run")),
-        "path": node.get("full_path") or path,
+        "id": node.get("id") or node_id,
+        "path": node.get("full_path") or existing.get("full_path"),
     }
     if data.get("revision"):
         compact["revision"] = data["revision"]
@@ -7734,11 +7735,13 @@ def try_get_node_by_path(path, allow_agent=False):
 
 
 def node_payload_from_args(args, existing=None):
-    parts = path_parts(args["path"])
     payload = {}
-    if not existing or "path" in args:
+    if "path" in args:
+        parts = path_parts(args["path"])
         payload["folder_path"] = parts["folder_path"]
         payload["name"] = parts["name"]
+    elif not existing:
+        raise RuntimeError("path is required when creating a node")
     for source, target in [
         ("type", "type"),
         ("content_text", "content_text"),
@@ -7762,6 +7765,22 @@ def node_payload_from_args(args, existing=None):
     if "metadata" not in payload and not existing:
         payload["metadata"] = {}
     return payload
+
+
+def resolve_existing_node_ref(args, view="render"):
+    if args.get("path"):
+        if args.get("_internal_path_ref"):
+            return read_node_by_path({"path": args["path"]})
+        raise RuntimeError("path is an index/route only; resolve it with nap_node_by_path, then use node_id or uri")
+    if args.get("uri"):
+        resolved = node_by_uri({"uri": args["uri"], "view": view})["node"]
+    elif args.get("node_id") or args.get("id"):
+        resolved = get_node_by_id({"node_id": args.get("node_id") or args.get("id"), "view": view})
+    else:
+        raise RuntimeError("one of node_id or uri is required")
+    if is_agent_namespace_path(resolved.get("full_path") or ""):
+        reject_agent_namespace_path(resolved.get("full_path") or "")
+    return resolved
 
 
 def upsert_node(args):
@@ -7797,17 +7816,16 @@ def upsert_node(args):
 
 
 def update_node_by_path(args):
-    reject_agent_namespace_path(args["path"])
     project_id = resolve_project_id(args)
-    existing = read_node_by_path({"path": args["path"]})
+    existing = resolve_existing_node_ref(args)
     updated = request_project_write(
         "PATCH",
         f"/v1/projects/{project_id}/nodes/{existing['id']}",
         encrypt_node_payload_for_write(project_id, node_payload_from_args(args, existing=existing), existing=existing),
         project_id,
         f"update node {existing['full_path']}",
-        "path",
-        existing["full_path"],
+        "node",
+        existing["id"],
     )
     index_node(updated)
     node = decrypt_node_for_return(updated, project_id=project_id)
@@ -7815,9 +7833,8 @@ def update_node_by_path(args):
 
 
 def archive_node_by_path(args):
-    reject_agent_namespace_path(args["path"])
     project_id = resolve_project_id(args)
-    existing = read_node_by_path({"path": args["path"]})
+    existing = resolve_existing_node_ref(args)
     if args.get("dry_run"):
         return {"ok": True, "changed": False, "dry_run": True, "archived": False, "paths": [existing["full_path"]]}
     request_project_write(
@@ -7826,8 +7843,8 @@ def archive_node_by_path(args):
         None,
         project_id,
         f"archive node {existing['full_path']}",
-        "path",
-        existing["full_path"],
+        "node",
+        existing["id"],
     )
     remove_indexed_node(existing["id"])
     return {"ok": True, "changed": True, "dry_run": False, "archived": True, "paths": [existing["full_path"]], "id": existing["id"]}
@@ -8805,7 +8822,7 @@ def update_kanban_card(args):
     }
     if "content_text" in args or "body" in args:
         payload["content_text"] = args.get("content_text") if "content_text" in args else args.get("body")
-    updated = update_node_by_path(payload)
+    updated = update_node_by_path({**payload, "_internal_path_ref": True})
     return {"ok": True, "changed": True, "updated": True, "path": updated.get("path") or existing["full_path"], "column": kanban_column(existing)}
 
 
@@ -9036,12 +9053,12 @@ def plan_lifecycle_update(args, *, action, terminal_status, required_target_key,
 
     updated = node
     if planned_changes != ["archive node"]:
-        update_node_by_path({"path": path, "metadata": metadata, "tags": tags, "links": links})
+        update_node_by_path({"path": path, "metadata": metadata, "tags": tags, "links": links, "_internal_path_ref": True})
         updated = dict(node)
         updated["metadata"] = metadata
         updated["tags"] = tags
         updated["links"] = links
-    archive_result = archive_node_by_path({"path": path})
+    archive_result = archive_node_by_path({"path": path, "_internal_path_ref": True})
     return plan_lifecycle_result(
         action,
         path,
@@ -11292,12 +11309,12 @@ def raw_tools():
         },
         {
             "name": "nap_patch",
-            "description": "Update an existing node by full path using an auto-acquired project lock. Fails if the node does not exist.",
+            "description": "Update an existing node by canonical node_id or nap:// URI using an auto-acquired node lock. Fails if the node does not exist.",
             "inputSchema": {
                 "type": "object",
-                "required": ["path"],
                 "properties": {
-                    "path": {"type": "string"},
+                    "node_id": {"type": "string", "description": "Canonical node UUID."},
+                    "uri": {"type": "string", "description": "Canonical nap://project-name/project-id/node-id URI."},
                     "content_text": {"type": "string"},
                     "type": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
@@ -11364,9 +11381,9 @@ def raw_tools():
             "description": "Fingerprint-guarded object-first node patch. Non-dry-run calls require precondition.revision and precondition.read_fingerprint from nap_node_get.",
             "inputSchema": {
                 "type": "object",
-                "required": ["path"],
                 "properties": {
-                    "path": {"type": "string"},
+                    "node_id": {"type": "string", "description": "Canonical node UUID."},
+                    "uri": {"type": "string", "description": "Canonical nap://project-name/project-id/node-id URI."},
                     "mode": {"type": "string", "enum": ["object_patch", "replace_editable_fields"], "default": "object_patch"},
                     "precondition": {
                         "type": "object",
@@ -11393,11 +11410,14 @@ def raw_tools():
         },
         {
             "name": "nap_rm",
-            "description": "Archive an existing node by full path using an auto-acquired project lock.",
+            "description": "Archive an existing node by canonical node_id or nap:// URI using an auto-acquired node lock.",
             "inputSchema": {
                 "type": "object",
-                "required": ["path"],
-                "properties": {"path": {"type": "string"}, "dry_run": {"type": "boolean", "default": False}},
+                "properties": {
+                    "node_id": {"type": "string", "description": "Canonical node UUID."},
+                    "uri": {"type": "string", "description": "Canonical nap://project-name/project-id/node-id URI."},
+                    "dry_run": {"type": "boolean", "default": False},
+                },
                 "additionalProperties": False,
             },
         },

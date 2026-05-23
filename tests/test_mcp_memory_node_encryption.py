@@ -185,8 +185,9 @@ def run():
     else:
         raise AssertionError("encrypted projects must fail closed when memory secret fetch fails")
     try:
+        mod.get_node_by_id = lambda args: encrypted_node(mod, full_path="/notes/alpha")
         mod.guarded_node_patch({
-            "path": "/notes/alpha",
+            "node_id": "node-1",
             "precondition": {"revision": "r1", "read_fingerprint": "fp1"},
             "content_op": {"op": "replace_all", "content_text": "plaintext"},
         })
@@ -363,9 +364,9 @@ def run():
     assert tee_body["encrypted_content_envelope"]["aad_subject"].startswith("encryption_id:")
 
     existing = encrypted_node(mod, full_path="/notes/beta", content="old")
-    mod.get_node_by_path = lambda args, allow_agent=False: dict(existing)
+    mod.get_node_by_id = lambda args: dict(existing)
     writes.clear()
-    patched = mod.update_node_by_path({"path": "/notes/beta", "content_text": "patch secret"})
+    patched = mod.update_node_by_path({"node_id": "node-1", "content_text": "patch secret"})
     patch_body = writes[-1][2]
     assert patched["ok"] is True
     assert patched["updated"] is True
