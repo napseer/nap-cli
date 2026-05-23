@@ -10041,7 +10041,7 @@ def ui_tree_insert(root, node):
     cursor.setdefault("nodes", []).append(node)
 
 
-def ui_render_tree_branch(branch, selected_path, mode, search, prefix=""):
+def ui_render_tree_branch(branch, selected_path, selected_node_id, mode, search, prefix=""):
     folders = branch.get("folders", {})
     nodes = branch.get("nodes", [])
     output = []
@@ -10052,14 +10052,15 @@ def ui_render_tree_branch(branch, selected_path, mode, search, prefix=""):
         output.append(
             f"<details class='folder' {'open' if should_open else ''}>"
             f"<summary><span class='folder-icon'>dir</span>{html.escape(name)}</summary>"
-            f"{ui_render_tree_branch(child, selected_path, mode, search, folder_path)}"
+            f"{ui_render_tree_branch(child, selected_path, selected_node_id, mode, search, folder_path)}"
             "</details>"
         )
     for node in sort_nodes_by_recency(nodes):
         full_path = node.get("full_path") or ""
+        node_id = node.get("id") or ""
         name = full_path.rstrip("/").split("/")[-1] or full_path
-        params = urllib.parse.urlencode({"mode": mode, "q": search, "path": full_path})
-        active = " active" if full_path == selected_path else ""
+        params = urllib.parse.urlencode({"mode": mode, "q": search, "node_id": node_id})
+        active = " active" if node_id and node_id == selected_node_id else ""
         output.append(
             f"<a class='file{active}' href='/?{params}'><span class='file-icon'>node</span>"
             f"<span>{html.escape(name)}</span><small>{html.escape(node.get('type') or 'note')}</small></a>"
@@ -10241,6 +10242,7 @@ def start_local_ui(args):
                     "feedback": [],
                 }
             search = query.get("q", [""])[0]
+            selected_node_id = query.get("node_id", [""])[0]
             selected_path = query.get("path", [""])[0]
             nodes_query = {"limit": 200}
             if search:
@@ -10257,14 +10259,21 @@ def start_local_ui(args):
             agent_nodes = [node for node in all_nodes if is_agent_namespace_path(node.get("full_path") or "")]
             if is_agent_namespace_path(selected_path):
                 selected_path = ""
-            if not selected_path and nodes:
-                selected_path = nodes[0].get("full_path") or ""
-            selected_node = None
-            if selected_path:
+            if not selected_node_id and selected_path:
                 try:
-                    selected_node = read_node_by_path({"path": selected_path})
+                    selected_node_id = (node_by_path({"path": selected_path}).get("identity") or {}).get("node_id") or ""
+                except Exception:
+                    selected_node_id = ""
+            if not selected_node_id and nodes:
+                selected_node_id = nodes[0].get("id") or ""
+            selected_node = None
+            if selected_node_id:
+                try:
+                    selected_node = get_node_by_id({"node_id": selected_node_id})
+                    selected_path = selected_node.get("full_path") or ""
                 except Exception:
                     selected_node = None
+                    selected_path = ""
             schedules = request_json("GET", f"/v1/projects/{project_id}/schedules").get("items", [])
             try:
                 feedback = request_json("GET", "/v1/feedback?limit=50").get("items", [])
@@ -10320,6 +10329,7 @@ def start_local_ui(args):
                 "archived_nodes": archived_nodes,
                 "agent_nodes": agent_nodes,
                 "connected_agents": connected_agents,
+                "selected_node_id": selected_node_id,
                 "selected_path": selected_path,
                 "selected_node": selected_node,
                 "schedules": schedules,
@@ -10453,6 +10463,7 @@ def start_local_ui(args):
                 mode = query.get("mode", ["filesystem"])[0]
                 if mode not in {"filesystem", "path-list"}:
                     mode = "filesystem"
+                selected_node_id = query.get("node_id", [""])[0]
                 selected_path = query.get("path", [""])[0]
                 nodes_query = {"limit": 200}
                 if search:
@@ -10460,32 +10471,40 @@ def start_local_ui(args):
                 nodes_suffix = rest_query_string(nodes_query)
                 nodes = request_json("GET", f"/v1/projects/{project_id}/nodes?{nodes_suffix}").get("items", [])
                 nodes = sort_nodes_by_recency(nodes)
-                if not selected_path and nodes:
-                    selected_path = nodes[0].get("full_path") or ""
-                selected_node = None
-                if selected_path:
+                if not selected_node_id and selected_path:
                     try:
-                        selected_node = read_node_by_path({"path": selected_path})
+                        selected_node_id = (node_by_path({"path": selected_path}).get("identity") or {}).get("node_id") or ""
+                    except Exception:
+                        selected_node_id = ""
+                if not selected_node_id and nodes:
+                    selected_node_id = nodes[0].get("id") or ""
+                selected_node = None
+                if selected_node_id:
+                    try:
+                        selected_node = get_node_by_id({"node_id": selected_node_id})
+                        selected_path = selected_node.get("full_path") or ""
                     except Exception:
                         selected_node = None
+                        selected_path = ""
                 schedules = request_json("GET", f"/v1/projects/{project_id}/schedules").get("items", [])
                 feedback = request_json("GET", "/v1/feedback?limit=50").get("items", [])
                 status = update_status()
                 current_url = "/" + (f"?{parsed_path.query}" if parsed_path.query else "")
-                filesystem_url = "/?" + urllib.parse.urlencode({"mode": "filesystem", "q": search, "path": selected_path})
-                path_list_url = "/?" + urllib.parse.urlencode({"mode": "path-list", "q": search, "path": selected_path})
+                filesystem_url = "/?" + urllib.parse.urlencode({"mode": "filesystem", "q": search, "node_id": selected_node_id})
+                path_list_url = "/?" + urllib.parse.urlencode({"mode": "path-list", "q": search, "node_id": selected_node_id})
                 tree = ui_build_tree(nodes)
-                tree_html = ui_render_tree_branch(tree, selected_path, mode, search)
+                tree_html = ui_render_tree_branch(tree, selected_path, selected_node_id, mode, search)
                 selected_links = ui_json_list((selected_node or {}).get("links") or [])
                 selected_metadata = ui_json((selected_node or {}).get("metadata") or {})
                 selected_tags = ", ".join((selected_node or {}).get("tags") or [])
                 selected_content = html.escape((selected_node or {}).get("content_text") or "")
                 selected_type = html.escape((selected_node or {}).get("type") or "note")
                 selected_path_value = html.escape(selected_path or "")
+                selected_node_id_value = html.escape(selected_node_id or "")
                 selected_title = html.escape(selected_path or "New node")
                 selected_badges = ui_tags((selected_node or {}).get("tags") or [])
                 node_rows = "".join(
-                    f"<tr><td><a class='path-link' href='/?{rest_query_string({'mode': 'filesystem', 'path': item['full_path'], 'q': search})}'><code>{html.escape(item['full_path'])}</code></a></td><td>{ui_tags(item.get('tags') or [])}</td><td>{html.escape(item.get('type') or 'note')}</td><td><form method='post' action='/nodes/archive'><input type='hidden' name='return_to' value='/?{rest_query_string({'mode': mode, 'q': search})}'><input type='hidden' name='path' value='{html.escape(item['full_path'])}'><button class='ghost'>Archive</button></form></td></tr>"
+                    f"<tr><td><a class='path-link' href='/?{rest_query_string({'mode': 'filesystem', 'node_id': item.get('id') or '', 'q': search})}'><code>{html.escape(item['full_path'])}</code></a></td><td>{ui_tags(item.get('tags') or [])}</td><td>{html.escape(item.get('type') or 'note')}</td><td><form method='post' action='/nodes/archive'><input type='hidden' name='return_to' value='/?{rest_query_string({'mode': mode, 'q': search})}'><input type='hidden' name='node_id' value='{html.escape(item.get('id') or '')}'><button class='ghost'>Archive</button></form></td></tr>"
                     for item in nodes
                 )
                 schedule_rows = "".join(
@@ -10516,13 +10535,13 @@ def start_local_ui(args):
 {f'''
 <div class="workspace"><aside class="side"><div class="side-head"><strong>Files</strong><span class="muted">{len(nodes)} nodes</span></div><div class="tree">{tree_html or '<div class="empty">No nodes found.</div>'}</div></aside>
 <div class="detail"><div class="detail-head"><div class="selected-title"><strong>{selected_title}</strong></div><div>{selected_badges}</div></div><div class="detail-body">
-<form method="post" action="/nodes/upsert"><input type="hidden" name="return_to" value="{html.escape(current_url)}"><h3>{'Edit node' if selected_node else 'Create node'}</h3>
+<form method="post" action="/nodes/upsert"><input type="hidden" name="return_to" value="{html.escape(current_url)}"><input type="hidden" name="node_id" value="{selected_node_id_value}"><h3>{'Edit node' if selected_node else 'Create node'}</h3>
 <label>Full path<input name="path" required value="{selected_path_value}" placeholder="/decisions/auth-model"></label>
 <div class="grid"><label>Type<input name="type" value="{selected_type}"></label><label>Tags CSV<input name="tags" value="{html.escape(selected_tags)}" placeholder="decision, auth"></label></div>
 <label>Content<textarea name="content_text">{selected_content}</textarea></label>
 <div class="grid"><label>Links JSON<textarea class="mono" name="links">{selected_links}</textarea></label><label>Metadata JSON<textarea class="mono" name="metadata">{selected_metadata}</textarea></label></div>
 <div class="actions"><button>Save node</button><a class="button ghost" href="/?mode=filesystem&q={urllib.parse.quote(search)}">New node</a></div></form>
-<form method="post" action="/nodes/link"><input type="hidden" name="return_to" value="{html.escape(current_url)}"><h3>Link nodes</h3><div class="grid"><label>Source path<input name="source_path" value="{selected_path_value}" required></label><label>Target path<input name="target_path" required></label><label>Relation<input name="relation" value="references"></label></div><button class="ghost">Create link</button></form>
+<form method="post" action="/nodes/link"><input type="hidden" name="return_to" value="{html.escape(current_url)}"><h3>Link nodes</h3><div class="grid"><label>Source node id<input name="source_node_id" value="{selected_node_id_value}" required></label><label>Target node id<input name="target_node_id" required></label><label>Relation<input name="relation" value="references"></label></div><button class="ghost">Create link</button></form>
 </div></div></div>''' if mode == 'filesystem' else f'''
 <div class="detail"><table><thead><tr><th>Path</th><th>Tags</th><th>Type</th><th>Action</th></tr></thead><tbody>{node_rows or '<tr><td colspan="4" class="muted">No nodes.</td></tr>'}</tbody></table></div>'''}
 </section>
@@ -10600,20 +10619,24 @@ def start_local_ui(args):
                         "payload": json.loads((form.get("payload", ["{}"])[0] or "{}")),
                     })
                 elif self.path == "/nodes/upsert":
-                    upsert_node({
+                    node_id = form.get("node_id", [""])[0].strip()
+                    payload = {
                         "path": form.get("path", [""])[0],
                         "type": form.get("type", ["note"])[0],
                         "tags": [tag.strip() for tag in form.get("tags", [""])[0].split(",") if tag.strip()],
                         "links": json.loads(form.get("links", ["[]"])[0] or "[]"),
                         "metadata": json.loads(form.get("metadata", ["{}"])[0] or "{}"),
                         "content_text": form.get("content_text", [""])[0],
-                    })
+                    }
+                    if node_id:
+                        payload["node_id"] = node_id
+                    upsert_node(payload)
                 elif self.path == "/nodes/archive":
-                    archive_node_by_path({"path": form.get("path", [""])[0]})
+                    archive_node_by_path({"node_id": form.get("node_id", [""])[0]})
                 elif self.path == "/nodes/link":
                     link_nodes({
-                        "source_path": form.get("source_path", [""])[0],
-                        "target_path": form.get("target_path", [""])[0],
+                        "source_node_id": form.get("source_node_id", [""])[0],
+                        "target_node_id": form.get("target_node_id", [""])[0],
                         "relation": form.get("relation", ["references"])[0],
                     })
                 elif self.path == "/auth/renew":

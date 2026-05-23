@@ -632,6 +632,18 @@ def test_context_and_related_use_identity_inputs(mod):
         mod.find_related_nodes({"path": "/notes/root"})
 
 
+def test_local_helper_ui_forms_submit_identity_for_existing_node_actions():
+    source = (pathlib.Path(__file__).resolve().parents[1] / "resources" / "scripts" / "napseer_mcp_server.py").read_text()
+    assert "name='node_id' value='{html.escape(item.get('id') or '')}'" in source
+    assert 'name="source_node_id"' in source
+    assert 'name="target_node_id"' in source
+    assert 'archive_node_by_path({"node_id": form.get("node_id", [""])[0]})' in source
+    assert '"source_node_id": form.get("source_node_id", [""])[0]' in source
+    assert '"target_node_id": form.get("target_node_id", [""])[0]' in source
+    assert 'name="source_path"' not in source
+    assert 'name="target_path"' not in source
+
+
 def test_discovery_rejects_full_content_view(mod):
     with pytest.raises(RuntimeError, match="full node bodies require nap_node_get"):
         mod.list_project_nodes({"view": "full"})
