@@ -9707,6 +9707,22 @@ def agent_node_args(args, key="path"):
     return scoped
 
 
+def resolve_node_ref_allow_agent(args, *, agent_slug=None):
+    if args.get("path"):
+        raise RuntimeError("path is an index/route only; resolve it with nap_node_by_path, then use node_id or uri")
+    if args.get("uri"):
+        resolved = node_by_uri({"uri": args["uri"], "view": args.get("view", "render")})["node"]
+    elif args.get("node_id") or args.get("id"):
+        resolved = get_node_by_id({"node_id": args.get("node_id") or args.get("id"), "view": args.get("view", "render")})
+    else:
+        raise RuntimeError("one of node_id or uri is required")
+    if agent_slug:
+        root = agent_root_path(agent_slug)
+        if not (resolved.get("full_path") or "").startswith(f"{root}/"):
+            raise RuntimeError(f"node is not inside /agents/{agent_slug}")
+    return resolved
+
+
 def list_agent_nodes(args):
     project_id = resolve_project_id(args)
     root = agent_root_path(agent_slug_from_args(args))
@@ -9727,23 +9743,32 @@ def list_agent_nodes(args):
 
 
 def get_agent_node(args):
-    return read_node_by_path({"path": agent_scoped_path(args)}, allow_agent=True)
+    slug = agent_slug_from_args(args)
+    return resolve_node_ref_allow_agent(args, agent_slug=slug)
 
 
 def upsert_agent_node(args):
-    scoped = agent_node_args(args)
     project_id = resolve_project_id(args)
-    existing = try_get_node_by_path(scoped["path"], allow_agent=True)
-    if existing:
+    slug = agent_slug_from_args(args)
+    if args.get("node_id") or args.get("id") or args.get("uri"):
+        existing = resolve_node_ref_allow_agent(args, agent_slug=slug)
         updated = request_project_write(
             "PATCH",
             f"/v1/projects/{project_id}/nodes/{existing['id']}",
-            node_payload_from_args(scoped, existing=existing),
+            node_payload_from_args(args, existing=existing),
             project_id,
             f"update agent node {existing['full_path']}",
+            "node",
+            existing["id"],
         )
         index_node(updated)
         return {"ok": True, "changed": True, "created": False, "updated": True, **node_write_reference(updated)}
+    if not args.get("path"):
+        raise RuntimeError("path is required when creating an agent node; use node_id or uri to update an existing node")
+    scoped = agent_node_args(args)
+    existing = try_get_node_by_path(scoped["path"], allow_agent=True)
+    if existing:
+        raise RuntimeError("path already resolves to an agent node; use node_id or uri to update it")
     created = request_project_write(
         "POST",
         f"/v1/projects/{project_id}/nodes",
@@ -9756,30 +9781,34 @@ def upsert_agent_node(args):
 
 
 def update_agent_node(args):
-    scoped = agent_node_args(args)
+    slug = agent_slug_from_args(args)
     project_id = resolve_project_id(args)
-    existing = read_node_by_path({"path": scoped["path"]}, allow_agent=True)
+    existing = resolve_node_ref_allow_agent(args, agent_slug=slug)
     updated = request_project_write(
         "PATCH",
         f"/v1/projects/{project_id}/nodes/{existing['id']}",
-        node_payload_from_args(scoped, existing=existing),
+        node_payload_from_args(args, existing=existing),
         project_id,
         f"update agent node {existing['full_path']}",
+        "node",
+        existing["id"],
     )
     index_node(updated)
     return {"ok": True, "changed": True, "updated": True, **node_write_reference(updated)}
 
 
 def archive_agent_node(args):
-    scoped = agent_node_args(args)
+    slug = agent_slug_from_args(args)
     project_id = resolve_project_id(args)
-    existing = read_node_by_path({"path": scoped["path"]}, allow_agent=True)
+    existing = resolve_node_ref_allow_agent(args, agent_slug=slug)
     request_project_write(
         "DELETE",
         f"/v1/projects/{project_id}/nodes/{existing['id']}",
         None,
         project_id,
         f"archive agent node {existing['full_path']}",
+        "node",
+        existing["id"],
     )
     remove_indexed_node(existing["id"])
     return {"archived": True, "path": existing["full_path"], "id": existing["id"]}
@@ -9788,11 +9817,10 @@ def archive_agent_node(args):
 def link_agent_node(args):
     slug = agent_slug_from_args(args)
     project_id = resolve_project_id(args)
-    source_path = agent_scoped_path({"agent_slug": slug, "path": args["source_path"]})
-    target_raw = str(args.get("target_path") or "").strip()
-    target_path = agent_scoped_path({"agent_slug": slug, "path": target_raw}) if is_agent_namespace_path(target_raw) or not target_raw.startswith("/") else normalize_node_path(target_raw)
-    source = read_node_by_path({"path": source_path}, allow_agent=True)
-    target = read_node_by_path({"path": target_path}, allow_agent=is_agent_namespace_path(target_path))
+    if args.get("source_path") or args.get("target_path"):
+        raise RuntimeError("paths are index/routes only; use source_node_id/target_node_id or source_uri/target_uri")
+    source = resolve_node_ref_allow_agent({"node_id": args.get("source_node_id"), "uri": args.get("source_uri")}, agent_slug=slug)
+    target = resolve_node_ref_allow_agent({"node_id": args.get("target_node_id"), "uri": args.get("target_uri")})
     relation = args.get("relation", "references")
     links = source.get("links") or []
     if not isinstance(links, list):
@@ -9811,6 +9839,8 @@ def link_agent_node(args):
             {"links": links},
             project_id,
             f"link agent node {source['full_path']}",
+            "node",
+            source["id"],
         )
         index_node(updated)
     else:
@@ -11640,23 +11670,29 @@ def raw_tools():
         },
         {
             "name": "nap_agent_cat",
-            "description": "Read one file inside /agents/{agent_slug}. Path may be relative to the agent root.",
+            "description": "Read one existing node inside /agents/{agent_slug} by canonical node_id or nap:// URI.",
             "inputSchema": {
                 "type": "object",
-                "required": ["agent_slug", "path"],
-                "properties": {"agent_slug": {"type": "string"}, "path": {"type": "string"}},
+                "required": ["agent_slug"],
+                "properties": {
+                    "agent_slug": {"type": "string"},
+                    "node_id": {"type": "string"},
+                    "uri": {"type": "string"},
+                },
                 "additionalProperties": False,
             },
         },
         {
             "name": "nap_agent_tee",
-            "description": "Create or update a file inside /agents/{agent_slug} using an auto-acquired project lock. Use this for agent profile, role, personality, rules, and memory.",
+            "description": "Create a route-addressed node inside /agents/{agent_slug}, or update an existing agent node by canonical node_id or nap:// URI.",
             "inputSchema": {
                 "type": "object",
-                "required": ["agent_slug", "path"],
+                "required": ["agent_slug"],
                 "properties": {
                     "agent_slug": {"type": "string"},
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "description": "Route path for creating a new agent node. Existing-node updates require node_id or uri."},
+                    "node_id": {"type": "string"},
+                    "uri": {"type": "string"},
                     "content_text": {"type": "string"},
                     "type": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
@@ -11669,13 +11705,14 @@ def raw_tools():
         },
         {
             "name": "nap_agent_patch",
-            "description": "Update an existing file inside /agents/{agent_slug}.",
+            "description": "Update an existing node inside /agents/{agent_slug} by canonical node_id or nap:// URI.",
             "inputSchema": {
                 "type": "object",
-                "required": ["agent_slug", "path"],
+                "required": ["agent_slug"],
                 "properties": {
                     "agent_slug": {"type": "string"},
-                    "path": {"type": "string"},
+                    "node_id": {"type": "string"},
+                    "uri": {"type": "string"},
                     "content_text": {"type": "string"},
                     "type": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
@@ -11688,24 +11725,30 @@ def raw_tools():
         },
         {
             "name": "nap_agent_rm",
-            "description": "Archive a file inside /agents/{agent_slug}.",
+            "description": "Archive an existing node inside /agents/{agent_slug} by canonical node_id or nap:// URI.",
             "inputSchema": {
                 "type": "object",
-                "required": ["agent_slug", "path"],
-                "properties": {"agent_slug": {"type": "string"}, "path": {"type": "string"}},
+                "required": ["agent_slug"],
+                "properties": {
+                    "agent_slug": {"type": "string"},
+                    "node_id": {"type": "string"},
+                    "uri": {"type": "string"},
+                },
                 "additionalProperties": False,
             },
         },
         {
             "name": "nap_agent_ln",
-            "description": "Create a graph link from an agent file to another node. Agent source is scoped by agent_slug.",
+            "description": "Create a graph link from an existing agent node to another existing node by canonical node identities.",
             "inputSchema": {
                 "type": "object",
-                "required": ["agent_slug", "source_path", "target_path"],
+                "required": ["agent_slug"],
                 "properties": {
                     "agent_slug": {"type": "string"},
-                    "source_path": {"type": "string"},
-                    "target_path": {"type": "string"},
+                    "source_node_id": {"type": "string"},
+                    "source_uri": {"type": "string"},
+                    "target_node_id": {"type": "string"},
+                    "target_uri": {"type": "string"},
                     "relation": {"type": "string", "default": "references"},
                 },
                 "additionalProperties": False,

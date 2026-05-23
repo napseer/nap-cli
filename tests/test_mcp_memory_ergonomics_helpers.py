@@ -348,6 +348,26 @@ def test_tools_include_node_by_path_descriptor(mod):
     assert "plan_uri" in plan_to_kanban_schema["properties"]
     assert "plan_path" not in plan_to_kanban_schema["properties"]
 
+    for name in ["nap_agent_cat", "nap_agent_patch", "nap_agent_rm"]:
+        schema = next(item for item in mod.tools() if item["name"] == name)["inputSchema"]
+        assert schema["required"] == ["agent_slug"]
+        assert "node_id" in schema["properties"]
+        assert "uri" in schema["properties"]
+        assert "path" not in schema["properties"]
+
+    agent_tee_schema = next(item for item in mod.tools() if item["name"] == "nap_agent_tee")["inputSchema"]
+    assert agent_tee_schema["required"] == ["agent_slug"]
+    assert "path" in agent_tee_schema["properties"]
+    assert "node_id" in agent_tee_schema["properties"]
+    assert "uri" in agent_tee_schema["properties"]
+
+    agent_ln_schema = next(item for item in mod.tools() if item["name"] == "nap_agent_ln")["inputSchema"]
+    assert agent_ln_schema["required"] == ["agent_slug"]
+    assert "source_node_id" in agent_ln_schema["properties"]
+    assert "target_node_id" in agent_ln_schema["properties"]
+    assert "source_path" not in agent_ln_schema["properties"]
+    assert "target_path" not in agent_ln_schema["properties"]
+
 
 def test_mutation_tools_reject_path_and_patch_by_node_id(mod):
     found = node("/notes/current", "active", node_type="note")
@@ -483,6 +503,67 @@ def test_tee_and_bulk_create_by_path_update_by_identity(mod):
 
     with pytest.raises(RuntimeError, match="path already resolves"):
         mod.bulk_upsert_nodes({"nodes": [{"path": "/notes/current", "content_text": "bad"}]})
+
+
+def test_agent_tools_create_by_route_and_update_by_identity(mod):
+    agent_file = node("/agents/alice/memory/current", "active", node_type="agent-file")
+    agent_file["id"] = "agent-node-123"
+    target = node("/notes/target", "active", node_type="note")
+    target["id"] = "target-123"
+    writes = []
+
+    def fake_get_node_by_id(args):
+        node_id = args.get("node_id")
+        if node_id == "agent-node-123":
+            return agent_file
+        if node_id == "target-123":
+            return target
+        raise AssertionError(f"unexpected node_id {node_id}")
+
+    mod.get_node_by_id = fake_get_node_by_id
+    mod.try_get_node_by_path = lambda path, allow_agent=False: agent_file if path == "/agents/alice/memory/current" else None
+    mod.request_project_write = lambda method, path, payload, *args, **kwargs: writes.append((method, path, payload, args)) or {
+        **agent_file,
+        "id": "agent-node-new" if method == "POST" else agent_file["id"],
+        "full_path": f"{payload.get('folder_path')}/{payload.get('name')}" if method == "POST" else agent_file["full_path"],
+        "content_text": payload.get("content_text", agent_file["content_text"]) if payload else agent_file["content_text"],
+        "links": payload.get("links", agent_file["links"]) if payload else agent_file["links"],
+    }
+    mod.index_node = lambda node: None
+    mod.remove_indexed_node = lambda node_id: None
+
+    read = mod.get_agent_node({"agent_slug": "alice", "node_id": "agent-node-123"})
+    assert read["id"] == "agent-node-123"
+
+    created = mod.upsert_agent_node({"agent_slug": "alice", "path": "/memory/new", "content_text": "new"})
+    assert created["created"] is True
+    assert writes[-1][0] == "POST"
+    assert writes[-1][2]["folder_path"] == "/agents/alice/memory"
+
+    updated = mod.upsert_agent_node({"agent_slug": "alice", "node_id": "agent-node-123", "content_text": "updated"})
+    assert updated["updated"] is True
+    assert writes[-1][1] == "/v1/projects/project-1/nodes/agent-node-123"
+    assert writes[-1][3][2:] == ("node", "agent-node-123")
+
+    patched = mod.update_agent_node({"agent_slug": "alice", "node_id": "agent-node-123", "content_text": "patched"})
+    assert patched["updated"] is True
+
+    archived = mod.archive_agent_node({"agent_slug": "alice", "node_id": "agent-node-123"})
+    assert archived["archived"] is True
+    assert writes[-1][0] == "DELETE"
+    assert writes[-1][3][2:] == ("node", "agent-node-123")
+
+    linked = mod.link_agent_node({"agent_slug": "alice", "source_node_id": "agent-node-123", "target_node_id": "target-123"})
+    assert linked["created"] is True
+    assert writes[-1][2]["links"] == [{"path": "/notes/target", "relation": "references"}]
+    assert writes[-1][3][2:] == ("node", "agent-node-123")
+
+    with pytest.raises(RuntimeError, match="path already resolves"):
+        mod.upsert_agent_node({"agent_slug": "alice", "path": "/memory/current", "content_text": "bad"})
+    with pytest.raises(RuntimeError, match="path is an index/route only"):
+        mod.update_agent_node({"agent_slug": "alice", "path": "/memory/current", "content_text": "bad"})
+    with pytest.raises(RuntimeError, match="paths are index/routes only"):
+        mod.link_agent_node({"agent_slug": "alice", "source_path": "/memory/current", "target_path": "/notes/target"})
 
 
 def test_discovery_rejects_full_content_view(mod):
