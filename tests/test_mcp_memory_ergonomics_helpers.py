@@ -96,8 +96,27 @@ def test_node_by_path_returns_canonical_identity_uri(mod):
         assert method == "GET"
         assert "/nodes/by-path?" in path
         assert "path=%2Fdocumentation%2Fproduct%2Fprd" in path
-        assert "view=render" in path
-        return found
+        assert "view=render" not in path
+        return {
+            "identity": {
+                "node_id": "node-123",
+                "canonical_uri": "nap://napseer/project-1/node-123",
+                "project_id": "project-1",
+                "project_name": "napseer",
+                "lookup_kind": "path",
+                "lookup_value": "/documentation/product/prd",
+                "legacy_full_path": "/documentation/product/prd",
+            },
+            "route": {
+                "id": "node-123",
+                "project_id": "project-1",
+                "full_path": "/documentation/product/prd",
+                "type": "product_spec",
+                "name": "prd",
+                "folder_path": "/documentation/product",
+            },
+            "warnings": ["Path lookup is index/route resolution only."],
+        }
 
     mod.request_json = fake_request
     result = mod.node_by_path({"path": "documentation/product/prd"})
@@ -117,6 +136,30 @@ def test_node_by_path_returns_canonical_identity_uri(mod):
     assert "preview" not in result["route"]
     assert "read_fingerprint" not in result["route"]
     assert "Path lookup is index/route resolution only" in result["warnings"][0]
+
+
+def test_path_resolver_then_read_uses_node_id_route(mod):
+    calls = []
+
+    def fake_request(method, path, payload=None, **kwargs):
+        calls.append(path)
+        assert method == "GET"
+        if "/nodes/by-path?" in path:
+            assert "view=" not in path
+            return {
+                "identity": {"node_id": "node-123", "project_id": "project-1"},
+                "route": {"id": "node-123", "project_id": "project-1", "full_path": "/documentation/product/prd"},
+            }
+        assert path == "/v1/projects/project-1/nodes/node-123"
+        return {**node("/documentation/product/prd", "active", node_type="product_spec"), "id": "node-123"}
+
+    mod.request_json = fake_request
+    result = mod.read_node_by_path({"path": "/documentation/product/prd"})
+    assert result["id"] == "node-123"
+    assert calls == [
+        "/v1/projects/project-1/nodes/by-path?path=%2Fdocumentation%2Fproduct%2Fprd",
+        "/v1/projects/project-1/nodes/node-123",
+    ]
 
 
 def test_node_by_id_returns_canonical_identity_uri(mod):
@@ -222,6 +265,31 @@ def test_tools_include_node_by_path_descriptor(mod):
     assert "does not read full node content" in tool["description"]
 
     assert all(item["name"] != "nap_cat" for item in mod.tools())
+
+    for name in ["nap_discover", "nap_find", "nap_context", "nap_find_related", "nap_recent"]:
+        schema = next(item for item in mod.tools() if item["name"] == name)["inputSchema"]
+        view = schema["properties"].get("view")
+        if view:
+            assert "full" not in view["enum"]
+
+
+def test_discovery_rejects_full_content_view(mod):
+    with pytest.raises(RuntimeError, match="full node bodies require nap_node_get"):
+        mod.list_project_nodes({"view": "full"})
+
+
+def test_include_content_is_legacy_noop(mod):
+    found = node("/plans/found", "planned", content="body must not be returned")
+
+    def fake_request(method, path, payload=None, **kwargs):
+        assert method == "GET"
+        assert "view=paths" in path
+        return {"items": [found], "next_cursor": None}
+
+    mod.request_json = fake_request
+    result = mod.list_project_nodes({"include_content": True, "view": "paths"})
+    assert result["view"] == "paths"
+    assert "content_text" not in result["items"][0]
 
 
 def test_recent_memory_defaults_to_paths(mod):

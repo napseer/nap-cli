@@ -49,7 +49,7 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-DISCOVERY_VIEWS = {"titles", "paths", "summary", "metadata", "full"}
+DISCOVERY_VIEWS = {"titles", "paths", "summary", "metadata"}
 DISCOVERY_DEFAULT_LIMIT = 25
 DISCOVERY_COMPACT_MAX_LIMIT = 10_000
 DISCOVERY_FULL_MAX_LIMIT = 10_000
@@ -5395,11 +5395,15 @@ def normalize_discovery_view(args, default="summary"):
     requested = str(args.get("view") or "").strip().lower()
     warnings = []
     if requested:
+        if requested == "full" and args.get("_allow_full"):
+            return requested, warnings
         if requested not in DISCOVERY_VIEWS:
-            raise RuntimeError("view must be titles, paths, summary, metadata, or full")
+            raise RuntimeError(
+                "view must be titles, paths, summary, or metadata; full node bodies require nap_node_get by node_id or uri"
+            )
         return requested, warnings
     if as_bool(args.get("include_content"), False):
-        return "full", warnings
+        warnings.append("include_content is ignored; resolve a path and read full content by node_id or uri")
     return default, warnings
 
 
@@ -5522,8 +5526,6 @@ def metadata_summary(node):
 
 
 def summarize_node(node, view="summary", preview_chars=240):
-    if view == "full":
-        return node
     metadata = node_metadata(node)
     status = node_status(node)
     if view == "titles":
@@ -5618,7 +5620,7 @@ def discovery_envelope(project_id, items, args, *, view=None, next_cursor=None, 
         "next_cursor": next_cursor,
         "has_more": bool(has_more) if has_more is not None else bool(next_cursor),
         "truncated": False,
-        "omitted_fields": [] if view == "full" else ["content_text"],
+        "omitted_fields": ["content_text"],
         "budget": {"limit": limit, "max_limit": discovery_max_limit(view), "preview_chars": preview_chars},
     }
     if as_bool(args.get("verbose"), False):
@@ -7559,10 +7561,28 @@ def get_node_by_path(args, allow_agent=False):
     if not allow_agent:
         reject_agent_namespace_path(path)
     params = {"path": path}
-    if args.get("view"):
-        params["view"] = args["view"]
-    node = request_json("GET", f"/v1/projects/{project_id}/nodes/by-path?{rest_query_string(params)}")
-    return decrypt_node_for_return(node, project_id=project_id)
+    payload = request_json("GET", f"/v1/projects/{project_id}/nodes/by-path?{rest_query_string(params)}")
+    if isinstance(payload, dict) and isinstance(payload.get("route"), dict):
+        route = dict(payload["route"])
+        if isinstance(payload.get("identity"), dict):
+            route["identity"] = payload["identity"]
+        if payload.get("warnings"):
+            route["warnings"] = payload["warnings"]
+        return route
+    node = decrypt_node_for_return(payload, project_id=project_id)
+    return node_route_reference(node)
+
+
+def read_node_by_path(args, allow_agent=False):
+    route = get_node_by_path(args, allow_agent=allow_agent)
+    if "content_text" in route and "identity" not in route:
+        return route
+    identity = route.get("identity") if isinstance(route.get("identity"), dict) else {}
+    node_id = identity.get("node_id") or route.get("id")
+    if not node_id:
+        raise RuntimeError("path resolver did not return a node_id")
+    project_id = identity.get("project_id") or route.get("project_id") or resolve_project_id(args)
+    return get_node_by_id({"project_id": project_id, "node_id": node_id, "view": args.get("view", "render")})
 
 
 def get_node_by_id(args):
@@ -7628,13 +7648,14 @@ def node_by_uri(args):
 
 def node_by_path(args):
     path = normalize_node_path(args["path"])
-    node = get_node_by_path({"path": path, "view": "render"})
+    route = get_node_by_path({"path": path})
+    identity = route.get("identity") if isinstance(route.get("identity"), dict) else node_identity_payload(route, project_id=route.get("project_id"), lookup_kind="path", lookup_value=path)
     return {
         "ok": True,
         "status": "resolved",
-        "identity": node_identity_payload(node, project_id=node.get("project_id"), lookup_kind="path", lookup_value=path),
-        "route": node_route_reference(node),
-        "warnings": [
+        "identity": identity,
+        "route": node_route_reference(route),
+        "warnings": route.get("warnings") or [
             "Path lookup is index/route resolution only. Read node content with identity.canonical_uri or identity.node_id."
         ],
     }
@@ -7705,7 +7726,7 @@ def guarded_node_patch(args):
 
 def try_get_node_by_path(path, allow_agent=False):
     try:
-        return get_node_by_path({"path": path}, allow_agent=allow_agent)
+        return read_node_by_path({"path": path}, allow_agent=allow_agent)
     except RuntimeError as exc:
         if "HTTP 404" in str(exc):
             return None
@@ -7778,7 +7799,7 @@ def upsert_node(args):
 def update_node_by_path(args):
     reject_agent_namespace_path(args["path"])
     project_id = resolve_project_id(args)
-    existing = get_node_by_path({"path": args["path"]})
+    existing = read_node_by_path({"path": args["path"]})
     updated = request_project_write(
         "PATCH",
         f"/v1/projects/{project_id}/nodes/{existing['id']}",
@@ -7796,7 +7817,7 @@ def update_node_by_path(args):
 def archive_node_by_path(args):
     reject_agent_namespace_path(args["path"])
     project_id = resolve_project_id(args)
-    existing = get_node_by_path({"path": args["path"]})
+    existing = read_node_by_path({"path": args["path"]})
     if args.get("dry_run"):
         return {"ok": True, "changed": False, "dry_run": True, "archived": False, "paths": [existing["full_path"]]}
     request_project_write(
@@ -7840,8 +7861,8 @@ def link_nodes(args):
     reject_agent_namespace_path(args["source_path"], "source_path")
     reject_agent_namespace_path(args["target_path"], "target_path")
     project_id = resolve_project_id(args)
-    source = get_node_by_path({"path": args["source_path"]})
-    target = get_node_by_path({"path": args["target_path"]})
+    source = read_node_by_path({"path": args["source_path"]})
+    target = read_node_by_path({"path": args["target_path"]})
     relation = args.get("relation", "references")
     links = source.get("links") or []
     if not isinstance(links, list):
@@ -8320,6 +8341,7 @@ def list_kanban_cards(args):
         "q": "/kanban",
         "limit": DISCOVERY_SOURCE_PAGE_LIMIT,
         "view": "full",
+        "_allow_full": True,
         "include_archived": not active_only,
         "archived_only": False,
     }
@@ -8432,7 +8454,7 @@ def list_kanban_cards(args):
     if as_bool(args.get("verbose"), False):
         response["diagnostics"] = {
             "source": "nodes",
-            "source_query": {"q": "/kanban", "view": "full", "limit": DISCOVERY_SOURCE_PAGE_LIMIT},
+            "source_query": {"q": "/kanban", "view": "internal-full", "limit": DISCOVERY_SOURCE_PAGE_LIMIT},
             "source_page_count": source_pages,
             "source_item_count": len(source_items),
             "filtered_item_count": len(items),
@@ -8504,7 +8526,7 @@ def pick_next_kanban_card(args):
 
 
 def kanban_card_by_path(path):
-    node = get_node_by_path({"path": normalize_node_path(path), "view": "render"})
+    node = read_node_by_path({"path": normalize_node_path(path), "view": "render"})
     if not normalize_node_path(node.get("full_path") or "").startswith("/kanban/"):
         raise RuntimeError("kanban command path must reference a /kanban card")
     return node
@@ -8662,12 +8684,14 @@ def lineage_status(args):
         "folder_path": "/plans",
         "limit": limit,
         "view": "full",
+        "_allow_full": True,
         "include_archived": include_archived,
     }).get("items", [])
     kanban_nodes = list_project_nodes({
         "q": "/kanban",
         "limit": limit,
         "view": "full",
+        "_allow_full": True,
         "include_archived": True,
     }).get("items", [])
     cards = [node for node in kanban_nodes if is_kanban_card_node_path(node.get("full_path") or "")]
@@ -8729,7 +8753,7 @@ def plan_to_kanban_card(args):
     plan_path = normalize_node_path(args.get("plan_path") or args.get("path") or "")
     if not is_plan_node_path(plan_path):
         raise RuntimeError("plan_path must be a /plans/<plan-slug> path")
-    plan = get_node_by_path({"path": plan_path})
+    plan = read_node_by_path({"path": plan_path})
     metadata = node_metadata(plan)
     title = str(args.get("title") or metadata.get("title") or plan.get("name") or "").strip()
     if not title:
@@ -8844,7 +8868,7 @@ def add_tags_once(tags, additions):
 
 def find_archived_node_by_path(path):
     normalized = normalize_node_path(path)
-    result = list_project_nodes({"archived_only": True, "q": normalized, "limit": 200, "view": "full"})
+    result = list_project_nodes({"archived_only": True, "q": normalized, "limit": 200, "view": "full", "_allow_full": True})
     for node in result.get("items", []):
         if normalize_node_path(node.get("full_path") or "") == normalized:
             return node
@@ -8856,7 +8880,7 @@ def get_plan_for_lifecycle(path):
     if not normalized.startswith("/plans/"):
         raise RuntimeError("plan lifecycle helpers only operate on /plans/* nodes")
     try:
-        node = get_node_by_path({"path": normalized})
+        node = read_node_by_path({"path": normalized})
         return node, False
     except RuntimeError as exc:
         if "HTTP 404" not in str(exc) and "node not found" not in str(exc):
@@ -9211,7 +9235,6 @@ def search_memory(args):
     mode = str(args.get("mode") or "hybrid").strip().lower()
     if mode not in {"hybrid", "server", "local"}:
         raise RuntimeError("mode must be hybrid, server, or local")
-    include_content = view == "full"
     encryption_state = project_encryption_state(project_id)
     collected = []
     sources = []
@@ -9233,13 +9256,7 @@ def search_memory(args):
             diagnostics["local_strategies"] = local_result.get("search_strategies", [])
             local = local_result.get("items", [])
             for item in local:
-                node = item
-                if include_content:
-                    try:
-                        node = get_node_by_path({"path": item["full_path"]})
-                    except Exception:
-                        pass
-                node = dict(node)
+                node = dict(item)
                 node["search_source"] = "local"
                 collected.append(node)
             if local:
@@ -9261,7 +9278,7 @@ def search_memory(args):
             server = list_project_nodes(server_args).get("items", [])
             diagnostics["server_queries"].append({"q": server_query, "matched": len(server)})
             for node in server:
-                node = summarize_node(node, view=view) if view != "full" else node
+                node = summarize_node(node, view=view)
                 node["search_source"] = "server"
                 node["matched_query"] = server_query
                 collected.append(node)
@@ -9368,7 +9385,7 @@ def get_memory_context(args):
         raise RuntimeError("path or paths is required")
     max_nodes = max(1, min(int(args.get("max_nodes", 20)), 100))
     depth = max(0, min(int(args.get("depth", 1)), 2))
-    default_view = "full" if as_bool(args.get("include_content"), True) and not args.get("view") else "summary"
+    default_view = "summary"
     view, _warnings = normalize_discovery_view(args, default=default_view)
     queue_paths = [normalize_node_path(path) for path in raw_paths]
     nodes = []
@@ -9382,7 +9399,7 @@ def get_memory_context(args):
                 continue
             seen_paths.add(path)
             try:
-                node = get_node_by_path({"path": path}, allow_agent=is_agent_namespace_path(path))
+                node = read_node_by_path({"path": path}, allow_agent=is_agent_namespace_path(path))
             except Exception:
                 continue
             nodes.append(summarize_node(node, view=view, preview_chars=normalize_int(args.get("preview_chars"), 240, 80, 1000)))
@@ -9412,7 +9429,7 @@ def find_related_nodes(args):
     path = args["path"]
     view, _warnings = normalize_discovery_view(args, default="paths")
     limit = max(1, min(int(args.get("limit", 25)), 100))
-    target = get_node_by_path({"path": path}, allow_agent=is_agent_namespace_path(path))
+    target = read_node_by_path({"path": path}, allow_agent=is_agent_namespace_path(path))
     related = []
     try:
         related.extend(get_backlinks_by_path({"path": target["full_path"]}).get("items", []))
@@ -9422,7 +9439,7 @@ def find_related_nodes(args):
     for link in links:
         if isinstance(link, dict) and link.get("path"):
             try:
-                related.append(get_node_by_path({"path": link["path"]}, allow_agent=is_agent_namespace_path(link["path"])))
+                related.append(read_node_by_path({"path": link["path"]}, allow_agent=is_agent_namespace_path(link["path"])))
             except Exception:
                 pass
     for tag in target.get("tags") or []:
@@ -9460,7 +9477,7 @@ def move_node(args):
     reject_agent_namespace_path(old_path)
     reject_agent_namespace_path(new_path)
     project_id = resolve_project_id(args)
-    existing = get_node_by_path({"path": old_path})
+    existing = read_node_by_path({"path": old_path})
     old_full_path = existing["full_path"]
     new_full_path = normalize_node_path(new_path)
     references_to_rewrite = [
@@ -9627,7 +9644,7 @@ def list_agent_nodes(args):
 
 
 def get_agent_node(args):
-    return get_node_by_path({"path": agent_scoped_path(args)}, allow_agent=True)
+    return read_node_by_path({"path": agent_scoped_path(args)}, allow_agent=True)
 
 
 def upsert_agent_node(args):
@@ -9658,7 +9675,7 @@ def upsert_agent_node(args):
 def update_agent_node(args):
     scoped = agent_node_args(args)
     project_id = resolve_project_id(args)
-    existing = get_node_by_path({"path": scoped["path"]}, allow_agent=True)
+    existing = read_node_by_path({"path": scoped["path"]}, allow_agent=True)
     updated = request_project_write(
         "PATCH",
         f"/v1/projects/{project_id}/nodes/{existing['id']}",
@@ -9673,7 +9690,7 @@ def update_agent_node(args):
 def archive_agent_node(args):
     scoped = agent_node_args(args)
     project_id = resolve_project_id(args)
-    existing = get_node_by_path({"path": scoped["path"]}, allow_agent=True)
+    existing = read_node_by_path({"path": scoped["path"]}, allow_agent=True)
     request_project_write(
         "DELETE",
         f"/v1/projects/{project_id}/nodes/{existing['id']}",
@@ -9691,8 +9708,8 @@ def link_agent_node(args):
     source_path = agent_scoped_path({"agent_slug": slug, "path": args["source_path"]})
     target_raw = str(args.get("target_path") or "").strip()
     target_path = agent_scoped_path({"agent_slug": slug, "path": target_raw}) if is_agent_namespace_path(target_raw) or not target_raw.startswith("/") else normalize_node_path(target_raw)
-    source = get_node_by_path({"path": source_path}, allow_agent=True)
-    target = get_node_by_path({"path": target_path}, allow_agent=is_agent_namespace_path(target_path))
+    source = read_node_by_path({"path": source_path}, allow_agent=True)
+    target = read_node_by_path({"path": target_path}, allow_agent=is_agent_namespace_path(target_path))
     relation = args.get("relation", "references")
     links = source.get("links") or []
     if not isinstance(links, list):
@@ -10121,7 +10138,7 @@ def start_local_ui(args):
             selected_node = None
             if selected_path:
                 try:
-                    selected_node = get_node_by_path({"path": selected_path})
+                    selected_node = read_node_by_path({"path": selected_path})
                 except Exception:
                     selected_node = None
             schedules = request_json("GET", f"/v1/projects/{project_id}/schedules").get("items", [])
@@ -10324,7 +10341,7 @@ def start_local_ui(args):
                 selected_node = None
                 if selected_path:
                     try:
-                        selected_node = get_node_by_path({"path": selected_path})
+                        selected_node = read_node_by_path({"path": selected_path})
                     except Exception:
                         selected_node = None
                 schedules = request_json("GET", f"/v1/projects/{project_id}/schedules").get("items", [])
@@ -10939,12 +10956,12 @@ def raw_tools():
                     "q": {"type": "string", "description": "Search text. Natural language is accepted; distinctive nouns, paths, tags, or quoted phrases produce better matches than full instructions."},
                     "mode": {"type": "string", "enum": ["hybrid", "server", "local"], "default": "hybrid"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "paths"},
+                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata"], "default": "paths"},
                     "updated_after": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD lower bound on updated_at."},
                     "updated_before": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD upper bound on updated_at."},
                     "since": {"type": "string", "description": "Alias for updated_after."},
                     "until": {"type": "string", "description": "Alias for updated_before."},
-                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
+                    "include_content": {"type": "boolean", "default": False, "description": "Legacy no-op; read full bodies with nap_node_get by node_id or uri."},
                     "active_only": {"type": "boolean", "default": False},
                     "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
                     "exclude_status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
@@ -10970,7 +10987,7 @@ def raw_tools():
                     "since": {"type": "string", "description": "Alias for updated_after."},
                     "until": {"type": "string", "description": "Alias for updated_before."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "summary"},
+                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata"], "default": "summary"},
                     "mode": {"type": "string", "enum": ["hybrid", "server", "local"], "default": "hybrid"},
                     "include_archived": {"type": "boolean", "default": False},
                     "archived_only": {"type": "boolean", "default": False},
@@ -10985,7 +11002,7 @@ def raw_tools():
         },
         {
             "name": "nap_find",
-            "description": "Structured active memory search by folder, tag, path, or query. Returns path/date rows by default; use view='full' for body text or resolve selected paths with nap_node_by_path before identity reads.",
+            "description": "Structured active memory search by folder, tag, path, or query. Returns path/date rows by default; resolve selected paths with nap_node_by_path before identity reads.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -10998,8 +11015,8 @@ def raw_tools():
                     "since": {"type": "string", "description": "Alias for updated_after."},
                     "until": {"type": "string", "description": "Alias for updated_before."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 10000},
-                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "paths"},
-                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
+                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata"], "default": "paths"},
+                    "include_content": {"type": "boolean", "default": False, "description": "Legacy no-op; read full bodies with nap_node_get by node_id or uri."},
                     "include_archived": {"type": "boolean", "default": False},
                     "archived_only": {"type": "boolean", "default": False},
                     "active_only": {"type": "boolean", "default": False},
@@ -11079,8 +11096,8 @@ def raw_tools():
                     "paths": {"type": "array", "items": {"type": "string"}},
                     "depth": {"type": "integer", "minimum": 0, "maximum": 2},
                     "max_nodes": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "view": {"type": "string", "enum": ["paths", "summary", "metadata", "full"], "default": "full"},
-                    "include_content": {"type": "boolean", "default": True, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
+                    "view": {"type": "string", "enum": ["paths", "summary", "metadata"], "default": "summary"},
+                    "include_content": {"type": "boolean", "default": False, "description": "Legacy no-op; read full bodies with nap_node_get by node_id or uri."},
                     "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
                 },
                 "additionalProperties": False,
@@ -11105,8 +11122,8 @@ def raw_tools():
                 "properties": {
                     "path": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "paths"},
-                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set. nap_recent and nap_find default to path/date output."},
+                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata"], "default": "paths"},
+                    "include_content": {"type": "boolean", "default": False, "description": "Legacy no-op; read full bodies with nap_node_get by node_id or uri."},
                     "preview_chars": {"type": "integer", "minimum": 80, "maximum": 1000, "default": 240},
                 },
                 "additionalProperties": False,
@@ -11126,8 +11143,8 @@ def raw_tools():
                     "since": {"type": "string", "description": "Alias for updated_after."},
                     "until": {"type": "string", "description": "Alias for updated_before."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "paths"},
-                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set. nap_recent and nap_find default to path/date output."},
+                    "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata"], "default": "paths"},
+                    "include_content": {"type": "boolean", "default": False, "description": "Legacy no-op; read full bodies with nap_node_get by node_id or uri."},
                     "active_only": {"type": "boolean", "default": False},
                     "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
                     "exclude_status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
@@ -11494,8 +11511,8 @@ def raw_tools():
                     "q": {"type": "string", "description": "Search phrase. Distinctive nouns, paths, tags, and quoted phrases work best; long sentences are decomposed automatically."},
                     "cursor": {"type": "string"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 10000},
-                    "view": {"type": "string", "enum": ["paths", "summary", "metadata", "full"], "default": "summary"},
-                    "include_content": {"type": "boolean", "default": False, "description": "Legacy; use view='full' for body text. Ignored when view is set."},
+                    "view": {"type": "string", "enum": ["paths", "summary", "metadata"], "default": "summary"},
+                    "include_content": {"type": "boolean", "default": False, "description": "Legacy no-op; read full bodies with nap_node_get by node_id or uri."},
                     "include_archived": {"type": "boolean", "default": False},
                     "archived_only": {"type": "boolean", "default": False},
                     "active_only": {"type": "boolean", "default": False},
@@ -12110,7 +12127,7 @@ def du_memory(args):
 
 def lint_memory(args):
     limit = max(1, min(int(args.get("limit", 200)), 500))
-    result = list_project_nodes({"limit": limit, "view": "full"})
+    result = list_project_nodes({"limit": limit, "view": "full", "_allow_full": True})
     warnings = []
     for node in result.get("items", []):
         for link in node.get("links") or []:
