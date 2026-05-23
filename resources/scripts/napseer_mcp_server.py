@@ -9028,7 +9028,6 @@ def supersede_plan(args):
         reason_key="supersede_reason",
         link_relation="superseded-by",
         terminal_tags=["superseded", "archived"],
-        require_reason=True,
     )
 
 
@@ -9043,15 +9042,12 @@ def cancel_plan(args):
         reason_key="cancel_reason",
         link_relation=None,
         terminal_tags=["cancelled", "archived"],
-        require_reason=True,
     )
 
 
-def plan_lifecycle_update(args, *, action, terminal_status, required_target_key, metadata_target_key, timestamp_key, reason_key, link_relation, terminal_tags, require_reason=False):
+def plan_lifecycle_update(args, *, action, terminal_status, required_target_key, metadata_target_key, timestamp_key, reason_key, link_relation, terminal_tags):
     target_path = resolve_lifecycle_target(args, required_target_key)
     reason = str(args.get("reason") or args.get("notes") or "").strip()
-    if require_reason and not reason:
-        raise RuntimeError("reason is required")
     dry_run = as_bool(args.get("dry_run"), False)
     node, already_archived = get_plan_for_lifecycle(args)
     path = node["full_path"]
@@ -11521,7 +11517,6 @@ def raw_tools():
             "description": "Mark a /plans node superseded by another node identity, add terminal tags and link, then archive it.",
             "inputSchema": {
                 "type": "object",
-                "required": ["reason"],
                 "properties": {
                     "plan_node_id": {"type": "string", "description": "Canonical node id of the /plans node."},
                     "plan_uri": {"type": "string", "description": "Canonical nap:// URI of the /plans node."},
@@ -11540,7 +11535,6 @@ def raw_tools():
             "description": "Mark a /plans node cancelled by plan node identity with a reason, add terminal tags, and archive it.",
             "inputSchema": {
                 "type": "object",
-                "required": ["reason"],
                 "properties": {
                     "plan_node_id": {"type": "string", "description": "Canonical node id of the /plans node."},
                     "plan_uri": {"type": "string", "description": "Canonical nap:// URI of the /plans node."},

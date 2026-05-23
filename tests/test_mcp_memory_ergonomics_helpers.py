@@ -332,14 +332,14 @@ def test_tools_include_node_by_path_descriptor(mod):
     assert "outcome_path" not in complete_schema["properties"]
 
     supersede_schema = next(item for item in mod.tools() if item["name"] == "nap_plan_supersede")["inputSchema"]
-    assert supersede_schema["required"] == ["reason"]
+    assert "required" not in supersede_schema
     assert "plan_node_id" in supersede_schema["properties"]
     assert "replacement_node_id" in supersede_schema["properties"]
     assert "path" not in supersede_schema["properties"]
     assert "replacement_path" not in supersede_schema["properties"]
 
     cancel_schema = next(item for item in mod.tools() if item["name"] == "nap_plan_cancel")["inputSchema"]
-    assert cancel_schema["required"] == ["reason"]
+    assert "required" not in cancel_schema
     assert "plan_node_id" in cancel_schema["properties"]
     assert "path" not in cancel_schema["properties"]
 
