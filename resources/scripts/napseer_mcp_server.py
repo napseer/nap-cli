@@ -473,6 +473,7 @@ PUBLIC_TOOLS = {
     "nap_lock_release",
     "nap_lock_ls",
     "nap_reindex_project",
+    "nap_index_sync",
     "nap_grep_local",
     "nap_index_status",
     "nap_index_clear",
@@ -5483,6 +5484,19 @@ def normalize_datetime_filter(value, *, end_of_day=False):
     return text
 
 
+def iso_minus_seconds(value, seconds):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+    return (parsed - timedelta(seconds=max(0, int(seconds)))).astimezone(timezone.utc).replace(
+        microsecond=0
+    ).isoformat().replace("+00:00", "Z")
+
+
 def normalize_discovery_ranges(args):
     normalized = dict(args or {})
     if normalized.get("after") and not normalized.get("updated_after"):
@@ -6132,12 +6146,18 @@ def local_index_diagnostics(project_id, conn=None):
     def read(connection):
         count = connection.execute("SELECT COUNT(*) AS count FROM local_index_nodes WHERE project_id = ?", (project_id,)).fetchone()["count"]
         latest = connection.execute("SELECT MAX(indexed_at) AS latest FROM local_index_nodes WHERE project_id = ?", (project_id,)).fetchone()["latest"]
+        latest_node_updated_at = connection.execute(
+            "SELECT MAX(updated_at) AS latest FROM local_index_nodes WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()["latest"]
         diagnostics.update(
             {
                 "count": count,
                 "latest_indexed_at": latest,
+                "latest_node_updated_at": latest_node_updated_at,
                 "used": False,
                 "reindex_recommended": count == 0,
+                "sync_recommended": count == 0,
             }
         )
         return diagnostics
@@ -6254,6 +6274,59 @@ def reindex_project(args):
     for node in nodes:
         index_node(node)
     return {"project_id": project_id, "indexed": len(nodes), "index_path": str(INDEX_PATH)}
+
+
+def sync_local_index(args):
+    args = normalize_discovery_ranges(args or {})
+    project_id = resolve_project_id(args)
+    limit = max(1, min(int(args.get("limit", 200)), 200))
+    include_archived = as_bool(args.get("include_archived"), True)
+    lookback_seconds = normalize_int(args.get("lookback_seconds"), 5, 0, 3600)
+    status_before = local_index_diagnostics(project_id)
+    latest_node_updated_at = status_before.get("latest_node_updated_at")
+    updated_after = args.get("updated_after") or iso_minus_seconds(latest_node_updated_at, lookback_seconds)
+    nodes = []
+    cursor = None
+    pages = 0
+    while True:
+        query = {
+            "limit": limit,
+            "view": "full",
+            "include_archived": include_archived,
+        }
+        if updated_after:
+            query["updated_after"] = updated_after
+        if cursor:
+            query["cursor"] = cursor
+        page = request_json("GET", f"/v1/projects/{project_id}/nodes?{rest_query_string(query)}")
+        pages += 1
+        nodes.extend(filter_project_nodes(page.get("items", [])))
+        cursor = page.get("next_cursor")
+        if not cursor:
+            break
+    indexed = 0
+    removed = 0
+    for node in nodes:
+        if node.get("archived_at"):
+            remove_indexed_node(node.get("id"))
+            removed += 1
+            continue
+        index_node(node)
+        indexed += 1
+    return {
+        "project_id": project_id,
+        "status": "synced",
+        "mode": "incremental",
+        "updated_after": updated_after,
+        "lookback_seconds": lookback_seconds,
+        "include_archived": include_archived,
+        "pages": pages,
+        "seen": len(nodes),
+        "indexed": indexed,
+        "removed": removed,
+        "index_path": str(INDEX_PATH),
+        "index": local_index_diagnostics(project_id),
+    }
 
 
 def index_status(args):
@@ -11067,6 +11140,21 @@ def raw_tools():
             },
         },
         {
+            "name": "nap_index_sync",
+            "description": "Incrementally synchronize the local SQLite FTS index from remote nodes changed since the latest indexed node update. Archived nodes are removed from the local index.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "updated_after": {"type": "string", "description": "Optional RFC3339 timestamp or YYYY-MM-DD lower bound. Defaults to the local index high-water mark with a short overlap."},
+                    "since": {"type": "string", "description": "Alias for updated_after."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 200},
+                    "lookback_seconds": {"type": "integer", "minimum": 0, "maximum": 3600, "default": 5},
+                    "include_archived": {"type": "boolean", "default": True},
+                },
+                "additionalProperties": False,
+            },
+        },
+        {
             "name": "nap_grep_local",
             "description": "Search the local SQLite FTS index with optional updated_at range filters. Encrypted nodes are indexed by safe path, name, tags, aliases, and links only.",
             "inputSchema": {
@@ -11999,6 +12087,7 @@ TOOL_CATEGORIES = {
     ],
     "maintenance": [
         "nap_reindex_project",
+        "nap_index_sync",
         "nap_index_status",
         "nap_index_clear",
         "nap_update_status",
@@ -12067,6 +12156,7 @@ READ_ONLY_TOOLS = {
 LOCAL_FILE_TOOLS = {
     "nap_update_self",
     "nap_reindex_project",
+    "nap_index_sync",
     "nap_index_clear",
     "nap_gateway_setup",
     "nap_gateway_configure",
@@ -12127,7 +12217,7 @@ def tool_auth_mode(name):
         return "public"
     if category == "gateway":
         return "local-gateway"
-    if name in {"nap_grep_local", "nap_index_status", "nap_index_clear", "nap_reindex_project", "nap_ui_open", "nap_update_self"}:
+    if name in {"nap_grep_local", "nap_index_status", "nap_index_clear", "nap_reindex_project", "nap_index_sync", "nap_ui_open", "nap_update_self"}:
         return "local-only"
     if category in {"explore", "update", "coordination", "agent", "project", "schedules", "maintenance"}:
         return "project-auth"
@@ -12384,6 +12474,8 @@ def call_tool_impl(name, args):
         return list_project_locks(args)
     if name == "nap_reindex_project":
         return reindex_project(args)
+    if name == "nap_index_sync":
+        return sync_local_index(args)
     if name == "nap_grep_local":
         return search_local_index(args)
     if name == "nap_index_status":

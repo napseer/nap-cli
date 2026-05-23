@@ -4,6 +4,7 @@
 import importlib.util
 import pathlib
 import sys
+import tempfile
 
 import pytest
 
@@ -809,6 +810,68 @@ def test_rest_query_string_serializes_booleans_lowercase(mod):
     assert "active_only=True" not in query
     assert "status=todo" in query
     assert "status=doing" in query
+
+
+def test_index_status_reports_sync_high_water_mark(mod):
+    with tempfile.TemporaryDirectory() as tmp:
+        state_dir = pathlib.Path(tmp)
+        mod.AUTH_DIR = state_dir
+        mod.INDEX_PATH = state_dir / "index.sqlite"
+        mod.INDEX_LOCK_PATH = state_dir / "index.lock"
+        mod.index_node(node("/notes/old", "active", content="old body"))
+
+        status = mod.index_status({})
+        assert status["count"] == 1
+        assert status["latest_node_updated_at"] == "2026-05-06T12:00:00Z"
+        assert status["sync_recommended"] is False
+
+
+def test_index_sync_fetches_incremental_changes_and_removes_archived_nodes(mod):
+    with tempfile.TemporaryDirectory() as tmp:
+        state_dir = pathlib.Path(tmp)
+        mod.AUTH_DIR = state_dir
+        mod.INDEX_PATH = state_dir / "index.sqlite"
+        mod.INDEX_LOCK_PATH = state_dir / "index.lock"
+        existing = node("/notes/existing", "active", content="existing body")
+        existing["id"] = "existing-node"
+        existing["updated_at"] = "2026-05-06T12:00:00Z"
+        mod.index_node(existing)
+
+        fresh = node("/notes/fresh", "active", content="fresh sync needle")
+        fresh["id"] = "fresh-node"
+        fresh["updated_at"] = "2026-05-06T12:05:00Z"
+        archived = node("/notes/existing", "active", content="archived body", archived_at="2026-05-06T12:06:00Z")
+        archived["id"] = "existing-node"
+        archived["updated_at"] = "2026-05-06T12:06:00Z"
+        calls = []
+
+        def fake_request(method, path, payload=None, **kwargs):
+            calls.append(path)
+            assert method == "GET"
+            assert "view=full" in path
+            assert "include_archived=true" in path
+            assert "updated_after=2026-05-06T11%3A59%3A55Z" in path
+            return {"items": [fresh, archived], "next_cursor": None}
+
+        mod.request_json = fake_request
+        result = mod.sync_local_index({"lookback_seconds": 5})
+        assert result["status"] == "synced"
+        assert result["seen"] == 2
+        assert result["indexed"] == 1
+        assert result["removed"] == 1
+        assert calls
+        local = mod.search_local_index({"q": "fresh needle"})
+        assert [item["id"] for item in local["items"]] == ["fresh-node"]
+        assert mod.search_local_index({"q": "existing"})["items"] == []
+
+
+def test_tools_include_index_sync_descriptor(mod):
+    tool = next(item for item in mod.tools() if item["name"] == "nap_index_sync")
+    assert "Incrementally synchronize" in tool["description"]
+    assert tool["inputSchema"]["properties"]["lookback_seconds"]["default"] == 5
+    contract = mod.tool_contract_metadata("nap_index_sync")
+    assert contract["side_effect"] == "local-file"
+    assert contract["auth_mode"] == "local-only"
 
 
 def test_kanban_list_grouping_and_filters(mod):
