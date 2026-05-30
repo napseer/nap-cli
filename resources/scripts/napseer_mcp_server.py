@@ -49,6 +49,21 @@ import webbrowser
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# Add script directory to path for modular imports
+_SCRIPT_DIR = pathlib.Path(__file__).parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
+# Import from modular subpackage for organized code
+try:
+    from napseer import constants as _mod_constants
+    from napseer import crypto as _mod_crypto
+    from napseer import telemetry as _mod_telemetry
+    from napseer import gateway as _mod_gateway
+    MODULAR_IMPORT = True
+except ImportError:
+    MODULAR_IMPORT = False
+
 DISCOVERY_VIEWS = {"titles", "paths", "summary", "metadata"}
 DISCOVERY_DEFAULT_LIMIT = 25
 DISCOVERY_COMPACT_MAX_LIMIT = 10_000
