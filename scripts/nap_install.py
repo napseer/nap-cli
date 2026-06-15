@@ -3,12 +3,13 @@
 
 Usage:
   python3 nap_install.py
+  nap project init
   nap project create
   nap project status
-  nap gateway start
-  nap gateway stop
+  nap service start
+  nap service status
+  nap service logs
   nap gateway configure
-  nap gateway logs
   nap status
   nap agent list
   nap update
@@ -231,7 +232,7 @@ def install_assets(update_project=False):
         },
         "updated_project_paths": updated_project_paths,
         "path_warning": path_warning(),
-        "next": ["nap project create", "nap gateway configure", "nap gateway start", "nap gateway logs", "nap update"],
+        "next": ["nap project init", "nap service start", "nap gateway configure", "nap update"],
     }
     return result
 
@@ -588,41 +589,57 @@ def service_logs(kind, args):
 
 
 def handle_gateway(args):
-    subcommand = args[0] if args else "ls"
+    subcommand = args[0] if args else "help"
     rest = args[1:] if args else []
-    if subcommand in {"help", "-h", "--help"}:
-        print("Usage: nap gateway [start|stop|status|logs|configure|setup|restart|kill|vault|terminal|schedule|service]")
-        print("  nap gateway start [--port PORT]       Start the local gateway service.")
-        print("  nap gateway status                    Show the managed gateway process.")
+    if subcommand in {"help", "-h", "--help", "ls", "list", "status"}:
+        print("Usage: nap gateway [configure|setup|restart|kill|vault|terminal|schedule|service]")
         print("  nap gateway configure [--command CMD] Configure the local gateway command.")
         print("  nap gateway setup                     Create or migrate local gateway storage.")
-        print("  nap gateway vault                     Show gateway vault status and pending setup requests.")
-        print("  nap gateway vault process             Complete pending setup requests with the vault/content passphrase.")
-        print("  nap gateway vault rotate-secret --kind memory")
-        print("  nap chat secret setup                 Configure chat secret state with the vault/content passphrase.")
+        print("  nap gateway vault ...                 Show gateway vault status and pending setup requests.")
+        print("  nap gateway terminal ...              Manage gateway tmux terminals.")
+        print("  nap gateway schedule ...              Manage gateway schedules (cron jobs).")
+        print("  nap gateway service preregister|activate  Register or activate a gateway service token.")
+        print()
+        print("Service lifecycle (start/stop/status/logs) lives under `nap service`.")
+        print("Use `nap service start|stop|status|logs` for the local gateway process.")
         return 0
-    if subcommand == "vault" and rest and rest[0] in {"help", "-h", "--help"}:
-        print("Usage: nap gateway vault [status|list|process|rotate-secret] [--kind memory] [--all] [--project-id ID] [--vault-passphrase TEXT]")
-        print("  status        Show local gateway state and pending setup requests.")
-        print("  process       Upload opaque client-wrapped key bundle records for backend-owned HashiCorp storage.")
-        print("  rotate-secret Rotate the memory project secret from the gateway worker path.")
-        print("  Chat secrets use: nap chat secret setup|status|rotate; setup uses the same vault/content passphrase.")
-        return 0
+    if subcommand in {"configure", "setup", "restart", "kill", "vault", "terminal", "schedule", "service"}:
+        return run_wrapper("gateway", [subcommand, *rest])
+    if subcommand in {"start", "stop", "logs", "log"}:
+        raise RuntimeError(
+            f"unknown gateway subcommand: {subcommand}. "
+            "Service lifecycle moved to `nap service <verb>`. "
+            f"Use `nap service {subcommand if subcommand != 'log' else 'logs'}`."
+        )
     if subcommand == "process":
-        return run_wrapper("gateway", ["vault", "process", *rest])
+        raise RuntimeError(
+            "unknown gateway subcommand: process. Use `nap gateway vault process`."
+        )
+    raise RuntimeError("unknown gateway subcommand. Use `nap gateway help`.")
+
+def handle_service(args):
+    subcommand = args[0] if args else "status"
+    rest = args[1:] if args else []
+    if subcommand in {"help", "-h", "--help"}:
+        print("Usage: nap service [start|stop|status|logs] [--port PORT] [--lines N]")
+        print("  start   Start the local gateway service in this directory.")
+        print("  stop    Stop the local gateway service.")
+        print("  status  Show the managed gateway process state.")
+        print("  logs    Tail the managed gateway log file.")
+        return 0
     if subcommand == "start":
         return print_json(start_service("gateway", ["--no-browser", *rest])) or 0
     if subcommand == "stop":
         return print_json(stop_service("gateway")) or 0
-    if subcommand in {"ls", "list", "status"}:
+    if subcommand == "status":
         return print_json(list_service("gateway")) or 0
     if subcommand in {"logs", "log"}:
         return print_json(service_logs("gateway", rest)) or 0
-    if subcommand == "configure":
-        return run_wrapper("gateway", ["configure", *rest])
-    if subcommand in {"setup", "restart", "kill", "vault", "terminal", "schedule", "service"}:
-        return run_wrapper("gateway", [subcommand, *rest])
-    raise RuntimeError("unknown gateway command; use nap gateway start|stop|configure|setup|restart|kill|logs|status|vault|terminal|schedule|service")
+    if subcommand in {"ls", "list"}:
+        raise RuntimeError(
+            f"unknown service subcommand: {subcommand}. Use one of: start, stop, status, logs."
+        )
+    raise RuntimeError("unknown service subcommand. Use `nap service help`.")
 
 
 def print_json(value):
@@ -636,12 +653,10 @@ def main(argv):
     if command == "install":
         print_json(install_assets(update_project=False))
         return 0
-    if command == "update":
-        result = install_assets(update_project=True)
-        print_json({**result, "status": "updated", "message": "Napseer CLI and runtime scripts are updated."})
-        return 0
     if command == "gateway":
         return handle_gateway(args)
+    if command == "service":
+        return handle_service(args)
     if command == "chat":
         return run_wrapper("chat", args or ["secret", "status"])
     if command == "status":
@@ -649,8 +664,6 @@ def main(argv):
     if command == "project":
         if not args:
             return run_wrapper("project", ["status"])
-        if args[0] == "bootstrap":
-            raise RuntimeError("unknown project command: bootstrap")
         return run_wrapper("project", args)
     if command == "lineage":
         return run_wrapper("lineage", args or ["status"])
@@ -662,6 +675,8 @@ def main(argv):
         return run_wrapper("auth", args)
     if command == "feedback":
         return run_wrapper("feedback", args)
+    if command == "agent":
+        return run_wrapper("agent", args)
     if command == "where":
         state = state_dir_status()
         print_json(
@@ -680,11 +695,13 @@ def main(argv):
         )
         return 0
     if command in {"help", "-h", "--help"}:
-        print("Usage: nap [auth|project|chat|plan|lineage|gateway|agent|feedback|status|update|where|install]")
+        print("Usage: nap [auth|project|chat|plan|lineage|gateway|service|agent|feedback|status|update|where|install]")
         print("  auth        Auth commands: login-local, status.")
         print("              Example: nap auth login-local")
-        print("  project     Project commands: init/attach existing, create, status, encryption.")
-        print("              Examples: nap project init, nap project create, nap project status")
+        print("  project     Project commands: init, attach, create, claim, status, encryption.")
+        print("              First-time setup: nap project init (enrolls and creates a project, no browser).")
+        print("              Attach an existing project to a Napseer account: nap project attach (opens browser).")
+        print("              Upgrade an anonymous project to a claimed one: nap project claim.")
         print("              Encrypted project setup is completed by the local gateway: nap gateway vault process")
         print("  chat        Chat secret commands: secret status, secret setup, secret rotate.")
         print("              Examples: nap chat secret setup --vault-passphrase TEXT, nap chat secret status")
@@ -692,13 +709,15 @@ def main(argv):
         print("              Example: nap plan to-kanban /plans/example --column todo")
         print("  lineage     Generic source-record -> plan -> kanban lineage checks.")
         print("              Example: nap lineage status")
-        print("  gateway     Gateway commands: start, stop, configure, setup, restart, kill, logs, status, vault.")
-        print("              Start auto-selects a local port; use --port to pin one.")
-        print("              Examples: nap gateway start, nap gateway vault, nap gateway vault process --all")
+        print("  gateway     Gateway operations: configure, setup, restart, kill, vault, terminal, schedule, service.")
+        print("              Examples: nap gateway configure, nap gateway vault process --all")
+        print("  service     Local gateway service lifecycle: start, stop, status, logs.")
+        print("              Start auto-selects a port; pass --port to pin one.")
+        print("              Examples: nap service start, nap service logs --lines 200")
         print("  agent       Agent commands: list, workspaces, create, show, edit.")
         print("              list shows registered project agents; workspaces shows /agents folders.")
-        print("  feedback    Feedback commands: list, global, status, resolve.")
-        print("              Examples: nap feedback list, nap feedback global --all, nap feedback resolve <id> --notes TEXT")
+        print("  feedback    Feedback commands: list, global, set, resolve.")
+        print("              Examples: nap feedback list, nap feedback set <id> --status open, nap feedback resolve <id> --notes TEXT")
         print("  status      Show cwd Napseer configuration and next setup commands.")
         print("  update      Refresh the globally installed nap command and wrapper.")
         print("  where       Show installed nap paths and cwd auth location.")

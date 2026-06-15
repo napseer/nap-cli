@@ -7344,6 +7344,85 @@ def cli_project_create(args):
         payload["passphrase"] = passphrase
     return bootstrap_project(payload)
 
+def cli_project_init(args):
+    """First-time setup wizard for a fresh directory.
+
+    Steps, in order, only running the ones that are needed:
+      1. SSH-key enroll this machine (anonymous) if no bearer token exists.
+      2. Create a project on the backend if none is configured for this folder.
+      3. Persist the resulting project/slug/name in ./.napseer/auth.json.
+
+    No browser is opened. Use `nap project attach` to OAuth-attach a pre-existing
+    project to a user account, or `nap project claim` to upgrade an anonymous
+    project to a claimed one.
+    """
+    positionals = cli_positionals(args)
+    slug = cli_option(args, "--slug", default=positionals[0] if positionals else default_project_slug())
+    name = cli_option(args, "--name", default=default_project_name(slug))
+    description = cli_option(args, "--description", default="")
+
+    already_initialized = bool(TOKEN) and bool(DEFAULT_PROJECT_ID)
+    if already_initialized:
+        existing_slug = load_public_auth_file().get("project_slug") or ""
+        return {
+            "status": "already_initialized",
+            "message": (
+                "This folder is already initialized. "
+                f"Project '{existing_slug}' is configured at {AUTH_PATH}."
+            ),
+            "project_id": DEFAULT_PROJECT_ID,
+            "project_slug": existing_slug,
+            "auth_path": str(AUTH_PATH),
+        }
+
+    steps = []
+    if not TOKEN:
+        enrollment = ensure_enrolled({
+            "slug": slug,
+            "worker_name": f"{slug}-agent",
+        })
+        steps.append({
+            "step": "enroll",
+            "status": enrollment.get("status", "enrolled"),
+            "token_expires_at": enrollment.get("token_expires_at"),
+        })
+    else:
+        steps.append({"step": "enroll", "status": "skipped", "reason": "token already present"})
+
+    if not DEFAULT_PROJECT_ID:
+        bootstrap = bootstrap_project({
+            "slug": slug,
+            "name": name,
+            "description": description,
+            "encryption": "plaintext",
+        })
+        steps.append({
+            "step": "create_project",
+            "status": bootstrap.get("status"),
+            "project_id": bootstrap.get("project_id"),
+        })
+        return {
+            **bootstrap,
+            "status": "initialized",
+            "message": (
+                f"Folder initialized. Project '{bootstrap['project']['slug']}' "
+                f"created and stored in {AUTH_PATH}. Next: `nap project attach` "
+                "to link it to your Napseer account, or `nap gateway configure` "
+                "to start a local gateway."
+            ),
+            "steps": steps,
+            "auth_path": str(AUTH_PATH),
+        }
+
+    steps.append({"step": "create_project", "status": "skipped", "reason": "project already configured"})
+    return {
+        "status": "initialized",
+        "message": "Folder initialized; existing project kept.",
+        "project_id": DEFAULT_PROJECT_ID,
+        "auth_path": str(AUTH_PATH),
+        "steps": steps,
+    }
+
 
 def parse_tmux_target(value):
     value = str(value or "").strip()
@@ -7421,35 +7500,24 @@ def cli_gateway_configure(args):
         gateway_setup({"passphrase": passphrase})
     if not gateway_is_unlocked():
         gateway_open_local(passphrase)
-
     target = parse_tmux_target(cli_option(args, "--target", default=""))
-    command = default_command or ""
-    if not command and sys.stdin.isatty():
-        value = input(f"Default terminal command [{normalize_gateway_command()}]: ").strip()
-        command = value or normalize_gateway_command()
-    if not command:
-        command = normalize_gateway_command()
+    command = default_command or normalize_gateway_command()
     payload = {
         "session": cli_option(args, "--session", default=target.get("session", "")),
         "window": cli_option(args, "--window", default=target.get("window", "")),
         "pane": cli_option(args, "--pane", default=target.get("pane", "")),
         "default_command": command,
     }
-    if "--target" not in args and "--session" not in args:
-        payload["session"] = ""
-    elif not payload["session"]:
-        payload.update(current_tmux_target())
     if "--target" in args or "--session" in args:
         if not payload.get("session"):
-            payload["session"] = input("tmux session: ").strip()
+            raise RuntimeError(
+                "nap gateway configure requires --session NAME (or --target session:window.pane). "
+                "Pass --no-prompt is no longer needed; the command is non-interactive."
+            )
         if not payload.get("window"):
-            value = input("tmux window, optional: ").strip()
-            if value:
-                payload["window"] = value
-        if not payload.get("pane"):
-            value = input("tmux pane, optional: ").strip()
-            if value:
-                payload["pane"] = value
+            raise RuntimeError(
+                "nap gateway configure requires --window NAME when --session is set."
+            )
     return gateway_tmux_configure(payload)
 
 
@@ -7500,14 +7568,17 @@ def mcp_gateway_configure(args):
         gateway_open_local(passphrase)
 
     target = parse_tmux_target(args.get("target", ""))
+    if not (args.get("target") or args.get("session")):
+        raise RuntimeError(
+            "nap_gateway_configure requires `session` (or `target` session:window.pane). "
+            "For interactive tmux discovery, use the CLI nap gateway configure with --target."
+        )
     payload = {
         "session": args.get("session", target.get("session", "")),
         "window": args.get("window", target.get("window", "")),
         "pane": args.get("pane", target.get("pane", "")),
         "default_command": default_command or normalize_gateway_command(),
     }
-    if not args.get("target") and not args.get("session"):
-        payload["session"] = ""
     return gateway_tmux_configure(payload)
 
 
@@ -12755,7 +12826,7 @@ def cli_main(argv):
     if command == "auth":
         subcommand = argv[2] if len(argv) > 2 else "status"
         args = argv[3:]
-        if subcommand in {"login-local", "operator-login", "login"}:
+        if subcommand == "login-local":
             print(json.dumps(operator_loopback_login({
                 "frontend_url": cli_option(args, "--frontend-url", default=None),
                 "api_base_url": cli_option(args, "--api-base-url", "--base-url", default=None),
@@ -12767,11 +12838,15 @@ def cli_main(argv):
         if subcommand in {"status", "show"}:
             print(json.dumps(cli_configure_status(), indent=2))
             return
+        if subcommand in {"login", "operator-login"}:
+            raise RuntimeError(
+                f"unknown auth subcommand: {subcommand}. Use `nap auth login-local`."
+            )
         print("Usage: napseer_mcp_server.py auth [login-local [--frontend-url URL] [--api-base-url URL] [--no-browser] [--timeout SECONDS]|status]")
         return
     if command == "project":
         subcommand = argv[2] if len(argv) > 2 else "help"
-        if subcommand in {"init", "attach", "bootstrap-existing"}:
+        if subcommand == "attach":
             print(json.dumps(operator_loopback_login({
                 "frontend_url": cli_option(argv[3:], "--frontend-url", default=None),
                 "api_base_url": cli_option(argv[3:], "--api-base-url", "--base-url", default=None),
@@ -12780,10 +12855,13 @@ def cli_main(argv):
                 "port": cli_option(argv[3:], "--port", default=0),
             }), indent=2))
             return
+        if subcommand == "init":
+            print(json.dumps(cli_project_init(argv[3:]), indent=2))
+            return
         if subcommand == "create":
             print(json.dumps(cli_project_create(argv[3:]), indent=2))
             return
-        if subcommand in {"claim", "login"}:
+        if subcommand == "claim":
             print(json.dumps(cli_project_claim(argv[3:]), indent=2))
             return
         if subcommand in {"status", "current"}:
@@ -12791,46 +12869,60 @@ def cli_main(argv):
             return
         if subcommand == "encryption":
             action = argv[3] if len(argv) > 3 else "status"
-            if action in {"status", "state", "show"}:
+            if action == "status":
                 print(json.dumps(project_encryption_status({}), indent=2))
                 return
             if action == "set":
-                if len(argv) <= 4:
-                    raise RuntimeError("nap project encryption set requires plaintext or encrypted")
+                desired = cli_option(argv[4:], "--state", default=None)
+                if desired not in {"plaintext", "encrypted"}:
+                    raise RuntimeError(
+                        "nap project encryption set requires --state plaintext|encrypted"
+                    )
                 print(json.dumps(project_encryption_transition({
-                    "state": argv[4],
-                    "passphrase": cli_option(argv[5:], "--passphrase", default=None),
+                    "state": desired,
+                    "passphrase": cli_option(argv[4:], "--passphrase", default=None),
                 }), indent=2))
                 return
-            print(json.dumps(project_encryption_transition({
-                "state": action,
-                "passphrase": cli_option(argv[4:], "--passphrase", default=None),
-            }), indent=2))
+            if action in {"state", "show", "plaintext", "encrypted"}:
+                raise RuntimeError(
+                    f"unknown project encryption action: {action}. "
+                    "Use `nap project encryption status` or `nap project encryption set --state plaintext|encrypted`."
+                )
+            print("Usage: napseer_mcp_server.py project encryption [status|set --state plaintext|encrypted [--passphrase TEXT]]")
             return
-        print("Usage: napseer_mcp_server.py project [init|attach [--no-browser] [--timeout SECONDS]|create [slug] [--name NAME] [--description TEXT] [--encryption plaintext]|claim [--no-browser] [--timeout SECONDS] [--return-url URL]|status|encryption [status|set plaintext|plaintext]]")
+        if subcommand in {"login", "bootstrap", "bootstrap-existing", "operator-login"}:
+            raise RuntimeError(
+                f"unknown project subcommand: {subcommand}. "
+                "Use one of: init, attach, create, claim, status, encryption."
+            )
+        print("Usage: napseer_mcp_server.py project [init [--slug SLUG] [--name NAME] [--description TEXT]|attach [--frontend-url URL] [--api-base-url URL] [--no-browser] [--timeout SECONDS]|create [slug] [--name NAME] [--description TEXT] [--encryption plaintext]|claim [--frontend-url URL] [--api-base-url URL] [--no-browser] [--timeout SECONDS] [--return-url URL]|status|encryption [status|set --state plaintext|encrypted]]")
         return
     if command == "lineage":
         subcommand = argv[2] if len(argv) > 2 else "status"
         args = argv[3:]
-        if subcommand in {"status", "ls", "list", "check"}:
+        if subcommand == "status":
             print(json.dumps(lineage_status({
                 "limit": cli_option(args, "--limit", default=None),
                 "include_archived": cli_flag(args, "--include-archived", "--archived"),
                 "include_items": not cli_flag(args, "--summary-only", "--no-items"),
             }), indent=2))
             return
-        print("Usage: napseer_mcp_server.py lineage [status|check] [--limit N] [--include-archived] [--summary-only]")
+        if subcommand in {"list", "ls", "check"}:
+            raise RuntimeError(
+                f"unknown lineage subcommand: {subcommand}. Use `nap lineage status`."
+            )
+        print("Usage: napseer_mcp_server.py lineage status [--limit N] [--include-archived] [--summary-only]")
         return
     if command == "plan":
         subcommand = argv[2] if len(argv) > 2 else "list"
         args = argv[3:]
-        if subcommand in {"list", "ls", "active"}:
+        if subcommand == "list":
             print(json.dumps(list_active_plans({
                 "limit": cli_option(args, "--limit", default=None),
                 "view": cli_option(args, "--view", default="summary"),
             }), indent=2))
             return
-        if subcommand in {"to-kanban", "card-from", "create-card"}:
+        if subcommand == "to-kanban":
             plan_path = cli_option(args, "--plan-path", "--path", default=None)
             if not plan_path:
                 plan_path = next((value for value in args if not value.startswith("-")), None)
@@ -12848,12 +12940,16 @@ def cli_main(argv):
             }
             print(json.dumps(plan_to_kanban_card(payload), indent=2))
             return
+        if subcommand in {"ls", "active", "card-from", "create-card"}:
+            raise RuntimeError(
+                f"unknown plan subcommand: {subcommand}. Use one of: list, to-kanban."
+            )
         print("Usage: napseer_mcp_server.py plan [list|to-kanban <plan-path> [--column todo|doing|review|done|backlog] [--title TEXT] [--priority low|normal|high|urgent] [--upsert]]")
         return
     if command == "gateway":
         subcommand = argv[2] if len(argv) > 2 else "status"
         args = argv[3:]
-        if subcommand in {"status", "ls", "list"}:
+        if subcommand == "status":
             print(json.dumps(gateway_status(), indent=2))
             return
         if subcommand == "configure":
@@ -12867,24 +12963,25 @@ def cli_main(argv):
             cli_gateway_require_unlocked(args, "killing gateway terminal")
             print(json.dumps(gateway_terminal_kill({}), indent=2))
             return
-        if subcommand in {"terminal", "terminals"}:
+        if subcommand == "terminal":
             action = args[0] if args else "list"
+            if action in {"ls", "status", "new", "rm", "remove", "send"}:
+                raise RuntimeError(
+                    f"unknown gateway terminal action: {action}. Use one of: list, create, close, capture, key, input."
+                )
             terminal_args = args[1:] if args else []
-            if subcommand == "terminals" and action not in {"create", "new", "close", "rm", "remove", "capture", "input", "send"}:
-                action = "list"
-                terminal_args = args
             cli_gateway_require_unlocked(terminal_args, "managing gateway terminals")
             terminal_id = cli_option(terminal_args, "--terminal", "--terminal-id", "--id", default=None)
-            if action in {"list", "ls", "status"}:
+            if action == "list":
                 print(json.dumps(gateway_terminal_sessions({"terminal_id": terminal_id}), indent=2))
                 return
-            if action in {"create", "new"}:
+            if action == "create":
                 print(json.dumps(gateway_terminal_create({
                     "name": cli_option(terminal_args, "--name", default=None),
                     "command": cli_option(terminal_args, "--command", "--default-command", default=None),
                 }), indent=2))
                 return
-            if action in {"close", "rm", "remove"}:
+            if action == "close":
                 target_id = terminal_id or (terminal_args[0] if terminal_args and not terminal_args[0].startswith("-") else None)
                 print(json.dumps(gateway_terminal_close({"terminal_id": target_id}), indent=2))
                 return
@@ -12898,7 +12995,7 @@ def cli_main(argv):
                     "text": cli_option(terminal_args, "--text", default=None),
                 }), indent=2))
                 return
-            if action in {"input", "send"}:
+            if action == "input":
                 text = cli_option(terminal_args, "--text", "--input", default=None)
                 if text is None:
                     text_parts = []
@@ -12916,15 +13013,19 @@ def cli_main(argv):
                     text = " ".join(text_parts)
                 print(json.dumps(gateway_terminal_input({"terminal_id": terminal_id, "input": text}), indent=2))
                 return
+            if action in {"ls", "status", "new", "rm", "remove", "send"}:
+                raise RuntimeError(
+                    f"unknown gateway terminal action: {action}. Use one of: list, create, close, capture, key, input."
+                )
             raise RuntimeError("unknown gateway terminal action")
-        if subcommand in {"schedule", "schedules", "cron", "crons"}:
+        if subcommand == "schedule":
             action = args[0] if args else "list"
+            if action in {"ls", "status", "new", "edit", "rm", "remove", "run-now", "now", "schedules", "cron", "crons"}:
+                raise RuntimeError(
+                    f"unknown gateway schedule action: {action}. Use one of: list, create, update, delete, run."
+                )
             schedule_args = args[1:] if args else []
-            if subcommand in {"schedules", "crons"} and action not in {"create", "new", "update", "edit", "delete", "rm", "remove", "run", "run-now", "now"}:
-                action = "list"
-                schedule_args = args
             cli_gateway_require_unlocked(schedule_args, "managing gateway schedules")
-            schedule_id = cli_option(schedule_args, "--schedule", "--schedule-id", "--id", default=None)
             payload = {
                 "schedule_id": schedule_id,
                 "name": cli_option(schedule_args, "--name", default=None),
@@ -12936,31 +13037,35 @@ def cli_main(argv):
                 payload["enabled"] = False
             if cli_flag(schedule_args, "--enabled", "--on"):
                 payload["enabled"] = True
-            if action in {"list", "ls", "status"}:
+            if action == "list":
                 print(json.dumps(gateway_schedule_list({}), indent=2))
                 return
-            if action in {"create", "new"}:
+            if action == "create":
                 print(json.dumps(gateway_schedule_create(payload), indent=2))
                 return
-            if action in {"update", "edit"}:
+            if action == "update":
                 if not payload.get("schedule_id"):
                     payload["schedule_id"] = schedule_args[0] if schedule_args and not schedule_args[0].startswith("-") else None
                 print(json.dumps(gateway_schedule_update(payload), indent=2))
                 return
-            if action in {"delete", "rm", "remove"}:
+            if action == "delete":
                 if not payload.get("schedule_id"):
                     payload["schedule_id"] = schedule_args[0] if schedule_args and not schedule_args[0].startswith("-") else None
                 print(json.dumps(gateway_schedule_delete(payload), indent=2))
                 return
-            if action in {"run", "run-now", "now"}:
+            if action == "run":
                 if not payload.get("schedule_id"):
                     payload["schedule_id"] = schedule_args[0] if schedule_args and not schedule_args[0].startswith("-") else None
                 print(json.dumps(gateway_schedule_run_now(payload), indent=2))
                 return
+            if action in {"ls", "status", "new", "edit", "rm", "remove", "run-now", "now", "schedules", "cron", "crons"}:
+                raise RuntimeError(
+                    f"unknown gateway schedule action: {action}. Use one of: list, create, update, delete, run."
+                )
             raise RuntimeError("unknown gateway schedule action")
-        if subcommand in {"service", "preregister"}:
-            service_action = args[0] if args and subcommand == "service" else "preregister"
-            service_args = args[1:] if args and subcommand == "service" else args
+        if subcommand == "service":
+            service_action = args[0] if args else "preregister"
+            service_args = args[1:] if args else []
             payload = {
                 "bootstrap_token": cli_option(service_args, "--bootstrap-token", default=None),
                 "activation_token": cli_option(service_args, "--activation-token", default=None),
@@ -12971,21 +13076,24 @@ def cli_main(argv):
                 "image_ref": cli_option(service_args, "--image", "--image-ref", default=None),
                 "token_expires_in_hours": cli_option(service_args, "--token-expires-in-hours", default=None),
             }
-            if service_action in {"preregister", "register", "bootstrap"}:
+            if service_action == "preregister":
                 print(json.dumps(gateway_service_preregister(payload), indent=2))
                 return
-            if service_action in {"activate", "claim"}:
+            if service_action == "activate":
                 print(json.dumps(gateway_service_activate(payload), indent=2))
                 return
-            if service_action in {"run", "start"}:
-                gateway_service_run(payload)
-                return
-            raise RuntimeError("unknown gateway service action; use preregister|activate|run")
+            if service_action in {"register", "bootstrap", "claim", "run", "start", "ls", "list", "status"}:
+                raise RuntimeError(
+                    f"unknown gateway service action: {service_action}. "
+                    "Use one of: preregister, activate. "
+                    "Use `nap service start|stop|status|logs` for the local gateway service lifecycle."
+                )
+            raise RuntimeError("unknown gateway service action; use preregister|activate")
         if subcommand == "vault":
             action = args[0] if args else "status"
             vault_args = args[1:] if args else []
             if action in {"help", "-h", "--help"}:
-                print("Usage: napseer_mcp_server.py gateway vault [status|list|process|rotate-secret] [--kind memory] [--all] [--project-id ID]")
+                print("Usage: napseer_mcp_server.py gateway vault [status|process|rotate-secret] [--kind memory] [--all] [--project-id ID]")
                 print("Chat secrets use: nap chat secret setup|status|rotate")
                 return
             payload = {
@@ -12994,30 +13102,42 @@ def cli_main(argv):
                 "complete_all": cli_flag(vault_args, "--all", "--complete-all"),
                 "vault_passphrase": cli_option(vault_args, "--vault-passphrase", "--passphrase", default=None),
             }
-            if action in {"list", "ls", "status"}:
+            if action == "status":
                 print(json.dumps(gateway_vault_status(payload), indent=2))
                 return
             if action == "process":
                 print(json.dumps(gateway_process_vault_setup_requests(payload), indent=2))
                 return
             if action == "rotate-secret":
-                if not payload.get("secret_kind"):
-                    payload["secret_kind"] = vault_args[0] if vault_args and not vault_args[0].startswith("-") else "memory"
+                payload.setdefault("secret_kind", "memory")
                 print(json.dumps(gateway_rotate_project_vault_secret(payload), indent=2))
                 return
-            raise RuntimeError("unknown gateway vault action; use status|list|process|rotate-secret")
+            if action in {"list", "ls"}:
+                raise RuntimeError(
+                    "unknown gateway vault action: list. Use `nap gateway vault status`."
+                )
+            raise RuntimeError("unknown gateway vault action; use status|process|rotate-secret")
         if subcommand == "setup":
             print(json.dumps(gateway_setup({
                 "passphrase": cli_option(args, "--passphrase", default=None),
                 "default_command": cli_option(args, "--command", default=cli_option(args, "--default-command", default=None)),
             }), indent=2))
             return
-        if subcommand in {"rotate-passphrase", "change-passphrase", "passwd"}:
+        if subcommand == "rotate-passphrase":
             print(json.dumps(gateway_rotate_passphrase({
                 "new_passphrase": cli_option(args, "--new-passphrase", "--passphrase", default=None),
             }), indent=2))
             return
-        print("Usage: napseer_mcp_server.py gateway [status|configure [--command CMD] [--target session:window.pane]|vault [status|list|process|rotate-secret] [--kind memory] [--all]|terminal [list|create|close|capture|input]|schedule [list|create|update|delete|run]|restart|kill|setup|rotate-passphrase --new-passphrase TEXT]")
+        if subcommand in {"change-passphrase", "passwd"}:
+            raise RuntimeError(
+                f"unknown gateway subcommand: {subcommand}. Use `nap gateway rotate-passphrase`."
+            )
+        if subcommand in {"ls", "list", "terminals", "schedules", "cron", "crons", "preregister", "register", "bootstrap"}:
+            raise RuntimeError(
+                f"unknown gateway subcommand: {subcommand}. "
+                "Use one of: status, configure, vault, terminal, schedule, service, restart, kill, setup, rotate-passphrase."
+            )
+        print("Usage: napseer_mcp_server.py gateway [status|configure [--command CMD] [--target session:window.pane]|vault [status|process|rotate-secret] [--kind memory] [--all]|terminal [list|create|close|capture|key|input]|schedule [list|create|update|delete|run]|service [preregister|activate]|restart|kill|setup|rotate-passphrase --new-passphrase TEXT]")
         return
     if command == "chat":
         subcommand = argv[2] if len(argv) > 2 else "secret"
@@ -13035,9 +13155,13 @@ def cli_main(argv):
         if action in {"status", "show", "ls", "list"}:
             print(json.dumps(chat_secret_status(payload), indent=2))
             return
-        if action in {"setup", "configure", "init"}:
+        if action == "setup":
             print(json.dumps(chat_secret_setup(payload), indent=2))
             return
+        if action in {"configure", "init"}:
+            raise RuntimeError(
+                f"unknown chat secret action: {action}. Use `nap chat secret setup`."
+            )
         if action in {"rotate", "rotate-secret"}:
             print(json.dumps(chat_secret_rotate(payload), indent=2))
             return
@@ -13046,7 +13170,7 @@ def cli_main(argv):
     if command == "feedback":
         subcommand = argv[2] if len(argv) > 2 else "list"
         args = argv[3:]
-        if subcommand in {"list", "ls"}:
+        if subcommand == "list":
             query = {
                 "status": cli_option(args, "--status", default=None),
                 "kind": cli_option(args, "--kind", default=None),
@@ -13058,7 +13182,7 @@ def cli_main(argv):
                 query["status"] = "open"
             print(json.dumps(list_feedback_reports(query), indent=2))
             return
-        if subcommand in {"admin", "admin-list", "global", "global-list"}:
+        if subcommand == "global":
             query = {
                 "account_id": cli_option(args, "--account-id", default=None),
                 "status": cli_option(args, "--status", default=None),
@@ -13071,17 +13195,21 @@ def cli_main(argv):
                 query["status"] = "open"
             print(json.dumps(list_admin_feedback_reports(query), indent=2))
             return
-        if subcommand in {"status", "set-status", "update"}:
-            if len(args) < 2:
-                raise RuntimeError("nap feedback status requires <feedback_id> <status>")
+        if subcommand == "set":
+            if len(args) < 1:
+                raise RuntimeError("nap feedback set requires <feedback_id> --status STATUS")
+            feedback_id = args[0]
+            status = cli_option(args, "--status", default=None)
+            if not status:
+                raise RuntimeError("nap feedback set requires --status STATUS")
             print(json.dumps(update_feedback_status({
-                "feedback_id": args[0],
-                "status": args[1],
+                "feedback_id": feedback_id,
+                "status": status,
                 "resolution": cli_option(args, "--resolution", default=None),
                 "notes": cli_option(args, "--notes", default=None),
             }), indent=2))
             return
-        if subcommand in {"resolve", "resolved"}:
+        if subcommand == "resolve":
             if not args:
                 raise RuntimeError("nap feedback resolve requires <feedback_id>")
             print(json.dumps(update_feedback_status({
@@ -13091,15 +13219,19 @@ def cli_main(argv):
                 "notes": cli_option(args, "--notes", default=None),
             }), indent=2))
             return
-        print("Usage: napseer_mcp_server.py feedback [list [--status STATUS|--all]|global [--account-id ID] [--status STATUS|--all]|status <id> <status>|resolve <id> [--notes TEXT]]")
+        if subcommand in {"ls", "admin", "admin-list", "global-list", "status", "set-status", "update", "resolved"}:
+            raise RuntimeError(
+                f"unknown feedback subcommand: {subcommand}. Use one of: list, global, set, resolve."
+            )
+        print("Usage: napseer_mcp_server.py feedback [list [--status STATUS|--all]|global [--account-id ID] [--status STATUS|--all]|set <id> --status STATUS [--resolution TEXT] [--notes TEXT]|resolve <id> [--notes TEXT]]")
         return
     if command == "agent":
         subcommand = argv[2] if len(argv) > 2 else "help"
         slug = argv[3] if len(argv) > 3 else ""
-        if subcommand in {"list", "ls", "registered"}:
+        if subcommand == "list":
             print(json.dumps(list_registered_agents({}), indent=2))
             return
-        if subcommand in {"workspaces", "workspace-list"}:
+        if subcommand == "workspaces":
             print(json.dumps(list_agent_workspaces({}), indent=2))
             return
         if subcommand == "create" and slug:
@@ -13117,6 +13249,10 @@ def cli_main(argv):
                 except KeyboardInterrupt:
                     return
             return
+        if subcommand in {"ls", "registered", "workspace-list"}:
+            raise RuntimeError(
+                f"unknown agent subcommand: {subcommand}. Use one of: list, workspaces, create, show, edit."
+            )
         print("Usage: napseer_mcp_server.py agent [list|workspaces|create <slug>|show <slug>|edit <slug>]")
         return
     if command in {"help", "-h", "--help"}:
