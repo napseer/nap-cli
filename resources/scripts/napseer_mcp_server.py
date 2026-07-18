@@ -438,12 +438,15 @@ PUBLIC_AUTH_KEYS = {
     "operator_subject",
     "operator_email",
     "operator_username",
+    "oauth_client_id",
+    "oauth_scope",
 }
 SECRET_AUTH_KEYS = {
     "token",
     "access_token",
     "refresh_token",
     "token_expires_at",
+    "refresh_expires_at",
     "local_auth_secret",
     "local_auth_purpose",
     "ssh_key_path",
@@ -1197,7 +1200,8 @@ def gateway_status():
         "worker_id": AUTH.get("worker_id"),
         "token_expires_at": TOKEN_EXPIRES_AT,
         "has_token": bool(TOKEN),
-        "has_ssh_key": bool(AUTH.get("ssh_private_key")) or pathlib.Path(AUTH["ssh_key_path"]).expanduser().exists(),
+        "has_refresh_token": bool(REFRESH_TOKEN),
+        "legacy_ssh_key_present": bool(AUTH.get("ssh_private_key")) or pathlib.Path(AUTH["ssh_key_path"]).expanduser().exists(),
         "tmux_target": VAULT_SECRETS.get("gateway_tmux_target") if unlocked else None,
         "default_command": VAULT_SECRETS.get("gateway_default_command") if unlocked else None,
         "managed_session": VAULT_SECRETS.get("gateway_managed_session") if unlocked else None,
@@ -5287,7 +5291,9 @@ def load_auth(public_override=None, secret_override=None):
         "base_url": os.environ.get("NAPSEER_BASE_URL") or merged.get("base_url") or "https://api.napseer.com",
         "account_id": os.environ.get("NAPSEER_ACCOUNT_ID") or merged.get("account_id") or merged.get("claimed_account_id"),
         "token": os.environ.get("NAPSEER_TOKEN") or merged.get("token") or merged.get("access_token"),
+        "refresh_token": os.environ.get("NAPSEER_REFRESH_TOKEN") or merged.get("refresh_token"),
         "token_expires_at": merged.get("token_expires_at"),
+        "refresh_expires_at": merged.get("refresh_expires_at"),
         "local_auth_secret": os.environ.get("NAPSEER_LOCAL_AUTH_SECRET") or merged.get("local_auth_secret"),
         "local_auth_purpose": os.environ.get("NAPSEER_LOCAL_AUTH_PURPOSE") or merged.get("local_auth_purpose"),
         "project_id": os.environ.get("NAPSEER_PROJECT_ID") or merged.get("project_id"),
@@ -5304,6 +5310,8 @@ def load_auth(public_override=None, secret_override=None):
         "ssh_public_key": merged.get("ssh_public_key"),
         "worker_capabilities": merged.get("worker_capabilities") or {"local_mcp": True, "mcp_wrapper": SCRIPT_NAME},
         "account_mode": merged.get("account_mode"),
+        "oauth_client_id": merged.get("oauth_client_id"),
+        "oauth_scope": merged.get("oauth_scope"),
         "service_registration_id": merged.get("service_registration_id"),
     }
 
@@ -5315,6 +5323,8 @@ LOCAL_AUTH_SECRET = AUTH.get("local_auth_secret")
 LOCAL_AUTH_PURPOSE = AUTH.get("local_auth_purpose")
 DEFAULT_PROJECT_ID = AUTH["project_id"]
 TOKEN_EXPIRES_AT = AUTH["token_expires_at"]
+REFRESH_TOKEN = AUTH.get("refresh_token")
+REFRESH_EXPIRES_AT = AUTH.get("refresh_expires_at")
 PROTOCOL_VERSION = "2025-11-25"
 SCHEDULE_SIGNATURE_NAMESPACE = "napseer-schedule-v1"
 HTTP_TIMEOUT_SECONDS = int(os.environ.get("NAPSEER_HTTP_TIMEOUT_SECONDS", "30"))
@@ -5727,7 +5737,13 @@ def request_json(method, path, payload=None, token_required=True, retry_auth=Tru
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8")
         if exc.code == 401 and token_required and retry_auth:
-            renew_auth()
+            try:
+                renew_auth()
+            except Exception as renew_exc:
+                raise RuntimeError(
+                    f"{method} {path} failed: HTTP 401 after renew attempt "
+                    f"({renew_exc}). Run `nap project attach` to re-auth this directory."
+                ) from renew_exc
             return request_json(method, path, payload, token_required=True, retry_auth=False, extra_headers=extra_headers)
         raise RuntimeError(f"{method} {path} failed: HTTP {exc.code}: {body_text}") from exc
 
@@ -6576,6 +6592,82 @@ def sign_with_auth_key(namespace, text):
 
 
 def renew_auth():
+    oauth_refresh_error = None
+    if AUTH.get("account_mode") in {"operator_account", "operator_project", "claimed"} and REFRESH_TOKEN:
+        try:
+            refreshed = request_form_json(
+                "POST",
+                "/v1/oauth/token",
+                {
+                    "grant_type": "refresh_token",
+                    "client_id": AUTH.get("oauth_client_id") or "nap-cli",
+                    "code": REFRESH_TOKEN,
+                },
+                token_required=False,
+            )
+        except RuntimeError as exc:
+            oauth_refresh_error = exc
+            refreshed = None
+        if refreshed is not None:
+            save_auth(
+                {
+                    "base_url": BASE_URL,
+                    "token": refreshed["access_token"],
+                    "token_expires_at": iso_timestamp_after_seconds(int(refreshed.get("expires_in") or 0)),
+                    "refresh_token": refreshed.get("refresh_token") or REFRESH_TOKEN,
+                    "refresh_expires_at": refreshed.get("refresh_expires_at"),
+                    "project_id": refreshed.get("project_id") or DEFAULT_PROJECT_ID,
+                }
+            )
+            return {
+                "status": "renewed",
+                "method": "oauth_refresh",
+                "token_expires_at": TOKEN_EXPIRES_AT,
+                "project_id": DEFAULT_PROJECT_ID,
+            }
+
+    if REFRESH_TOKEN:
+        try:
+            refreshed = request_json(
+                "POST",
+                "/v1/enrollment/refresh",
+                {"refresh_token": REFRESH_TOKEN},
+                token_required=False,
+            )
+        except RuntimeError as enrollment_refresh_error:
+            if oauth_refresh_error is not None:
+                raise RuntimeError(
+                    f"OAuth refresh failed ({oauth_refresh_error}); enrollment fallback also failed "
+                    f"({enrollment_refresh_error})"
+                ) from enrollment_refresh_error
+            raise
+        token = refreshed["token"]
+        worker = refreshed.get("worker") or {}
+        save_auth(
+            {
+                "base_url": BASE_URL,
+                "token": token["access_token"],
+                "refresh_token": token.get("refresh_token") or REFRESH_TOKEN,
+                "token_expires_at": token.get("expires_at"),
+                "refresh_expires_at": token.get("refresh_expires_at"),
+                "project_id": worker.get("project_id") or DEFAULT_PROJECT_ID,
+                "worker_id": worker.get("id") or AUTH.get("worker_id"),
+                "agent_id": worker.get("agent_id") or AUTH.get("agent_id"),
+                "worker_name": worker.get("name") or AUTH.get("worker_name"),
+                "device_fingerprint": worker.get("device_fingerprint") or AUTH.get("device_fingerprint"),
+                "root_path": worker.get("root_path") or AUTH.get("root_path"),
+            }
+        )
+        return {
+            "status": "renewed",
+            "method": "enrollment_refresh",
+            "token_expires_at": TOKEN_EXPIRES_AT,
+            "refresh_expires_at": REFRESH_EXPIRES_AT,
+            "worker_id": AUTH.get("worker_id"),
+            "agent_id": AUTH.get("agent_id"),
+            "project_id": DEFAULT_PROJECT_ID,
+        }
+
     public_key = auth_public_key()
     challenge = request_json(
         "POST",
@@ -6600,7 +6692,9 @@ def renew_auth():
         {
             "base_url": BASE_URL,
             "token": verified["token"]["access_token"],
+            "refresh_token": verified["token"].get("refresh_token"),
             "token_expires_at": verified["token"].get("expires_at"),
+            "refresh_expires_at": verified["token"].get("refresh_expires_at"),
             "worker_id": verified["worker"]["id"],
             "agent_id": verified["worker"]["agent_id"],
             "worker_name": verified["worker"]["name"],
@@ -6610,7 +6704,9 @@ def renew_auth():
     )
     return {
         "status": "renewed",
+        "method": "legacy_ssh_enrollment",
         "token_expires_at": verified["token"].get("expires_at"),
+        "refresh_expires_at": verified["token"].get("refresh_expires_at"),
         "worker_id": verified["worker"]["id"],
         "agent_id": verified["worker"]["agent_id"],
     }
@@ -6758,7 +6854,36 @@ LOCAL_PROJECT_OAUTH_SCOPE = (
 )
 
 
-def operator_loopback_login(args=None):
+def operator_account_login(args=None):
+    args = args or {}
+    result = oauth_loopback_authorize({
+        **args,
+        "flow": "operator_login",
+        "scope": args.get("scope") or "openid profile email napseer.projects.read",
+    })
+    token_expires_at = iso_timestamp_after_seconds(int(result.get("expires_in") or 0))
+    save_auth({
+        "base_url": result.get("api_base_url") or BASE_URL,
+        "token": result.get("access_token"),
+        "refresh_token": result.get("refresh_token"),
+        "token_expires_at": token_expires_at,
+        "refresh_expires_at": result.get("refresh_expires_at"),
+        "account_mode": "operator_account",
+        "oauth_client_id": "nap-cli",
+        "oauth_scope": result.get("scope"),
+    })
+    return {
+        "status": "authenticated",
+        "mode": "operator_account",
+        "auth_path": str(AUTH_PATH),
+        "base_url": result.get("api_base_url") or BASE_URL,
+        "scope": result.get("scope"),
+        "token_expires_at": token_expires_at,
+        "message": "OAuth2 PKCE account token stored. Run `nap project attach` to select a project for this directory.",
+    }
+
+
+def operator_project_attach(args=None):
     args = args or {}
     result = oauth_loopback_authorize({
         **args,
@@ -6768,16 +6893,18 @@ def operator_loopback_login(args=None):
     project_id = result.get("project_id")
     if not project_id:
         raise RuntimeError("OAuth authorization did not return a selected project_id")
-    operator_auth = {
-        "base_url": result["api_base_url"],
-        "token": result["access_token"],
-        "token_expires_at": iso_timestamp_after_seconds(int(result.get("expires_in") or 0)),
+    token_expires_at = iso_timestamp_after_seconds(int(result.get("expires_in") or 0))
+    save_auth({
+        "base_url": result.get("api_base_url") or BASE_URL,
+        "token": result.get("access_token"),
+        "refresh_token": result.get("refresh_token"),
+        "token_expires_at": token_expires_at,
+        "refresh_expires_at": result.get("refresh_expires_at"),
         "project_id": project_id,
         "account_mode": "operator_project",
         "oauth_client_id": "nap-cli",
         "oauth_scope": result.get("scope"),
-    }
-    save_auth_file_credentials(operator_auth)
+    })
     try:
         project = request_json("GET", f"/v1/projects/{project_id}")
         save_auth_file_credentials({
@@ -6788,19 +6915,20 @@ def operator_loopback_login(args=None):
     except Exception:
         project = None
     return {
-        "status": "authenticated",
+        "status": "attached",
+        "mode": "operator_project",
         "auth_path": str(AUTH_PATH),
-        "base_url": result["api_base_url"],
+        "base_url": result.get("api_base_url") or BASE_URL,
         "project_id": project_id,
         "project": project,
         "scope": result.get("scope"),
-        "token_expires_at": operator_auth["token_expires_at"],
-        "message": "OAuth2 PKCE loopback token and selected project stored in this folder's Napseer auth state.",
+        "token_expires_at": token_expires_at,
+        "message": "OAuth2 PKCE project token and selected project stored in this directory's Napseer auth state.",
     }
 
 
 def save_auth_file_credentials(updates):
-    global AUTH, BASE_URL, TOKEN, DEFAULT_PROJECT_ID, TOKEN_EXPIRES_AT
+    global AUTH, BASE_URL, TOKEN, DEFAULT_PROJECT_ID, TOKEN_EXPIRES_AT, REFRESH_TOKEN, REFRESH_EXPIRES_AT
     current_public = load_public_auth_file()
     current_public.update({key: value for key, value in updates.items() if value is not None})
     write_public_auth(current_public)
@@ -6809,10 +6937,12 @@ def save_auth_file_credentials(updates):
     TOKEN = AUTH["token"]
     DEFAULT_PROJECT_ID = AUTH["project_id"]
     TOKEN_EXPIRES_AT = AUTH["token_expires_at"]
+    REFRESH_TOKEN = AUTH.get("refresh_token")
+    REFRESH_EXPIRES_AT = AUTH.get("refresh_expires_at")
 
 
 def save_auth(updates):
-    global AUTH, BASE_URL, TOKEN, DEFAULT_PROJECT_ID, TOKEN_EXPIRES_AT, VAULT_SECRETS
+    global AUTH, BASE_URL, TOKEN, DEFAULT_PROJECT_ID, TOKEN_EXPIRES_AT, REFRESH_TOKEN, REFRESH_EXPIRES_AT, VAULT_SECRETS
     current_public = load_public_auth_file()
     cleaned = {key: value for key, value in updates.items() if value is not None}
     if vault_exists():
@@ -6836,16 +6966,20 @@ def save_auth(updates):
     TOKEN = AUTH["token"]
     DEFAULT_PROJECT_ID = AUTH["project_id"]
     TOKEN_EXPIRES_AT = AUTH["token_expires_at"]
+    REFRESH_TOKEN = AUTH.get("refresh_token")
+    REFRESH_EXPIRES_AT = AUTH.get("refresh_expires_at")
 
 
 def refresh_public_auth_state():
-    global AUTH, BASE_URL, TOKEN, DEFAULT_PROJECT_ID, TOKEN_EXPIRES_AT
+    global AUTH, BASE_URL, TOKEN, DEFAULT_PROJECT_ID, TOKEN_EXPIRES_AT, REFRESH_TOKEN, REFRESH_EXPIRES_AT
     public = load_public_auth_file()
     AUTH = load_auth(public_override=public, secret_override=VAULT_SECRETS if gateway_is_unlocked() else {})
     BASE_URL = AUTH["base_url"].rstrip("/")
     TOKEN = AUTH["token"]
     DEFAULT_PROJECT_ID = AUTH["project_id"]
     TOKEN_EXPIRES_AT = AUTH["token_expires_at"]
+    REFRESH_TOKEN = AUTH.get("refresh_token")
+    REFRESH_EXPIRES_AT = AUTH.get("refresh_expires_at")
     return AUTH
 
 
@@ -10090,7 +10224,9 @@ def claim_account(args):
         {
             "base_url": token_result.get("api_base_url") or BASE_URL,
             "token": token_result.get("access_token"),
+            "refresh_token": token_result.get("refresh_token"),
             "token_expires_at": token_expires_at,
+            "refresh_expires_at": token_result.get("refresh_expires_at"),
             "oauth_client_id": "nap-cli",
             "oauth_scope": token_result.get("scope"),
             "account_claim_url": claim.get("claim_url"),
@@ -12827,7 +12963,7 @@ def cli_main(argv):
         subcommand = argv[2] if len(argv) > 2 else "status"
         args = argv[3:]
         if subcommand == "login-local":
-            print(json.dumps(operator_loopback_login({
+            print(json.dumps(operator_account_login({
                 "frontend_url": cli_option(args, "--frontend-url", default=None),
                 "api_base_url": cli_option(args, "--api-base-url", "--base-url", default=None),
                 "open_browser": not cli_flag(args, "--no-browser"),
@@ -12847,7 +12983,7 @@ def cli_main(argv):
     if command == "project":
         subcommand = argv[2] if len(argv) > 2 else "help"
         if subcommand == "attach":
-            print(json.dumps(operator_loopback_login({
+            print(json.dumps(operator_project_attach({
                 "frontend_url": cli_option(argv[3:], "--frontend-url", default=None),
                 "api_base_url": cli_option(argv[3:], "--api-base-url", "--base-url", default=None),
                 "open_browser": not cli_flag(argv[3:], "--no-browser"),

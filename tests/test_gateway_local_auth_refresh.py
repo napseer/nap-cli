@@ -74,6 +74,30 @@ def run():
     assert vault_writes[-1][0] == b"k" * 32
     assert vault_writes[-1][1]["secrets"]["gateway_default_command"] == "bash -l"
 
+    oauth_saves = []
+    mod.AUTH.update({
+        "account_mode": "operator_project",
+        "oauth_client_id": "nap-cli",
+        "refresh_token": "old-oauth-refresh",
+    })
+    mod.REFRESH_TOKEN = "old-oauth-refresh"
+    mod.REFRESH_EXPIRES_AT = "old-refresh-expiry"
+    mod.request_form_json = lambda method, path, payload, token_required=False: {
+        "access_token": "fresh-oauth-access",
+        "refresh_token": "fresh-oauth-refresh",
+        "refresh_expires_at": "new-refresh-expiry",
+        "expires_in": 3600,
+        "project_id": "project_1",
+    }
+    mod.save_auth = lambda updates: oauth_saves.append(dict(updates))
+    mod.request_json = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("OAuth refresh must not call the enrollment endpoint")
+    )
+    result = mod.renew_auth()
+    assert result["method"] == "oauth_refresh"
+    assert oauth_saves[0]["refresh_token"] == "fresh-oauth-refresh"
+    assert oauth_saves[0]["refresh_expires_at"] == "new-refresh-expiry"
+
     print("ok: local gateway auth refresh smoke passed")
 
 
