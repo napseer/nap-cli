@@ -6591,6 +6591,56 @@ def sign_with_auth_key(namespace, text):
     return sign_text(namespace, pathlib.Path(AUTH["ssh_key_path"]).expanduser(), text)
 
 
+def renew_anonymous_auth_with_ssh():
+    """Recover an anonymous worker using its durable local signing key."""
+    public_key = auth_public_key()
+    challenge = request_json(
+        "POST",
+        "/v1/enrollment/challenges",
+        {
+            "public_key": public_key,
+            "worker_name": AUTH["worker_name"],
+            "device_fingerprint": AUTH["device_fingerprint"],
+            "root_path": AUTH["root_path"],
+            "worker_capabilities": AUTH["worker_capabilities"],
+        },
+        token_required=False,
+    )
+    signature = sign_with_auth_key("napseer", challenge["challenge_text"])
+    verified = request_json(
+        "POST",
+        "/v1/enrollment/verify",
+        {"challenge_id": challenge["challenge_id"], "signature": signature},
+        token_required=False,
+    )
+    worker = verified["worker"]
+    token = verified["token"]
+    save_auth(
+        {
+            "base_url": BASE_URL,
+            "token": token["access_token"],
+            "refresh_token": token.get("refresh_token"),
+            "token_expires_at": token.get("expires_at"),
+            "refresh_expires_at": token.get("refresh_expires_at"),
+            "project_id": worker.get("project_id") or DEFAULT_PROJECT_ID,
+            "worker_id": worker["id"],
+            "agent_id": worker["agent_id"],
+            "worker_name": worker["name"],
+            "device_fingerprint": worker["device_fingerprint"],
+            "root_path": worker["root_path"],
+        }
+    )
+    return {
+        "status": "renewed",
+        "method": "anonymous_ssh_recovery",
+        "token_expires_at": token.get("expires_at"),
+        "refresh_expires_at": token.get("refresh_expires_at"),
+        "worker_id": worker["id"],
+        "agent_id": worker["agent_id"],
+        "project_id": worker.get("project_id") or DEFAULT_PROJECT_ID,
+    }
+
+
 def renew_auth():
     oauth_refresh_error = None
     if AUTH.get("account_mode") in {"operator_account", "operator_project", "claimed"} and REFRESH_TOKEN:
@@ -6640,6 +6690,8 @@ def renew_auth():
                     f"OAuth refresh failed ({oauth_refresh_error}); enrollment fallback also failed "
                     f"({enrollment_refresh_error})"
                 ) from enrollment_refresh_error
+            if AUTH.get("account_mode") in {None, "anonymous"}:
+                return renew_anonymous_auth_with_ssh()
             raise
         token = refreshed["token"]
         worker = refreshed.get("worker") or {}
@@ -6668,48 +6720,7 @@ def renew_auth():
             "project_id": DEFAULT_PROJECT_ID,
         }
 
-    public_key = auth_public_key()
-    challenge = request_json(
-        "POST",
-        "/v1/enrollment/challenges",
-        {
-            "public_key": public_key,
-            "worker_name": AUTH["worker_name"],
-            "device_fingerprint": AUTH["device_fingerprint"],
-            "root_path": AUTH["root_path"],
-            "worker_capabilities": AUTH["worker_capabilities"],
-        },
-        token_required=False,
-    )
-    signature = sign_with_auth_key("napseer", challenge["challenge_text"])
-    verified = request_json(
-        "POST",
-        "/v1/enrollment/verify",
-        {"challenge_id": challenge["challenge_id"], "signature": signature},
-        token_required=False,
-    )
-    save_auth(
-        {
-            "base_url": BASE_URL,
-            "token": verified["token"]["access_token"],
-            "refresh_token": verified["token"].get("refresh_token"),
-            "token_expires_at": verified["token"].get("expires_at"),
-            "refresh_expires_at": verified["token"].get("refresh_expires_at"),
-            "worker_id": verified["worker"]["id"],
-            "agent_id": verified["worker"]["agent_id"],
-            "worker_name": verified["worker"]["name"],
-            "device_fingerprint": verified["worker"]["device_fingerprint"],
-            "root_path": verified["worker"]["root_path"],
-        }
-    )
-    return {
-        "status": "renewed",
-        "method": "legacy_ssh_enrollment",
-        "token_expires_at": verified["token"].get("expires_at"),
-        "refresh_expires_at": verified["token"].get("refresh_expires_at"),
-        "worker_id": verified["worker"]["id"],
-        "agent_id": verified["worker"]["agent_id"],
-    }
+    return renew_anonymous_auth_with_ssh()
 
 
 def jwt_claims(token):
@@ -7038,7 +7049,9 @@ def ensure_enrolled(args=None):
         {
             "base_url": BASE_URL,
             "token": verified["token"]["access_token"],
+            "refresh_token": verified["token"].get("refresh_token"),
             "token_expires_at": verified["token"].get("expires_at"),
+            "refresh_expires_at": verified["token"].get("refresh_expires_at"),
             "worker_id": verified["worker"]["id"],
             "agent_id": verified["worker"]["agent_id"],
             "worker_name": worker_name,
@@ -7050,7 +7063,11 @@ def ensure_enrolled(args=None):
             "account_mode": AUTH.get("account_mode") or "anonymous",
         }
     )
-    return {"status": "enrolled", "token_expires_at": verified["token"].get("expires_at")}
+    return {
+        "status": "enrolled",
+        "token_expires_at": verified["token"].get("expires_at"),
+        "refresh_expires_at": verified["token"].get("refresh_expires_at"),
+    }
 
 
 def gateway_service_preregister(args=None):
