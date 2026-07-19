@@ -9765,12 +9765,11 @@ def classify_memory_query(args):
 
 
 def get_memory_context(args):
-    if args.get("path") or args.get("paths"):
-        raise RuntimeError("paths are index/routes only; resolve them with nap_node_by_path, then use node_id/uri inputs")
     raw_node_ids = args.get("node_ids") or ([args["node_id"]] if args.get("node_id") else [])
     raw_uris = args.get("uris") or ([args["uri"]] if args.get("uri") else [])
-    if not raw_node_ids and not raw_uris:
-        raise RuntimeError("node_id, node_ids, uri, or uris is required")
+    raw_paths = args.get("paths") or ([args["path"]] if args.get("path") else [])
+    if not raw_node_ids and not raw_uris and not raw_paths:
+        raise RuntimeError("path, paths, node_id, node_ids, uri, or uris is required")
     max_nodes = max(1, min(int(args.get("max_nodes", 20)), 100))
     depth = max(0, min(int(args.get("depth", 1)), 2))
     default_view = "summary"
@@ -9780,6 +9779,8 @@ def get_memory_context(args):
         queue.append(("node", get_node_by_id({"node_id": node_id})))
     for uri in raw_uris:
         queue.append(("node", node_by_uri({"uri": uri})["node"]))
+    for path in raw_paths:
+        queue.append(("path", normalize_node_path(path)))
     nodes = []
     edges = []
     seen_paths = set()
@@ -11562,10 +11563,12 @@ def raw_tools():
         *kanban_workflow_tool_schemas(),
         {
             "name": "nap_context",
-            "description": "Fetch one or more nodes plus bounded outgoing links and backlinks for surrounding context.",
+            "description": "Resolve one or more paths, node IDs, or nap:// URIs and fetch bounded outgoing links and backlinks in one call.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "path": {"type": "string", "description": "Readable route to resolve internally; canonical identity is returned in the result."},
+                    "paths": {"type": "array", "items": {"type": "string"}},
                     "node_id": {"type": "string"},
                     "node_ids": {"type": "array", "items": {"type": "string"}},
                     "uri": {"type": "string"},

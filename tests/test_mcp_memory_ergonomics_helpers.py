@@ -329,8 +329,8 @@ def test_tools_include_node_by_path_descriptor(mod):
     assert "node_ids" in context_schema["properties"]
     assert "uri" in context_schema["properties"]
     assert "uris" in context_schema["properties"]
-    assert "path" not in context_schema["properties"]
-    assert "paths" not in context_schema["properties"]
+    assert "path" in context_schema["properties"]
+    assert "paths" in context_schema["properties"]
 
     related_schema = next(item for item in mod.tools() if item["name"] == "nap_find_related")["inputSchema"]
     assert "node_id" in related_schema["properties"]
@@ -599,6 +599,8 @@ def test_context_and_related_use_identity_inputs(mod):
         raise AssertionError(f"unexpected node_id {node_id}")
 
     def fake_read_by_path(args, allow_agent=False):
+        if args["path"] == "/notes/root":
+            return root
         if args["path"] == "/notes/linked":
             return linked
         if args["path"] == "/notes/backlink":
@@ -627,8 +629,8 @@ def test_context_and_related_use_identity_inputs(mod):
     assert related["target"]["full_path"] == "/notes/root"
     assert {item["full_path"] for item in related["items"]} >= {"/notes/backlink", "/notes/linked"}
 
-    with pytest.raises(RuntimeError, match="paths are index/routes only"):
-        mod.get_memory_context({"path": "/notes/root"})
+    path_context = mod.get_memory_context({"path": "/notes/root", "depth": 0, "view": "paths"})
+    assert [item["full_path"] for item in path_context["items"]] == ["/notes/root"]
     with pytest.raises(RuntimeError, match="path is an index/route only"):
         mod.find_related_nodes({"path": "/notes/root"})
 
