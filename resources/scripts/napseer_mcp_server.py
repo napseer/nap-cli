@@ -5719,6 +5719,12 @@ def agent_scoped_folder(args):
 
 
 def request_json(method, path, payload=None, token_required=True, retry_auth=True, extra_headers=None):
+    if token_required:
+        # `nap project attach` may run in a separate process while this MCP
+        # server stays alive. Reload the project auth file before building
+        # each authenticated request so the long-running server observes the
+        # replacement access and refresh tokens without a restart.
+        refresh_public_auth_state()
     if token_required and not TOKEN:
         raise RuntimeError("NAPSEER_TOKEN is required")
     body = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -5727,6 +5733,7 @@ def request_json(method, path, payload=None, token_required=True, retry_auth=Tru
         headers["Authorization"] = f"Bearer {TOKEN}"
     if extra_headers:
         headers.update(extra_headers)
+    request_token = TOKEN
     request = urllib.request.Request(f"{BASE_URL}{path}", data=body, headers=headers, method=method)
     try:
         with api_urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
@@ -5738,6 +5745,19 @@ def request_json(method, path, payload=None, token_required=True, retry_auth=Tru
         body_text = exc.read().decode("utf-8")
         if exc.code == 401 and token_required and retry_auth:
             try:
+                # The attach flow may have completed after this request was
+                # sent. Prefer its new access token over attempting to renew
+                # the stale in-memory refresh token that just failed.
+                refresh_public_auth_state()
+                if TOKEN and TOKEN != request_token:
+                    return request_json(
+                        method,
+                        path,
+                        payload,
+                        token_required=True,
+                        retry_auth=False,
+                        extra_headers=extra_headers,
+                    )
                 renew_auth()
             except Exception as renew_exc:
                 raise RuntimeError(
