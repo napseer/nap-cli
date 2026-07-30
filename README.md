@@ -18,7 +18,6 @@ Current state:
 - `resources/scripts/napseer_mcp_supervisor.py` is the recommended Codex stdio
   entrypoint. It keeps the client transport alive while restarting or reloading
   the generated `napseer_mcp_server.py` worker between requests.
-- `scripts/nap_install.py` is kept as a convenient top-level command source copy during the initial import.
 - Gateway service compatibility remains in the worker while the standalone
   gateway image is built from the public gateway repository.
 
