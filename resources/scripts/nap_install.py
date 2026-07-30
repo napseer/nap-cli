@@ -14,6 +14,8 @@ Usage:
   nap update
 """
 
+import ast
+import contextlib
 import json
 import hashlib
 import os
@@ -34,6 +36,7 @@ INSTALL_DIR = pathlib.Path(os.environ.get("NAPSEER_HOME", pathlib.Path.home() / 
 BIN_DIR = pathlib.Path(os.environ.get("NAPSEER_BIN_DIR", pathlib.Path.home() / ".local" / "bin"))
 SCRIPT_NAMES = (
     "napseer_mcp_server.py",
+    "napseer_mcp_supervisor.py",
     "napseer_spake2.py",
     "terminal_init.py",
     "terminal_protocol.py",
@@ -49,12 +52,57 @@ RUNTIME_SCRIPT_NAMES = (
     "terminal_protocol.py",
     "terminal_pty_manager.py",
     "napseer_mcp_server.py",
+    "napseer_mcp_supervisor.py",
 )
 MAX_SERVICE_LOG_BYTES = int(os.environ.get("NAPSEER_MAX_SERVICE_LOG_BYTES", str(5 * 1024 * 1024)))
-CLI_DISTRIBUTION_CONTRACT_VERSION = "2026-05-19"
+CLI_RELEASE_VERSION = "0.2.0"
+CLI_DISTRIBUTION_CONTRACT_VERSION = "2026-07-29"
+CLI_MINIMUM_CONTRACT_VERSION = "2026-05-19"
+CLI_BUNDLE_SCHEMA_VERSION = "napseer.cli.bundle.v1"
+INSTALL_PATHS = {
+    "nap_install.py": "nap_install.py",
+    "napseer_mcp_server.py": "napseer_mcp_server.py",
+    "napseer_mcp_supervisor.py": "napseer_mcp_supervisor.py",
+    "napseer_spake2.py": "napseer_spake2.py",
+    "terminal_init.py": "terminal/__init__.py",
+    "terminal_protocol.py": "terminal/protocol.py",
+    "terminal_pty_manager.py": "terminal/pty_manager.py",
+}
 CLI_GENERATED_SOURCE_REPO = os.environ.get("NAPSEER_CLI_SOURCE_REPO", "https://github.com/napseer/nap-cli")
 CLI_GENERATED_SOURCE_REVISION = os.environ.get("NAPSEER_CLI_SOURCE_REVISION", "unresolved")
 CLI_GENERATED_SOURCE_REVISION_STATUS = os.environ.get("NAPSEER_CLI_SOURCE_REVISION_STATUS", "unresolved")
+HELP_TOKENS = {"help", "-h", "--help"}
+CANONICAL_COMMANDS = (
+    ("init", "Initialize Napseer in the current folder."),
+    ("status", "Show concise account, project, and runtime state."),
+    ("doctor", "Diagnose local setup without changing it."),
+    ("auth", "Authenticate an account or repair credentials."),
+    ("project", "Create, attach, claim, or inspect a project."),
+    ("mcp", "Install, update, inspect, or serve the local MCP runtime."),
+    ("gateway", "Set up and operate the local gateway."),
+    ("update", "Update the installed CLI and runtime bundle."),
+    ("version", "Show version, source revision, and contract identity."),
+    ("help", "Show this help or help for one command."),
+)
+COMMAND_METADATA = {
+    "init": {"mutates": True, "visible": True},
+    "status": {"mutates": False, "visible": True},
+    "doctor": {"mutates": False, "visible": True},
+    "auth": {"mutates": True, "visible": True},
+    "project": {"mutates": True, "visible": True},
+    "mcp": {"mutates": True, "visible": True},
+    "gateway": {"mutates": True, "visible": True},
+    "update": {"mutates": True, "visible": True},
+    "version": {"mutates": False, "visible": True},
+    "help": {"mutates": False, "visible": True},
+    "chat": {"mutates": True, "visible": False},
+    "plan": {"mutates": True, "visible": False},
+    "lineage": {"mutates": False, "visible": False},
+    "agent": {"mutates": True, "visible": False},
+    "feedback": {"mutates": True, "visible": False},
+    "where": {"mutates": False, "visible": False},
+    "install": {"mutates": True, "visible": False},
+}
 
 
 def chmod_best_effort(path, mode):
@@ -114,16 +162,23 @@ def read_url_bytes(url, user_agent, label):
         raise RuntimeError(f"{label} failed: HTTP {exc.code}: {body}") from exc
 
 
-def fetch_script(name):
+def fetch_json(path, label):
     try:
         body = read_url_bytes(
-            f"{BASE_URL}/v1/scripts/{name}",
+            f"{BASE_URL}{path}",
             "nap-install-python/0.1",
-            f"GET /v1/scripts/{name}",
+            f"GET {path}",
         )
         payload = json.loads(body.decode("utf-8"))
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"{name} response was not valid JSON") from exc
+        raise RuntimeError(f"{label} response was not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{label} response must be a JSON object")
+    return payload
+
+
+def fetch_script(name):
+    payload = fetch_json(f"/v1/scripts/{name}", name)
     content = payload.get("content")
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError(f"{name} response did not include script content")
@@ -159,108 +214,312 @@ def source_revision_status_for(value):
     return "resolved"
 
 
-def install_assets(update_project=False):
-    scripts = {}
-    fetched = {}
+def bundle_manifest():
+    return fetch_json("/v1/scripts", "CLI bundle manifest")
+
+
+def validated_manifest_items(manifest):
+    if manifest.get("schema_version") != CLI_BUNDLE_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"unsupported CLI bundle schema: {manifest.get('schema_version')!r}"
+        )
+    contract = manifest.get("contract")
+    if not isinstance(contract, dict):
+        raise RuntimeError("CLI bundle manifest is missing contract metadata")
+    if contract.get("current") != CLI_DISTRIBUTION_CONTRACT_VERSION:
+        raise RuntimeError("CLI bundle contract does not match this installer")
+    if contract.get("minimum_supported") != CLI_MINIMUM_CONTRACT_VERSION:
+        raise RuntimeError("CLI bundle minimum contract metadata is inconsistent")
+    if manifest.get("release_version") != CLI_RELEASE_VERSION:
+        raise RuntimeError("CLI bundle release version does not match this installer")
+    source = manifest.get("source")
+    if (
+        not isinstance(source, dict)
+        or source_revision_status_for(source.get("revision")) != "resolved"
+    ):
+        raise RuntimeError("CLI bundle source revision must be resolved")
+    items = manifest.get("items")
+    if not isinstance(items, list):
+        raise RuntimeError("CLI bundle manifest items must be an array")
+    by_name = {}
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            raise RuntimeError("CLI bundle manifest contains an invalid item")
+        name = item["name"]
+        if name in by_name:
+            raise RuntimeError(f"CLI bundle manifest contains duplicate asset {name}")
+        by_name[name] = item
+    missing = [name for name in SCRIPT_NAMES if name not in by_name]
+    if missing:
+        raise RuntimeError(f"CLI bundle manifest is missing assets: {', '.join(missing)}")
     for name in SCRIPT_NAMES:
-        payload, content = fetch_script(name)
-        fetched[name] = (payload, content)
+        item = by_name[name]
+        expected_path = INSTALL_PATHS[name]
+        path = pathlib.PurePosixPath(str(item.get("install_path") or ""))
+        if str(path) != expected_path or path.is_absolute() or ".." in path.parts:
+            raise RuntimeError(f"CLI bundle asset {name} has unsafe install_path")
+        if item.get("mode") != "0755":
+            raise RuntimeError(f"CLI bundle asset {name} has unsupported mode")
+        if item.get("source_repo") != source.get("repo"):
+            raise RuntimeError(f"CLI bundle asset {name} has inconsistent source repo")
+        if item.get("source_revision") != source.get("revision"):
+            raise RuntimeError(f"CLI bundle asset {name} has inconsistent source revision")
+        if item.get("contract_version") != contract.get("current"):
+            raise RuntimeError(f"CLI bundle asset {name} has inconsistent contract version")
+        if item.get("minimum_contract_version") != contract.get("minimum_supported"):
+            raise RuntimeError(f"CLI bundle asset {name} has inconsistent minimum contract")
+        if not isinstance(item.get("bytes"), int) or item["bytes"] <= 0:
+            raise RuntimeError(f"CLI bundle asset {name} has invalid byte length")
+        digest = str(item.get("sha256") or "")
+        if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+            raise RuntimeError(f"CLI bundle asset {name} has invalid sha256")
+    return {name: by_name[name] for name in SCRIPT_NAMES}
 
-    install_order = []
-    for name in (*RUNTIME_SCRIPT_NAMES, "nap_install.py", *SCRIPT_NAMES):
-        if name not in install_order:
-            install_order.append(name)
-    for name in install_order:
-        payload, content = fetched[name]
-        target = INSTALL_DIR / str(payload.get("filename") or name)
-        write_file(target, content, executable=name.endswith(".py"))
-        scripts[name] = {
-            "path": str(target),
-            "version": payload.get("version"),
-            "build_commit": payload.get("build_commit"),
-            "sha256": payload.get("sha256"),
-            "source_repo": payload.get("source_repo"),
-            "source_revision": payload.get("source_revision"),
-            "source_revision_status": payload.get("source_revision_status")
-            or source_revision_status_for(payload.get("source_revision")),
-            "generated_at": payload.get("generated_at"),
-            "generator_version": payload.get("generator_version"),
-            "contract_version": payload.get("contract_version"),
-            "supported_backend_api_versions": payload.get("supported_backend_api_versions"),
-            "supported_gateway_contract_versions": payload.get("supported_gateway_contract_versions"),
-        }
 
-    installer_content = (INSTALL_DIR / "nap_install.py").read_text(encoding="utf-8")
-    nap_path = BIN_DIR / "nap"
-    write_file(nap_path, installer_content, executable=True)
+def verify_asset_payload(name, manifest_item, payload, content):
+    actual = content.encode("utf-8")
+    if len(actual) != manifest_item["bytes"]:
+        raise RuntimeError(f"{name} byte length does not match bundle manifest")
+    if hashlib.sha256(actual).hexdigest() != manifest_item["sha256"]:
+        raise RuntimeError(f"{name} sha256 does not match bundle manifest")
+    for field in (
+        "version",
+        "source_repo",
+        "source_revision",
+        "contract_version",
+        "minimum_contract_version",
+        "install_path",
+        "mode",
+    ):
+        if payload.get(field) != manifest_item.get(field):
+            raise RuntimeError(f"{name} {field} does not match bundle manifest")
+
+
+def release_name(manifest):
+    revision = manifest["source"]["revision"]
+    identity = str(manifest.get("bundle_id") or "")
+    suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
+    return f"{manifest['release_version']}-{revision[:12]}-{suffix}"
+
+
+def validate_staged_python(release_dir):
+    for install_path in INSTALL_PATHS.values():
+        path = release_dir / install_path
+        if path.suffix == ".py":
+            try:
+                ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            except (OSError, SyntaxError) as exc:
+                raise RuntimeError(
+                    f"staged Python asset failed validation: {install_path}"
+                ) from exc
+
+
+def validate_release_hashes(release_dir, items):
+    for name, item in items.items():
+        path = release_dir / INSTALL_PATHS[name]
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(f"release asset is missing: {name}") from exc
+        if len(content) != item["bytes"]:
+            raise RuntimeError(f"release asset byte length is invalid: {name}")
+        if hashlib.sha256(content).hexdigest() != item["sha256"]:
+            raise RuntimeError(f"release asset sha256 is invalid: {name}")
+
+
+def pid_exists(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+@contextlib.contextmanager
+def installation_lock():
+    INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = INSTALL_DIR / ".install.lock"
+    for attempt in range(2):
+        try:
+            descriptor = os.open(
+                str(lock_path),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(str(os.getpid()))
+            break
+        except FileExistsError:
+            try:
+                owner = int(lock_path.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                owner = None
+            if attempt == 0 and not pid_exists(owner):
+                lock_path.unlink(missing_ok=True)
+                continue
+            raise RuntimeError("another Napseer install or update is already running")
+    try:
+        yield
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
+def atomic_symlink(path, target):
+    temporary = path.with_name(f".{path.name}.next-{os.getpid()}")
+    temporary.unlink(missing_ok=True)
+    os.symlink(target, temporary)
+    os.replace(temporary, path)
+
+
+def preserve_legacy_path(path):
+    if path.is_symlink() or not path.exists():
+        return
+    backup = path.with_name(f"{path.name}.pre-bundle")
+    if backup.exists() or backup.is_symlink():
+        raise RuntimeError(
+            f"cannot preserve legacy install path because backup exists: {backup}"
+        )
+    os.replace(path, backup)
+
+
+def activate_release(release_dir):
+    current = INSTALL_DIR / "current"
     if os.name == "nt":
-        write_file(BIN_DIR / "nap.cmd", f'@echo off\r\n"{sys.executable}" "{nap_path}" %*\r\n', executable=False)
+        for install_path in INSTALL_PATHS.values():
+            target = INSTALL_DIR / install_path
+            content = (release_dir / install_path).read_text(encoding="utf-8")
+            write_file(target, content, executable=True)
+        nap_path = BIN_DIR / "nap"
+        write_file(
+            nap_path,
+            (release_dir / "nap_install.py").read_text(encoding="utf-8"),
+            executable=True,
+        )
+        write_file(
+            BIN_DIR / "nap.cmd",
+            f'@echo off\r\n"{sys.executable}" "{nap_path}" %*\r\n',
+            executable=False,
+        )
+        return nap_path
 
-    updated_project_paths = []
-    if update_project:
-        for script_name in ("napseer_mcp_server.py", "napseer_spake2.py"):
-            content = (INSTALL_DIR / script_name).read_text(encoding="utf-8")
-            for candidate in (
-                pathlib.Path.cwd() / script_name,
-                pathlib.Path.cwd() / "resources" / "scripts" / script_name,
-            ):
-                if candidate.exists():
-                    write_file(candidate, content, executable=script_name.endswith(".py"))
-                    updated_project_paths.append(str(candidate))
+    for filename in (
+        "nap_install.py",
+        "napseer_mcp_server.py",
+        "napseer_mcp_supervisor.py",
+        "napseer_spake2.py",
+    ):
+        path = INSTALL_DIR / filename
+        preserve_legacy_path(path)
+        atomic_symlink(path, f"current/{filename}")
+    terminal_path = INSTALL_DIR / "terminal"
+    preserve_legacy_path(terminal_path)
+    atomic_symlink(terminal_path, "current/terminal")
 
-    installer_payload = fetched["nap_install.py"][0]
-    cli_source_revision = installer_payload.get("source_revision") or CLI_GENERATED_SOURCE_REVISION
-    cli_source_revision_status = (
-        installer_payload.get("source_revision_status")
-        or CLI_GENERATED_SOURCE_REVISION_STATUS
-        or source_revision_status_for(cli_source_revision)
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    nap_path = BIN_DIR / "nap"
+    preserve_legacy_path(nap_path)
+    atomic_symlink(
+        nap_path,
+        os.path.relpath(INSTALL_DIR / "nap_install.py", BIN_DIR),
     )
-    result = {
+    atomic_symlink(current, os.path.relpath(release_dir, INSTALL_DIR))
+    return nap_path
+
+
+def install_assets():
+    with installation_lock():
+        manifest = bundle_manifest()
+        items = validated_manifest_items(manifest)
+        releases_dir = INSTALL_DIR / "releases"
+        releases_dir.mkdir(parents=True, exist_ok=True)
+        final_release = releases_dir / release_name(manifest)
+        staging = releases_dir / f".staging-{os.getpid()}-{time.time_ns()}"
+        staging.mkdir(mode=0o700)
+        scripts = {}
+        try:
+            for name in SCRIPT_NAMES:
+                manifest_item = items[name]
+                payload, content = fetch_script(name)
+                verify_asset_payload(name, manifest_item, payload, content)
+                target = staging / INSTALL_PATHS[name]
+                write_file(target, content, executable=True)
+                scripts[name] = {
+                    "path": str(INSTALL_DIR / "current" / INSTALL_PATHS[name]),
+                    "version": payload.get("version"),
+                    "sha256": payload.get("sha256"),
+                    "source_repo": payload.get("source_repo"),
+                    "source_revision": payload.get("source_revision"),
+                    "contract_version": payload.get("contract_version"),
+                }
+            validate_staged_python(staging)
+            write_file(
+                staging / "bundle-manifest.json",
+                json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+                executable=False,
+            )
+            if final_release.exists():
+                shutil.rmtree(staging)
+            else:
+                os.replace(staging, final_release)
+            validate_release_hashes(final_release, items)
+            nap_path = activate_release(final_release)
+        except Exception:
+            if staging.exists():
+                shutil.rmtree(staging)
+            raise
+
+    return {
         "status": "installed",
-        "message": "Napseer CLI and runtime scripts are installed.",
+        "message": "Napseer CLI and runtime bundle installed atomically.",
         "bin": str(nap_path),
         "install_dir": str(INSTALL_DIR),
+        "release_dir": str(final_release),
+        "bundle_id": manifest.get("bundle_id"),
         "scripts": scripts,
         "cli_distribution": {
-            "contract_version": CLI_DISTRIBUTION_CONTRACT_VERSION,
-            "source_repo": installer_payload.get("source_repo") or CLI_GENERATED_SOURCE_REPO,
-            "source_revision": None
-            if source_revision_status_for(cli_source_revision) == "unresolved"
-            else cli_source_revision,
-            "source_revision_status": cli_source_revision_status,
+            "release_version": manifest.get("release_version"),
+            "contract_version": manifest["contract"]["current"],
+            "minimum_contract_version": manifest["contract"]["minimum_supported"],
+            "source_repo": manifest["source"]["repo"],
+            "source_revision": manifest["source"]["revision"],
+            "source_revision_status": manifest["source"]["revision_status"],
         },
-        "updated_project_paths": updated_project_paths,
+        "updated_project_paths": [],
         "path_warning": path_warning(),
-        "next": ["nap project create", "nap gateway configure", "nap gateway start", "nap gateway logs", "nap update"],
+        "next": ["nap init", "nap mcp status", "nap gateway setup"],
     }
-    return result
 
 
 def runtime_assets_missing():
     missing = []
     for name in RUNTIME_SCRIPT_NAMES:
-        path = INSTALL_DIR / {
-            "terminal_init.py": "terminal/__init__.py",
-            "terminal_protocol.py": "terminal/protocol.py",
-            "terminal_pty_manager.py": "terminal/pty_manager.py",
-        }.get(name, name)
+        path = runtime_asset_path(name)
         if not path.exists() or path.stat().st_size == 0:
             missing.append(name)
     return missing
 
 
-def ensure_runtime_assets():
+def active_install_root():
+    current = INSTALL_DIR / "current"
+    return current if current.exists() else INSTALL_DIR
+
+
+def runtime_asset_path(name):
+    return active_install_root() / INSTALL_PATHS.get(name, name)
+
+
+def require_runtime_assets():
     missing = runtime_assets_missing()
     if missing:
-        install_assets(update_project=False)
-        missing = runtime_assets_missing()
-    if missing:
-        raise RuntimeError(f"missing installed Napseer runtime scripts after repair: {', '.join(missing)}")
+        raise RuntimeError(
+            "missing installed Napseer runtime scripts: "
+            f"{', '.join(missing)}. Run `nap mcp install` to repair them."
+        )
 
 
 def run_wrapper(command_name, args):
-    wrapper = INSTALL_DIR / "napseer_mcp_server.py"
-    ensure_runtime_assets()
+    wrapper = runtime_asset_path("napseer_mcp_server.py")
+    require_runtime_assets()
     return subprocess.call([sys.executable, str(wrapper), command_name, *args])
 
 
@@ -277,14 +536,17 @@ def cwd_state_dir():
 
 def state_dir_status():
     preferred = preferred_state_dir()
-    active = cwd_state_dir()
     return {
-        "active_state_dir": str(active),
-        "active_auth_path": str(active / "auth.json"),
+        "active_state_dir": str(preferred),
+        "active_auth_path": str(preferred / "auth.json"),
         "state_dir": str(preferred),
         "auth_path": str(preferred / "auth.json"),
         "state_dir_exists": preferred.exists(),
-        "state_dir_message": ".napseer directory is active.",
+        "state_dir_message": (
+            ".napseer directory is active."
+            if preferred.exists()
+            else ".napseer directory is not initialized."
+        ),
     }
 
 
@@ -469,8 +731,8 @@ def cli_option(args, *names, default=None):
 
 
 def start_service(kind, args):
-    wrapper = INSTALL_DIR / "napseer_mcp_server.py"
-    ensure_runtime_assets()
+    wrapper = runtime_asset_path("napseer_mcp_server.py")
+    require_runtime_assets()
     existing = read_service_state(kind)
     if existing and pid_running(existing.get("pid")):
         return {
@@ -629,15 +891,211 @@ def print_json(value):
     print(json.dumps(value, indent=2))
 
 
+def print_root_help():
+    print("Usage: nap <command> [arguments]")
+    print()
+    print("Commands:")
+    width = max(len(name) for name, _summary in CANONICAL_COMMANDS)
+    for name, summary in CANONICAL_COMMANDS:
+        print(f"  {name.ljust(width)}  {summary}")
+    print()
+    print("Run `nap help <command>` for command-specific help.")
+
+
+def print_command_help(command):
+    help_text = {
+        "init": (
+            "Usage: nap init [--slug SLUG] [--name NAME] [--description TEXT]\n"
+            "Initialize the current folder and create its first Napseer project."
+        ),
+        "status": (
+            "Usage: nap status\n"
+            "Show the current folder's account, project, and runtime state."
+        ),
+        "doctor": (
+            "Usage: nap doctor\n"
+            "Run read-only checks and print exact repair commands."
+        ),
+        "auth": (
+            "Usage: nap auth [status|login|repair]\n"
+            "  login   Authenticate an account; does not select a project.\n"
+            "  status  Show credential state without credential values.\n"
+            "  repair  Recover failed automatic credential renewal."
+        ),
+        "project": (
+            "Usage: nap project [init|create|attach|claim|status|encryption]\n"
+            "  init    Initialize a fresh folder (same workflow as `nap init`).\n"
+            "  create  Create and bind a new project.\n"
+            "  attach  Select an existing project owned by the logged-in account.\n"
+            "  claim   Move an anonymous project into an authenticated account.\n"
+            "  status  Show the current folder binding."
+        ),
+        "mcp": (
+            "Usage: nap mcp [status|install|update|serve]\n"
+            "  status   Show supervisor and worker installation state.\n"
+            "  install  Install or repair local MCP assets.\n"
+            "  update   Update local MCP assets from verified published sources.\n"
+            "  serve    Run the stable stdio supervisor."
+        ),
+        "gateway": (
+            "Usage: nap gateway [setup|start|stop|restart|status|logs|vault|terminal|schedule|service]\n"
+            "Common lifecycle commands are setup, start, stop, restart, status, and logs.\n"
+            "Vault, terminal, schedule, and service are advanced capability groups."
+        ),
+        "update": (
+            "Usage: nap update\n"
+            "Update the installed CLI and runtime bundle. Help never performs an update."
+        ),
+        "version": (
+            "Usage: nap version\n"
+            "Show distribution contract and canonical source revision."
+        ),
+        "install": "Compatibility command. Use `nap mcp install`.",
+        "where": "Compatibility command. Use `nap doctor` or `nap mcp status`.",
+        "chat": "Compatibility command. Chat-secret operations are an advanced runtime workflow.",
+        "plan": "Compatibility command. Agent planning belongs to the authenticated MCP surface.",
+        "lineage": "Compatibility command. Agent lineage checks belong to the authenticated MCP surface.",
+        "agent": "Compatibility command. Agent workspace operations belong to the authenticated MCP surface.",
+        "feedback": "Compatibility command. Feedback administration is not a primary operator workflow.",
+    }
+    if command in {"help", "-h", "--help", ""}:
+        print_root_help()
+        return 0
+    text = help_text.get(command)
+    if text is None:
+        raise RuntimeError(f"unknown help topic: {command}")
+    print(text)
+    return 0
+
+
+def mcp_status():
+    worker = runtime_asset_path("napseer_mcp_server.py")
+    supervisor = runtime_asset_path("napseer_mcp_supervisor.py")
+    missing = runtime_assets_missing()
+    return {
+        "status": "ok" if not missing else "repair_required",
+        "supervisor_installed": supervisor.is_file(),
+        "worker_installed": worker.is_file(),
+        "runtime_assets_missing": missing,
+        "serve_command": f"{sys.executable} {supervisor}",
+        "next": None if not missing else "nap mcp install",
+    }
+
+
+def handle_mcp(args):
+    subcommand = args[0] if args else "status"
+    rest = args[1:]
+    if subcommand == "status":
+        print_json(mcp_status())
+        return 0
+    if subcommand == "install":
+        print_json(install_assets())
+        return 0
+    if subcommand == "update":
+        result = install_assets()
+        print_json({**result, "status": "updated", "message": "Napseer MCP runtime is updated."})
+        return 0
+    if subcommand == "serve":
+        if rest:
+            raise RuntimeError("nap mcp serve does not accept arguments")
+        require_runtime_assets()
+        supervisor = runtime_asset_path("napseer_mcp_supervisor.py")
+        os.execv(sys.executable, [sys.executable, str(supervisor)])
+    raise RuntimeError("unknown MCP command; use nap mcp status|install|update|serve")
+
+
+def doctor_status():
+    state = state_dir_status()
+    auth_path = pathlib.Path(state["active_auth_path"])
+    auth = {}
+    auth_error = None
+    if auth_path.exists():
+        try:
+            auth = json.loads(auth_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            auth_error = "auth file is unreadable or invalid JSON"
+    missing = runtime_assets_missing()
+    issues = []
+    if auth_error:
+        issues.append({"code": "auth_file_invalid", "message": auth_error, "next": "nap auth login"})
+    elif not auth_path.exists():
+        issues.append({"code": "project_not_initialized", "message": "current folder is not initialized", "next": "nap init"})
+    elif not auth.get("project_id"):
+        issues.append({"code": "project_not_attached", "message": "no project is attached", "next": "nap project attach"})
+    if missing:
+        issues.append({"code": "runtime_assets_missing", "message": "local MCP runtime is incomplete", "next": "nap mcp install"})
+    if not runtime_asset_path("napseer_mcp_supervisor.py").is_file():
+        issues.append({"code": "supervisor_missing", "message": "stable MCP supervisor is not installed", "next": "nap mcp install"})
+    return {
+        "status": "ok" if not issues else "repair_required",
+        "checks": {
+            "state_directory": state["state_dir_exists"],
+            "auth_file": auth_path.exists() and auth_error is None,
+            "account_mode": auth.get("account_mode"),
+            "token_present": bool(auth.get("token")),
+            "refresh_present": bool(auth.get("refresh_token")),
+            "project_attached": bool(auth.get("project_id")),
+            "mcp_supervisor": runtime_asset_path("napseer_mcp_supervisor.py").is_file(),
+            "mcp_worker": runtime_asset_path("napseer_mcp_server.py").is_file(),
+        },
+        "issues": issues,
+    }
+
+
+def version_status():
+    manifest_path = active_install_root() / "bundle-manifest.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            source = manifest.get("source") or {}
+            contract = manifest.get("contract") or {}
+            return {
+                "release_version": manifest.get("release_version"),
+                "contract_version": contract.get("current"),
+                "minimum_contract_version": contract.get("minimum_supported"),
+                "source_repo": source.get("repo"),
+                "source_revision": source.get("revision"),
+                "source_revision_status": source.get("revision_status"),
+                "bundle_id": manifest.get("bundle_id"),
+            }
+        except (OSError, json.JSONDecodeError):
+            pass
+    return {
+        "release_version": CLI_RELEASE_VERSION,
+        "contract_version": CLI_DISTRIBUTION_CONTRACT_VERSION,
+        "minimum_contract_version": CLI_MINIMUM_CONTRACT_VERSION,
+        "source_repo": CLI_GENERATED_SOURCE_REPO,
+        "source_revision": None
+        if source_revision_status_for(CLI_GENERATED_SOURCE_REVISION) == "unresolved"
+        else CLI_GENERATED_SOURCE_REVISION,
+        "source_revision_status": source_revision_status_for(CLI_GENERATED_SOURCE_REVISION),
+    }
+
+
 def main(argv):
     invoked_as_nap = pathlib.Path(argv[0]).name in {"nap", "nap.cmd"}
     command = argv[1] if len(argv) > 1 else ("help" if invoked_as_nap else "install")
     args = argv[2:]
+    if command in HELP_TOKENS:
+        return print_command_help(args[0] if args else "")
+    if any(item in HELP_TOKENS for item in args):
+        return print_command_help(command)
+    if command == "init":
+        return run_wrapper("project", ["init", *args])
+    if command == "doctor":
+        print_json(doctor_status())
+        return 0
+    if command == "mcp":
+        return handle_mcp(args)
+    if command == "version":
+        print_json(version_status())
+        return 0
     if command == "install":
-        print_json(install_assets(update_project=False))
+        print("`nap install` is deprecated; use `nap mcp install`.", file=sys.stderr)
+        print_json(install_assets())
         return 0
     if command == "update":
-        result = install_assets(update_project=True)
+        result = install_assets()
         print_json({**result, "status": "updated", "message": "Napseer CLI and runtime scripts are updated."})
         return 0
     if command == "gateway":
@@ -659,6 +1117,10 @@ def main(argv):
     if command == "agent":
         return run_wrapper("agent", args)
     if command == "auth":
+        if args and args[0] == "repair":
+            return run_wrapper("auth", ["refresh", *args[1:]])
+        if args and args[0] == "refresh":
+            print("`nap auth refresh` is deprecated; use `nap auth repair`.", file=sys.stderr)
         return run_wrapper("auth", args)
     if command == "feedback":
         return run_wrapper("feedback", args)
@@ -668,7 +1130,8 @@ def main(argv):
             {
                 "bin": shutil.which("nap") or str(BIN_DIR / "nap"),
                 "install_dir": str(INSTALL_DIR),
-                "wrapper": str(INSTALL_DIR / "napseer_mcp_server.py"),
+                "wrapper": str(runtime_asset_path("napseer_mcp_server.py")),
+                "supervisor": str(runtime_asset_path("napseer_mcp_supervisor.py")),
                 "cwd": str(pathlib.Path.cwd()),
                 "cwd_auth_path": state["active_auth_path"],
                 "cwd_auth_configured": pathlib.Path(state["active_auth_path"]).exists(),
@@ -678,31 +1141,6 @@ def main(argv):
                 "message": f"Napseer install and cwd paths resolved. {state['state_dir_message']}",
             }
         )
-        return 0
-    if command in {"help", "-h", "--help"}:
-        print("Usage: nap [auth|project|chat|plan|lineage|gateway|agent|feedback|status|update|where|install]")
-        print("  auth        Auth commands: login-local, status.")
-        print("              Example: nap auth login-local")
-        print("  project     Project commands: init/attach existing, create, status, encryption.")
-        print("              Examples: nap project init, nap project create, nap project status")
-        print("              Encrypted project setup is completed by the local gateway: nap gateway vault process")
-        print("  chat        Chat secret commands: secret status, secret setup, secret rotate.")
-        print("              Examples: nap chat secret setup --vault-passphrase TEXT, nap chat secret status")
-        print("  plan        Plan commands: list, to-kanban.")
-        print("              Example: nap plan to-kanban /plans/example --column todo")
-        print("  lineage     Generic source-record -> plan -> kanban lineage checks.")
-        print("              Example: nap lineage status")
-        print("  gateway     Gateway commands: start, stop, configure, setup, restart, kill, logs, status, vault.")
-        print("              Start auto-selects a local port; use --port to pin one.")
-        print("              Examples: nap gateway start, nap gateway vault, nap gateway vault process --all")
-        print("  agent       Agent commands: list, workspaces, create, show, edit.")
-        print("              list shows registered project agents; workspaces shows /agents folders.")
-        print("  feedback    Feedback commands: list, global, status, resolve.")
-        print("              Examples: nap feedback list, nap feedback global --all, nap feedback resolve <id> --notes TEXT")
-        print("  status      Show cwd Napseer configuration and next setup commands.")
-        print("  update      Refresh the globally installed nap command and wrapper.")
-        print("  where       Show installed nap paths and cwd auth location.")
-        print("  install     Reinstall/repair nap from the hosted script directory.")
         return 0
     raise RuntimeError(f"unknown command: {command}")
 

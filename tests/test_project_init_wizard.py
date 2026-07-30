@@ -163,13 +163,36 @@ def test_cli_main_dispatches_init():
     print("ok: cli_main routes `project init` to cli_project_init passed")
 
 
-def test_cli_main_rejects_old_aliases():
-    """Verify `auth login` / `project bootstrap-existing` are no longer accepted."""
-    mod = load_module()
+def test_cli_main_accepts_canonical_login_and_hidden_compatibility_alias():
+    """Login aliases must route to one handler without performing browser or network I/O."""
+    import contextlib
+    import io
 
+    mod = load_module()
+    calls = []
+    mod.operator_account_login = lambda args: (
+        calls.append(dict(args)) or {"status": "authenticated"}
+    )
+
+    for subcommand in ["login", "login-local", "operator-login"]:
+        with contextlib.redirect_stdout(io.StringIO()):
+            mod.cli_main([
+                "napseer_mcp_server.py",
+                "auth",
+                subcommand,
+                "--no-browser",
+                "--timeout",
+                "1",
+            ])
+
+    assert len(calls) == 3
+    assert all(call["open_browser"] is False for call in calls)
+    assert all(call["timeout_seconds"] == 1 for call in calls)
+
+
+def test_cli_main_rejects_project_login_aliases():
+    mod = load_module()
     cases = [
-        (["napseer_mcp_server.py", "auth", "login"], "unknown auth subcommand: login"),
-        (["napseer_mcp_server.py", "auth", "operator-login"], "unknown auth subcommand: operator-login"),
         (["napseer_mcp_server.py", "project", "login"], "unknown project subcommand: login"),
         (["napseer_mcp_server.py", "project", "bootstrap-existing"], "unknown project subcommand: bootstrap-existing"),
     ]
@@ -180,7 +203,7 @@ def test_cli_main_rejects_old_aliases():
             assert expected_substring in str(exc), (args, str(exc))
         else:
             raise AssertionError(f"expected RuntimeError for {args}")
-    print("ok: cli_main rejects old auth/project aliases with clear errors passed")
+    print("ok: cli_main rejects old project aliases with clear errors passed")
 
 
 if __name__ == "__main__":
@@ -188,5 +211,6 @@ if __name__ == "__main__":
     test_init_already_initialized()
     test_init_token_only_creates_project()
     test_cli_main_dispatches_init()
-    test_cli_main_rejects_old_aliases()
+    test_cli_main_accepts_canonical_login_and_hidden_compatibility_alias()
+    test_cli_main_rejects_project_login_aliases()
     print("ok: project init wizard smoke tests passed")

@@ -266,7 +266,11 @@ def run():
     assert compact["view"] == "paths"
     assert "content_text" not in compact["items"][0]
     assert compact["items"][0]["full_path"] == "/renamed/alpha"
-    full = mod.list_project_nodes({"limit": 10, "view": "full"})
+    full = mod.list_project_nodes({
+        "limit": 10,
+        "view": "full",
+        "_allow_full": True,
+    })
     assert full["items"][0]["content_text"] == "secret needle"
 
     plan_base = {

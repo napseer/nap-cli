@@ -246,44 +246,43 @@ def test_node_get_rejects_path_reads(mod):
 
 
 def test_tools_include_node_by_path_descriptor(mod):
+    tool_by_name = {item["name"]: item for item in mod.tools()}
+    assert len(tool_by_name) == 56
+    assert len(tool_by_name) == len(mod.tools())
+
     get_tool = next(item for item in mod.tools() if item["name"] == "nap_node_get")
     assert get_tool["inputSchema"].get("required") is None
     assert "node_id" in get_tool["inputSchema"]["properties"]
     assert "uri" in get_tool["inputSchema"]["properties"]
     assert "path" not in get_tool["inputSchema"]["properties"]
 
-    by_id = next(item for item in mod.tools() if item["name"] == "nap_node_by_id")
-    assert by_id["inputSchema"]["required"] == ["node_id"]
-    assert "nap:// URI" in by_id["description"]
-
-    by_uri = next(item for item in mod.tools() if item["name"] == "nap_node_by_uri")
-    assert by_uri["inputSchema"]["required"] == ["uri"]
-    assert "nap://" in by_uri["description"]
-
     tool = next(item for item in mod.tools() if item["name"] == "nap_node_by_path")
     assert tool["inputSchema"]["required"] == ["path"]
     assert "preview_chars" not in tool["inputSchema"]["properties"]
     assert "does not read full node content" in tool["description"]
 
-    assert all(item["name"] != "nap_cat" for item in mod.tools())
+    for hidden_name in [
+        "nap_cat",
+        "nap_node_by_id",
+        "nap_node_by_uri",
+        "nap_tee",
+        "nap_patch",
+        "nap_find",
+        "nap_index_sync",
+    ]:
+        assert hidden_name not in tool_by_name
 
-    for name in ["nap_discover", "nap_find", "nap_context", "nap_find_related", "nap_recent"]:
+    for name in ["nap_discover", "nap_context", "nap_find_related", "nap_recent"]:
         schema = next(item for item in mod.tools() if item["name"] == name)["inputSchema"]
         view = schema["properties"].get("view")
         if view:
             assert "full" not in view["enum"]
 
-    for name in ["nap_patch", "nap_node_patch", "nap_rm"]:
+    for name in ["nap_node_patch", "nap_rm"]:
         schema = next(item for item in mod.tools() if item["name"] == name)["inputSchema"]
         assert "node_id" in schema["properties"]
         assert "uri" in schema["properties"]
         assert "path" not in schema["properties"]
-
-    tee_schema = next(item for item in mod.tools() if item["name"] == "nap_tee")["inputSchema"]
-    assert tee_schema.get("required") is None
-    assert "path" in tee_schema["properties"]
-    assert "node_id" in tee_schema["properties"]
-    assert "uri" in tee_schema["properties"]
 
     bulk_node_schema = next(item for item in mod.tools() if item["name"] == "nap_bulk")["inputSchema"]["properties"]["nodes"]["items"]
     assert bulk_node_schema.get("required") is None
@@ -291,96 +290,18 @@ def test_tools_include_node_by_path_descriptor(mod):
     assert "node_id" in bulk_node_schema["properties"]
     assert "uri" in bulk_node_schema["properties"]
 
-    for name in [
-        "nap_kanban_start",
-        "nap_kanban_send_review",
-        "nap_kanban_complete",
-        "nap_kanban_block",
-        "nap_kanban_unblock",
-        "nap_kanban_update",
-        "nap_kanban_archive",
+    for required_name in [
+        "nap_library_ls",
+        "nap_library_attach",
+        "nap_library_detach",
+        "nap_library_nodes",
+        "nap_library_node_get",
+        "nap_auth_refresh",
+        "nap_node_restore",
+        "nap_plan_transition",
+        "nap_index_status",
     ]:
-        schema = next(item for item in mod.tools() if item["name"] == name)["inputSchema"]
-        assert "node_id" in schema["properties"]
-        assert "uri" in schema["properties"]
-        assert "path" not in schema["properties"]
-
-    mv_schema = next(item for item in mod.tools() if item["name"] == "nap_mv")["inputSchema"]
-    assert mv_schema["required"] == ["new_path"]
-    assert "node_id" in mv_schema["properties"]
-    assert "uri" in mv_schema["properties"]
-    assert "path" not in mv_schema["properties"]
-
-    ln_schema = next(item for item in mod.tools() if item["name"] == "nap_ln")["inputSchema"]
-    assert "source_node_id" in ln_schema["properties"]
-    assert "source_uri" in ln_schema["properties"]
-    assert "target_node_id" in ln_schema["properties"]
-    assert "target_uri" in ln_schema["properties"]
-    assert "source_path" not in ln_schema["properties"]
-    assert "target_path" not in ln_schema["properties"]
-
-    backlinks_schema = next(item for item in mod.tools() if item["name"] == "nap_backlinks")["inputSchema"]
-    assert "node_id" in backlinks_schema["properties"]
-    assert "uri" in backlinks_schema["properties"]
-    assert "path" not in backlinks_schema["properties"]
-
-    context_schema = next(item for item in mod.tools() if item["name"] == "nap_context")["inputSchema"]
-    assert "node_id" in context_schema["properties"]
-    assert "node_ids" in context_schema["properties"]
-    assert "uri" in context_schema["properties"]
-    assert "uris" in context_schema["properties"]
-    assert "path" in context_schema["properties"]
-    assert "paths" in context_schema["properties"]
-
-    related_schema = next(item for item in mod.tools() if item["name"] == "nap_find_related")["inputSchema"]
-    assert "node_id" in related_schema["properties"]
-    assert "uri" in related_schema["properties"]
-    assert "path" not in related_schema["properties"]
-
-    complete_schema = next(item for item in mod.tools() if item["name"] == "nap_plan_complete")["inputSchema"]
-    assert "plan_node_id" in complete_schema["properties"]
-    assert "plan_uri" in complete_schema["properties"]
-    assert "outcome_node_id" in complete_schema["properties"]
-    assert "outcome_uri" in complete_schema["properties"]
-    assert "path" not in complete_schema["properties"]
-    assert "outcome_path" not in complete_schema["properties"]
-
-    supersede_schema = next(item for item in mod.tools() if item["name"] == "nap_plan_supersede")["inputSchema"]
-    assert "required" not in supersede_schema
-    assert "plan_node_id" in supersede_schema["properties"]
-    assert "replacement_node_id" in supersede_schema["properties"]
-    assert "path" not in supersede_schema["properties"]
-    assert "replacement_path" not in supersede_schema["properties"]
-
-    cancel_schema = next(item for item in mod.tools() if item["name"] == "nap_plan_cancel")["inputSchema"]
-    assert "required" not in cancel_schema
-    assert "plan_node_id" in cancel_schema["properties"]
-    assert "path" not in cancel_schema["properties"]
-
-    plan_to_kanban_schema = next(item for item in mod.tools() if item["name"] == "nap_plan_to_kanban")["inputSchema"]
-    assert "plan_node_id" in plan_to_kanban_schema["properties"]
-    assert "plan_uri" in plan_to_kanban_schema["properties"]
-    assert "plan_path" not in plan_to_kanban_schema["properties"]
-
-    for name in ["nap_agent_cat", "nap_agent_patch", "nap_agent_rm"]:
-        schema = next(item for item in mod.tools() if item["name"] == name)["inputSchema"]
-        assert schema["required"] == ["agent_slug"]
-        assert "node_id" in schema["properties"]
-        assert "uri" in schema["properties"]
-        assert "path" not in schema["properties"]
-
-    agent_tee_schema = next(item for item in mod.tools() if item["name"] == "nap_agent_tee")["inputSchema"]
-    assert agent_tee_schema["required"] == ["agent_slug"]
-    assert "path" in agent_tee_schema["properties"]
-    assert "node_id" in agent_tee_schema["properties"]
-    assert "uri" in agent_tee_schema["properties"]
-
-    agent_ln_schema = next(item for item in mod.tools() if item["name"] == "nap_agent_ln")["inputSchema"]
-    assert agent_ln_schema["required"] == ["agent_slug"]
-    assert "source_node_id" in agent_ln_schema["properties"]
-    assert "target_node_id" in agent_ln_schema["properties"]
-    assert "source_path" not in agent_ln_schema["properties"]
-    assert "target_path" not in agent_ln_schema["properties"]
+        assert required_name in tool_by_name
 
 
 def test_mutation_tools_reject_path_and_patch_by_node_id(mod):
@@ -508,15 +429,21 @@ def test_tee_and_bulk_create_by_path_update_by_identity(mod):
     assert writes[-1][0] == "PATCH"
     assert writes[-1][1] == "/v1/projects/project-1/nodes/node-123"
 
-    with pytest.raises(RuntimeError, match="path already resolves"):
-        mod.upsert_node({"path": "/notes/current", "content_text": "bad"})
+    compatibility_update = mod.upsert_node(
+        {"path": "/notes/current", "content_text": "compatibility update"}
+    )
+    assert compatibility_update["updated"] is True
+    assert writes[-1][0] == "PATCH"
 
     bulk = mod.bulk_upsert_nodes({"nodes": [{"node_id": "node-123", "content_text": "bulk update"}]})
     assert bulk["items"][0]["created"] is False
     assert writes[-1][1] == "/v1/projects/project-1/nodes/node-123"
 
-    with pytest.raises(RuntimeError, match="path already resolves"):
-        mod.bulk_upsert_nodes({"nodes": [{"path": "/notes/current", "content_text": "bad"}]})
+    compatibility_bulk_update = mod.bulk_upsert_nodes(
+        {"nodes": [{"path": "/notes/current", "content_text": "compatibility update"}]}
+    )
+    assert compatibility_bulk_update["items"][0]["created"] is False
+    assert writes[-1][0] == "PATCH"
 
 
 def test_agent_tools_create_by_route_and_update_by_identity(mod):
@@ -867,12 +794,12 @@ def test_index_sync_fetches_incremental_changes_and_removes_archived_nodes(mod):
         assert mod.search_local_index({"q": "existing"})["items"] == []
 
 
-def test_tools_include_index_sync_descriptor(mod):
-    tool = next(item for item in mod.tools() if item["name"] == "nap_index_sync")
-    assert "Incrementally synchronize" in tool["description"]
-    assert tool["inputSchema"]["properties"]["lookback_seconds"]["default"] == 5
-    contract = mod.tool_contract_metadata("nap_index_sync")
-    assert contract["side_effect"] == "local-file"
+def test_tools_include_read_only_index_status_descriptor(mod):
+    tool = next(item for item in mod.tools() if item["name"] == "nap_index_status")
+    assert "local search index" in tool["description"]
+    assert tool["inputSchema"]["properties"] == {}
+    contract = mod.tool_contract_metadata("nap_index_status")
+    assert contract["side_effect"] == "none"
     assert contract["auth_mode"] == "local-only"
 
 

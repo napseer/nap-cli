@@ -35,33 +35,31 @@ def test_initial_enrollment_persists_refresh_credential():
     mod.AUTH = anonymous_auth(mod)
     mod.BASE_URL = mod.AUTH["base_url"]
     mod.DEFAULT_PROJECT_ID = None
-    with tempfile.TemporaryDirectory() as directory:
-        key_path = pathlib.Path(directory) / "test-key"
-        pathlib.Path(str(key_path) + ".pub").write_text(
-            "ssh-ed25519 test-public-key", encoding="utf-8"
-        )
-        mod.ensure_local_files = lambda: key_path
-        mod.sign_text = lambda *args: "test-signature"
-        saved = []
-        mod.save_auth = lambda payload: saved.append(dict(payload))
-        responses = iter([
-            {"challenge_id": "challenge", "challenge_text": "sign-me"},
-            {
-                "token": {
-                    "access_token": "access",
-                    "refresh_token": "refresh",
-                    "expires_at": "2099-01-01T00:00:00Z",
-                    "refresh_expires_at": "",
-                },
-                "worker": {"id": "worker", "agent_id": "agent-id"},
-            },
-        ])
-        mod.request_json = lambda *args, **kwargs: next(responses)
+    saved = []
+    requests = []
+    mod.save_auth = lambda payload: saved.append(dict(payload))
 
-        mod.ensure_enrolled({"slug": "example"})
+    def request(method, path, payload=None, token_required=False):
+        requests.append((method, path, payload, token_required))
+        return {
+            "token": {
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "expires_at": "2099-01-01T00:00:00Z",
+                "refresh_expires_at": "",
+            },
+            "worker": {"id": "worker", "agent_id": "agent-id"},
+        }
+
+    mod.request_json = request
+    mod.ensure_enrolled({"slug": "example"})
 
     assert saved[0]["refresh_token"] == "refresh"
     assert "refresh_expires_at" in saved[0]
+    assert [(method, path) for method, path, _, _ in requests] == [
+        ("POST", "/v1/enrollment/token")
+    ]
+    assert requests[0][3] is False
 
 
 def test_failed_anonymous_refresh_uses_ssh_recovery():

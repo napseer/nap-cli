@@ -6,11 +6,12 @@ Verifies that:
     are accepted and route to the right function.
   - dropped aliases (ls, new, send, rm, set-status, admin, global-list, etc.)
     now raise RuntimeError with a clear pointer to the canonical verb.
-  - `nap project encryption set` requires --state; positional-state shortcut is gone.
-  - `nap project encryption plaintext` (action-as-state) now errors.
+  - project encryption compatibility forms normalize to one transition handler.
 """
 
 import importlib.util
+import contextlib
+import io
 import pathlib
 import sys
 
@@ -155,35 +156,48 @@ def test_gateway_rotate_passphrase_aliases_rejected():
         expect_unknown(mod, args, "rotate-passphrase")
 
 
-def test_project_encryption_state_flag_required():
-    """nap project encryption set requires --state; positional state is rejected."""
+def dispatch_encryption(mod, argv):
+    calls = []
+    mod.project_encryption_transition = lambda args: (
+        calls.append(dict(args)) or {"status": "updated", "state": args["state"]}
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        mod.cli_main(argv)
+    return calls
+
+
+def test_project_encryption_set_compatibility_form():
+    """The explicit set form routes to the canonical transition handler."""
     mod = load_module()
-    # Without --state, the dispatch should raise
-    expect_unknown(
+    calls = dispatch_encryption(
         mod,
         ["napseer_mcp_server.py", "project", "encryption", "set", "plaintext"],
-        "--state plaintext|encrypted",
     )
+    assert calls == [{"state": "plaintext", "passphrase": None}]
 
 
-def test_project_encryption_action_as_state_rejected():
-    """`nap project encryption plaintext` (the old shortcut) must error."""
+def test_project_encryption_action_as_state_is_hidden_compatibility():
     mod = load_module()
-    expect_unknown(
+    calls = dispatch_encryption(
         mod,
         ["napseer_mcp_server.py", "project", "encryption", "plaintext"],
-        "project encryption",
     )
+    assert calls == [{"state": "plaintext", "passphrase": None}]
 
 
-def test_project_encryption_show_alias_rejected():
+def test_project_encryption_status_aliases_are_read_only_compatibility():
     mod = load_module()
-    for args in [
+    calls = []
+    mod.project_encryption_status = lambda args: (
+        calls.append(dict(args)) or {"status": "ok", "state": "plaintext"}
+    )
+    for argv in [
         ["napseer_mcp_server.py", "project", "encryption", "state"],
         ["napseer_mcp_server.py", "project", "encryption", "show"],
-        ["napseer_mcp_server.py", "project", "encryption", "encrypted"],
     ]:
-        expect_unknown(mod, args, "project encryption")
+        with contextlib.redirect_stdout(io.StringIO()):
+            mod.cli_main(argv)
+    assert calls == [{}, {}]
 
 
 if __name__ == "__main__":
@@ -198,7 +212,7 @@ if __name__ == "__main__":
     test_gateway_service_run_rejected()
     test_gateway_vault_aliases_rejected()
     test_gateway_rotate_passphrase_aliases_rejected()
-    test_project_encryption_state_flag_required()
-    test_project_encryption_action_as_state_rejected()
-    test_project_encryption_show_alias_rejected()
+    test_project_encryption_set_compatibility_form()
+    test_project_encryption_action_as_state_is_hidden_compatibility()
+    test_project_encryption_status_aliases_are_read_only_compatibility()
     print("ok: cli dispatch consolidation tests passed")

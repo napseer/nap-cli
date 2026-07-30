@@ -11,9 +11,25 @@ This repository is intended to become the canonical source for:
 
 Current state:
 
-- `resources/scripts/nap_install.py` is copied from the backend pre-split implementation.
-- `resources/scripts/` contains the runtime scripts currently installed by `nap_install.py`.
+- `resources/scripts/nap_install.py` owns the versioned, verified, atomic
+  runtime bundle installer.
+- `resources/scripts/` contains the public runtime source embedded by the
+  backend without behavioral rewrites.
+- `resources/scripts/napseer_mcp_supervisor.py` is the recommended Codex stdio
+  entrypoint. It keeps the client transport alive while restarting or reloading
+  the generated `napseer_mcp_server.py` worker between requests.
 - `scripts/nap_install.py` is kept as a convenient top-level command source copy during the initial import.
-- Gateway-specific implementation is still partially embedded in `resources/scripts/napseer_mcp_server.py`; it should move behind a gateway package/runtime boundary in a later extraction slice.
+- Gateway service compatibility remains in the worker while the standalone
+  gateway image is built from the public gateway repository.
 
-Backend discovery remains the compatibility source of truth during migration.
+Backend discovery publishes the release manifest and exact public source
+revision used for each bundle.
+
+Configure Codex and other long-lived stdio clients to launch:
+
+```sh
+python3 ~/.local/share/napseer/napseer_mcp_supervisor.py
+```
+
+The direct wrapper remains the `nap` CLI implementation and an isolated
+protocol-debugging entrypoint.
