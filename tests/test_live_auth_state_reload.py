@@ -46,12 +46,29 @@ def run():
     requests = []
     mod.load_public_auth_file = lambda: dict(current)
     mod.gateway_is_unlocked = lambda: False
+    mod.AUTH_PATH = pathlib.Path(__file__)
+
+    # The MCP worker may have started before `nap project attach`, leaving
+    # its project selection empty until another process replaces auth.json.
+    mod.DEFAULT_PROJECT_ID = None
+    assert mod.resolve_project_id({}) == "project-1"
+
+    current = {}
+    mod.DEFAULT_PROJECT_ID = "stale-project"
+    try:
+        mod.resolve_project_id({})
+    except mod.SafeToolError as exc:
+        assert exc.code == "project_not_configured"
+        assert "nap project attach" in exc.safe_message
+    else:
+        raise AssertionError("missing project selection must return an actionable safe error")
 
     def open_success(request, timeout=None):
         requests.append(request)
         return Response()
 
     mod.api_urlopen = open_success
+    current = auth("fresh-access", "fresh-refresh")
     mod.TOKEN = "stale-access"
     mod.REFRESH_TOKEN = "stale-refresh"
     result = mod.request_json("GET", "/v1/projects/project-1")

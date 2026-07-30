@@ -7375,9 +7375,19 @@ def chmod_best_effort(path, mode):
 
 
 def resolve_project_id(args):
+    # Project-scoped tools resolve their target before issuing an HTTP
+    # request. Reload auth here as well as in request_json so a long-running
+    # MCP worker observes `nap project attach` even when it started before a
+    # project was selected.
+    if AUTH_PATH.exists() or not DEFAULT_PROJECT_ID:
+        refresh_public_auth_state()
     project_id = DEFAULT_PROJECT_ID
     if not project_id:
-        raise RuntimeError("No project configured. Run nap project create or call nap_project_create first.")
+        raise SafeToolError(
+            "project_not_configured",
+            "No project is selected in this directory. Run `nap project attach` "
+            "for an existing project or `nap project create` for a new one.",
+        )
     return project_id
 
 
