@@ -282,3 +282,34 @@ def test_manifest_rejects_path_traversal():
         assert "unsafe install_path" in str(exc)
     else:
         raise AssertionError("unsafe manifest path must be rejected")
+
+
+def test_manifest_accepts_a_future_compatible_release():
+    module = load_installer()
+    manifest, _payloads = fake_bundle(module)
+    manifest["release_version"] = "0.2.2"
+    manifest["contract"]["current"] = "2026-08-02"
+    for item in manifest["items"]:
+        item["version"] = "0.2.2"
+        item["contract_version"] = "2026-08-02"
+
+    items = module.validated_manifest_items(manifest)
+
+    assert len(items) == len(module.SCRIPT_NAMES)
+
+
+def test_manifest_rejects_a_minimum_contract_newer_than_installer():
+    module = load_installer()
+    manifest, _payloads = fake_bundle(module)
+    manifest["contract"]["current"] = "2026-08-02"
+    manifest["contract"]["minimum_supported"] = "2026-08-02"
+    for item in manifest["items"]:
+        item["contract_version"] = "2026-08-02"
+        item["minimum_contract_version"] = "2026-08-02"
+
+    try:
+        module.validated_manifest_items(manifest)
+    except RuntimeError as exc:
+        assert "newer bootstrap installer" in str(exc)
+    else:
+        raise AssertionError("incompatible minimum contract must be rejected")

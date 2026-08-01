@@ -3,15 +3,17 @@
 
 Usage:
   python3 nap_install.py
+  nap init
+  nap status
+  nap doctor
+  nap auth login
   nap project create
-  nap project status
+  nap project attach
+  nap mcp status
   nap gateway start
   nap gateway stop
-  nap gateway configure
-  nap gateway logs
-  nap status
-  nap agent list
   nap update
+  nap version
 """
 
 import ast
@@ -212,6 +214,23 @@ def bundle_manifest():
     return fetch_json("/v1/scripts", "CLI bundle manifest")
 
 
+def contract_version_tuple(value):
+    parts = str(value or "").split("-")
+    if len(parts) != 3 or any(not part.isdigit() for part in parts):
+        return None
+    year, month, day = (int(part) for part in parts)
+    if year < 2000 or not 1 <= month <= 12 or not 1 <= day <= 31:
+        return None
+    return year, month, day
+
+
+def release_version_tuple(value):
+    parts = str(value or "").split(".")
+    if len(parts) != 3 or any(not part.isdigit() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
+
+
 def validated_manifest_items(manifest):
     if manifest.get("schema_version") != CLI_BUNDLE_SCHEMA_VERSION:
         raise RuntimeError(
@@ -220,12 +239,15 @@ def validated_manifest_items(manifest):
     contract = manifest.get("contract")
     if not isinstance(contract, dict):
         raise RuntimeError("CLI bundle manifest is missing contract metadata")
-    if contract.get("current") != CLI_DISTRIBUTION_CONTRACT_VERSION:
-        raise RuntimeError("CLI bundle contract does not match this installer")
-    if contract.get("minimum_supported") != CLI_MINIMUM_CONTRACT_VERSION:
-        raise RuntimeError("CLI bundle minimum contract metadata is inconsistent")
-    if manifest.get("release_version") != CLI_RELEASE_VERSION:
-        raise RuntimeError("CLI bundle release version does not match this installer")
+    current_contract = contract_version_tuple(contract.get("current"))
+    minimum_contract = contract_version_tuple(contract.get("minimum_supported"))
+    installer_contract = contract_version_tuple(CLI_DISTRIBUTION_CONTRACT_VERSION)
+    if current_contract is None or minimum_contract is None or current_contract < minimum_contract:
+        raise RuntimeError("CLI bundle contract metadata is invalid")
+    if installer_contract is None or installer_contract < minimum_contract:
+        raise RuntimeError("CLI bundle requires a newer bootstrap installer")
+    if release_version_tuple(manifest.get("release_version")) is None:
+        raise RuntimeError("CLI bundle release version is invalid")
     source = manifest.get("source")
     if (
         not isinstance(source, dict)
