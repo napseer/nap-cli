@@ -329,3 +329,15 @@ def test_cli_log_compaction_preserves_live_writer_inode(tmp_path):
     content = log_path.read_bytes()
     assert content.endswith(b"after-cli-compaction\n")
     assert b"recent-line\n" in content
+
+
+def test_logs_command_never_compacts_a_running_service_log(tmp_path, monkeypatch):
+    module = load_installer()
+    log_path = tmp_path / "gateway.log"
+    log_path.write_text("one\ntwo\n", encoding="utf-8")
+    monkeypatch.setattr(module, "service_log_path", lambda kind: log_path)
+    monkeypatch.setattr(module, "compact_log_file", fail_if_called)
+
+    result = module.service_logs("gateway", ["--lines", "1"])
+
+    assert result["lines"] == ["two"]

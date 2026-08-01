@@ -863,7 +863,6 @@ def list_service(kind):
 def service_logs(kind, args):
     max_lines = int(cli_option(args, "--lines", "--tail", default="120"))
     path = service_log_path(kind)
-    compact_log_file(path)
     lines = log_tail_lines(path, max_lines=max_lines)
     status = "ok" if path.exists() else "missing"
     return {

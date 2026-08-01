@@ -614,34 +614,35 @@ def compact_log_file(path, max_bytes):
     if max_bytes <= 0:
         return
     file_path = pathlib.Path(path)
-    try:
-        size = file_path.stat().st_size
-    except FileNotFoundError:
-        return
-    except OSError:
-        return
-    if size <= max_bytes:
-        return
-    try:
-        with file_path.open("rb") as handle:
-            handle.seek(-max_bytes, os.SEEK_END)
-            chunk = handle.read(max_bytes)
-    except OSError:
-        return
-    newline_index = chunk.find(b"\n")
-    if newline_index >= 0 and newline_index + 1 < len(chunk):
-        chunk = chunk[newline_index + 1 :]
-    try:
-        # Keep the inode stable: the daemon's stdout/stderr already point to
-        # this file. Replacing the pathname would leave the live process
-        # writing to a deleted inode and make `nap gateway logs` stale.
-        with GATEWAY_LOG_LOCK, file_path.open("r+b") as handle:
-            handle.seek(0)
-            handle.write(chunk)
-            handle.truncate()
-            handle.flush()
-    except OSError:
-        return
+    with GATEWAY_LOG_LOCK:
+        try:
+            size = file_path.stat().st_size
+        except FileNotFoundError:
+            return
+        except OSError:
+            return
+        if size <= max_bytes:
+            return
+        try:
+            with file_path.open("rb") as handle:
+                handle.seek(-max_bytes, os.SEEK_END)
+                chunk = handle.read(max_bytes)
+        except OSError:
+            return
+        newline_index = chunk.find(b"\n")
+        if newline_index >= 0 and newline_index + 1 < len(chunk):
+            chunk = chunk[newline_index + 1 :]
+        try:
+            # Keep the inode stable: the daemon's stdout/stderr already point
+            # to this file. The same lock covers the read/truncate interval so
+            # a concurrent gateway_log append cannot be discarded.
+            with file_path.open("r+b") as handle:
+                handle.seek(0)
+                handle.write(chunk)
+                handle.truncate()
+                handle.flush()
+        except OSError:
+            return
 
 
 def start_gateway_log_compactor_thread():
