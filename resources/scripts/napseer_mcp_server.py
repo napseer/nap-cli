@@ -574,6 +574,7 @@ GATEWAY_LISTENER_ACTIVE_LANES = set()
 GATEWAY_LISTENER_UNSTABLE_UNTIL = 0.0
 GATEWAY_LISTENER_STABILITY_LOCK = threading.RLock()
 AUTH_RENEW_LOCK = threading.Lock()
+GATEWAY_LOG_LOCK = threading.Lock()
 GATEWAY_VAULT_SETUP_THREAD_STARTED = False
 GATEWAY_PERIODIC_LOG_STATE = {}
 WS_CLOSE_DETAILS = {}
@@ -595,7 +596,8 @@ def gateway_log(event, level="info", **fields):
             payload[key] = value
         else:
             payload[key] = str(value)
-    print(json.dumps(payload, separators=(",", ":"), sort_keys=True), file=sys.stderr, flush=True)
+    with GATEWAY_LOG_LOCK:
+        print(json.dumps(payload, separators=(",", ":"), sort_keys=True), file=sys.stderr, flush=True)
 
 
 def gateway_periodic_log(key, interval_seconds, event, level="info", **fields):
@@ -629,15 +631,17 @@ def compact_log_file(path, max_bytes):
     newline_index = chunk.find(b"\n")
     if newline_index >= 0 and newline_index + 1 < len(chunk):
         chunk = chunk[newline_index + 1 :]
-    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
     try:
-        tmp_path.write_bytes(chunk)
-        tmp_path.replace(file_path)
+        # Keep the inode stable: the daemon's stdout/stderr already point to
+        # this file. Replacing the pathname would leave the live process
+        # writing to a deleted inode and make `nap gateway logs` stale.
+        with GATEWAY_LOG_LOCK, file_path.open("r+b") as handle:
+            handle.seek(0)
+            handle.write(chunk)
+            handle.truncate()
+            handle.flush()
     except OSError:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        return
 
 
 def start_gateway_log_compactor_thread():
