@@ -2839,9 +2839,9 @@ def gateway_listener_min_lanes():
 
 def gateway_listener_max_lanes():
     try:
-        configured = int(os.environ.get("NAPSEER_GATEWAY_RELAY_LISTENER_MAX_LANES", "3"))
+        configured = int(os.environ.get("NAPSEER_GATEWAY_RELAY_LISTENER_MAX_LANES", "1"))
     except ValueError:
-        configured = 3
+        configured = 1
     return max(gateway_listener_min_lanes(), min(5, configured))
 
 
@@ -4567,6 +4567,11 @@ def handle_gateway_relay_session(connect_request, listener_sock=None):
                         "snapshot_truncated": len(snapshot_data) >= max_snapshot_bytes,
                         "sent_at": iso_now(),
                     })
+            elif gateway_remote_should_run():
+                # An explicitly configured spare lane stays silent while it is
+                # outside the current target. It is not a readiness failure.
+                closed_by_relay_streak = 0
+                failure_streak = 0
             else:
                 for chunk in attach.chunks:
                     send_gateway_payload({
