@@ -475,7 +475,6 @@ PUBLIC_TOOLS = {
     "nap_gateway_vault_secret_rotate",
     "nap_gateway_restart",
     "nap_gateway_kill",
-    "nap_login",
     "nap_update_status",
     "nap_update_self",
     "nap_apropos",
@@ -12014,8 +12013,8 @@ def raw_tools():
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
         {
-            "name": "nap_login",
-            "description": "Renew the local bearer token with the stored refresh token. Legacy SSH enrollment is used only when no refresh token exists.",
+            "name": "nap_auth_refresh",
+            "description": "Repair authentication with the stored refresh credential. Normal refresh is automatic.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -13266,7 +13265,7 @@ TOOL_CATEGORIES = {
         "nap_agent_rm",
         "nap_agent_ln",
     ],
-    "project": ["nap_whoami", "nap_login", "nap_project_create", "nap_claim_account"],
+    "project": ["nap_whoami", "nap_project_create", "nap_claim_account"],
     "schedules": ["nap_crontab_register_key", "nap_crontab_put"],
     "gateway": [
         "nap_gateway_status",
@@ -13589,9 +13588,7 @@ CANONICAL_TOOL_NAMES = {
 
 # Old clients may still call the old names. They are deliberately absent from
 # tools/list and nap_apropos so new clients learn only the canonical surface.
-COMPATIBILITY_TOOL_ALIASES = {
-    "nap_login": "nap_auth_refresh",
-}
+COMPATIBILITY_TOOL_ALIASES = {}
 
 HIDDEN_COMPATIBILITY_TOOL_NAMES = {
     "nap_bulk_read",
@@ -14518,7 +14515,7 @@ def call_tool_impl(name, args):
         return gateway_terminal_restart(args)
     if name == "nap_gateway_kill":
         return gateway_terminal_kill(args)
-    if name in {"nap_auth_refresh", "nap_login"}:
+    if name == "nap_auth_refresh":
         return renew_auth()
     if name == "nap_update_status":
         return update_status()
