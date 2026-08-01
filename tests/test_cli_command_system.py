@@ -313,3 +313,19 @@ def test_manifest_rejects_a_minimum_contract_newer_than_installer():
         assert "newer bootstrap installer" in str(exc)
     else:
         raise AssertionError("incompatible minimum contract must be rejected")
+
+
+def test_cli_log_compaction_preserves_live_writer_inode(tmp_path):
+    module = load_installer()
+    log_path = tmp_path / "gateway.log"
+    log_path.write_bytes((b"old-line\n" * 200) + b"recent-line\n")
+    inode_before = log_path.stat().st_ino
+
+    with log_path.open("ab", buffering=0) as live_writer:
+        module.compact_log_file(log_path, 128)
+        live_writer.write(b"after-cli-compaction\n")
+
+    assert log_path.stat().st_ino == inode_before
+    content = log_path.read_bytes()
+    assert content.endswith(b"after-cli-compaction\n")
+    assert b"recent-line\n" in content

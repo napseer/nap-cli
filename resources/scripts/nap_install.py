@@ -682,15 +682,17 @@ def compact_log_file(path, max_bytes=MAX_SERVICE_LOG_BYTES):
     newline_index = chunk.find(b"\n")
     if newline_index >= 0 and newline_index + 1 < len(chunk):
         chunk = chunk[newline_index + 1 :]
-    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
     try:
-        tmp_path.write_bytes(chunk)
-        tmp_path.replace(file_path)
+        # Preserve the inode used by a running gateway process. Replacing the
+        # path here would leave its inherited stdout/stderr descriptors
+        # writing to a deleted file.
+        with file_path.open("r+b") as handle:
+            handle.seek(0)
+            handle.write(chunk)
+            handle.truncate()
+            handle.flush()
     except OSError:
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        return
 
 
 def ensure_port_available(kind, port):
