@@ -25,6 +25,7 @@ def run():
     test_state = tempfile.TemporaryDirectory()
     mod.AUTH_PATH = pathlib.Path(test_state.name) / "auth.json"
     saves = []
+    replacements = []
 
     def save_auth(updates):
         saves.append(dict(updates))
@@ -40,7 +41,11 @@ def run():
     }
     mod.save_auth = save_auth
     mod.save_auth_file_credentials = save_auth
-    mod.replace_public_auth_state = lambda updates, clear_keys=(): save_auth(updates)
+    def replace_public_auth_state(updates, clear_keys=()):
+        replacements.append(set(clear_keys))
+        save_auth(updates)
+
+    mod.replace_public_auth_state = replace_public_auth_state
     mod.request_json = lambda method, path: {
         "id": PROJECT_ID,
         "slug": "existing-project",
@@ -54,12 +59,15 @@ def run():
     assert saves[0]["refresh_token"] == "oauth-refresh-token"
     assert saves[0]["project_id"] == PROJECT_ID
     assert saves[0]["account_mode"] == "operator_project"
+    assert replacements[0] == mod.WORKER_BINDING_AUTH_KEYS
+    assert "project_id" not in replacements[0]
     assert "napseer.projects.read" in saves[0]["oauth_scope"]
     assert saves[1]["project_slug"] == "existing-project"
     assert result["project_id"] == PROJECT_ID
     assert result["project"]["name"] == "Existing Project"
 
     saves.clear()
+    replacements.clear()
     mod.oauth_loopback_authorize = lambda args: {
         "api_base_url": "https://api.example.test",
         "access_token": "account-token",

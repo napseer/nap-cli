@@ -7059,17 +7059,20 @@ def operator_project_attach(args=None):
     if not project_id:
         raise RuntimeError("OAuth authorization did not return a selected project_id")
     token_expires_at = iso_timestamp_after_seconds(int(result.get("expires_in") or 0))
-    save_auth({
-        "base_url": result.get("api_base_url") or BASE_URL,
-        "token": result.get("access_token"),
-        "refresh_token": result.get("refresh_token"),
-        "token_expires_at": token_expires_at,
-        "refresh_expires_at": result.get("refresh_expires_at"),
-        "project_id": project_id,
-        "account_mode": "operator_project",
-        "oauth_client_id": "nap-cli",
-        "oauth_scope": result.get("scope"),
-    })
+    replace_public_auth_state(
+        {
+            "base_url": result.get("api_base_url") or BASE_URL,
+            "token": result.get("access_token"),
+            "refresh_token": result.get("refresh_token"),
+            "token_expires_at": token_expires_at,
+            "refresh_expires_at": result.get("refresh_expires_at"),
+            "project_id": project_id,
+            "account_mode": "operator_project",
+            "oauth_client_id": "nap-cli",
+            "oauth_scope": result.get("scope"),
+        },
+        clear_keys=WORKER_BINDING_AUTH_KEYS,
+    )
     try:
         project = request_json("GET", f"/v1/projects/{project_id}")
         save_auth_file_credentials({
@@ -13912,6 +13915,16 @@ PROJECT_BINDING_AUTH_KEYS = {
     "project_name",
     "project_encryption_state",
     "project_signing_key_fingerprint",
+    "worker_id",
+    "agent_id",
+    "worker_name",
+    "worker_capabilities",
+    "claimed_account_id",
+    "claimed_at",
+    "service_registration_id",
+}
+
+WORKER_BINDING_AUTH_KEYS = {
     "worker_id",
     "agent_id",
     "worker_name",
