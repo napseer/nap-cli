@@ -880,21 +880,9 @@ def handle_gateway(args):
     subcommand = args[0] if args else "status"
     rest = args[1:] if args else []
     if subcommand in {"help", "-h", "--help"}:
-        print("Usage: nap gateway [start|stop|status|logs|setup|repair|terminal|schedule|vault]")
-        print("  nap gateway start [--port PORT]       Start the local gateway service.")
-        print("  nap gateway status                    Show the managed gateway process.")
-        print("  nap gateway setup [--command CMD]     Create local storage and set the default command.")
-        print("  nap gateway repair                    Create dedicated gateway worker credentials.")
-        print("  nap gateway vault                     Show gateway vault status and pending setup requests.")
-        print("  nap gateway vault process             Complete pending setup requests with the vault/content passphrase.")
-        print("  nap gateway vault rotate-secret --kind memory")
-        return 0
-    if subcommand == "vault" and rest and rest[0] in {"help", "-h", "--help"}:
-        print("Usage: nap gateway vault [status|process|rotate-secret] [--kind memory] [--all] [--project-id ID] [--vault-passphrase TEXT]")
-        print("  status        Show local gateway state and pending setup requests.")
-        print("  process       Upload opaque client-wrapped key bundle records for backend-owned HashiCorp storage.")
-        print("  rotate-secret Rotate the memory project secret from the gateway worker path.")
-        return 0
+        return print_gateway_help()
+    if subcommand in {"terminal", "schedule", "vault"} and rest and rest[0] in {"help", "-h", "--help"}:
+        return print_gateway_help(subcommand)
     if subcommand == "vault" and rest and rest[0] in {"list", "ls"}:
         raise RuntimeError("unknown gateway vault command: list; use `nap gateway vault status`")
     if subcommand == "process":
@@ -916,6 +904,41 @@ def handle_gateway(args):
     if subcommand in {"setup", "repair", "vault", "terminal", "schedule"}:
         return run_wrapper("gateway", [subcommand, *rest])
     raise RuntimeError("unknown gateway command; use nap gateway start|stop|status|logs|setup|repair|terminal|schedule|vault")
+
+
+def print_gateway_help(topic=None):
+    if topic == "terminal":
+        print("""Usage:
+  nap gateway terminal list
+  nap gateway terminal create [--name NAME] [--command CMD]
+  nap gateway terminal capture --terminal ID [--start OFFSET]
+  nap gateway terminal input --terminal ID --text TEXT
+  nap gateway terminal key --terminal ID (--key KEY | --text TEXT)
+  nap gateway terminal close [ID | --terminal ID]""")
+        return 0
+    if topic == "schedule":
+        print("""Usage:
+  nap gateway schedule list
+  nap gateway schedule create --name NAME --terminal ID --message TEXT --cron EXPR
+  nap gateway schedule update [ID | --schedule ID] [--name NAME] [--message TEXT] [--cron EXPR] [--enabled | --disabled]
+  nap gateway schedule run [ID | --schedule ID]
+  nap gateway schedule delete [ID | --schedule ID]""")
+        return 0
+    if topic == "vault":
+        print("Usage: nap gateway vault [status|process|rotate-secret] [--kind memory] [--all] [--project-id ID] [--vault-passphrase TEXT]")
+        print("  status        Show local gateway state and pending setup requests.")
+        print("  process       Upload opaque client-wrapped key bundle records for backend-owned HashiCorp storage.")
+        print("  rotate-secret Rotate the memory project secret from the gateway worker path.")
+        return 0
+    print("Usage: nap gateway [start|stop|status|logs|setup|repair|terminal|schedule|vault]")
+    print("  nap gateway start [--port PORT]       Start the local gateway service.")
+    print("  nap gateway status                    Show the managed gateway process.")
+    print("  nap gateway setup [--command CMD]     Create local storage and set the default command.")
+    print("  nap gateway repair                    Create dedicated gateway worker credentials.")
+    print("  nap gateway terminal help             Show terminal lifecycle commands.")
+    print("  nap gateway schedule help             Show schedule lifecycle commands.")
+    print("  nap gateway vault help                Show vault commands.")
+    return 0
 
 
 def print_json(value):
@@ -1189,6 +1212,9 @@ def main(argv):
     if command in HELP_TOKENS:
         return print_command_help(args[0] if args else "")
     if any(item in HELP_TOKENS for item in args):
+        if command == "gateway":
+            topic = next((item for item in args if item not in HELP_TOKENS), None)
+            return print_gateway_help(topic)
         return print_command_help(command)
     if command == "init":
         return run_wrapper("project", ["init", *args])

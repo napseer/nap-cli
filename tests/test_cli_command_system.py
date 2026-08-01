@@ -66,6 +66,21 @@ def test_help_topic_uses_same_canonical_text(capsys):
     assert "Usage: nap mcp [status|install|update|serve]" in capsys.readouterr().out
 
 
+def test_gateway_nested_help_is_specific_and_side_effect_free(monkeypatch, capsys):
+    module = load_installer()
+    monkeypatch.setattr(module, "run_wrapper", fail_if_called)
+
+    assert module.main(["nap", "gateway", "terminal", "help"]) == 0
+    terminal_help = capsys.readouterr().out
+    assert "nap gateway terminal capture" in terminal_help
+    assert "nap gateway schedule create" not in terminal_help
+
+    assert module.main(["nap", "gateway", "schedule", "--help"]) == 0
+    schedule_help = capsys.readouterr().out
+    assert "nap gateway schedule create" in schedule_help
+    assert "nap gateway terminal capture" not in schedule_help
+
+
 def test_init_and_auth_repair_normalize_to_existing_handlers(monkeypatch):
     module = load_installer()
     calls = []
