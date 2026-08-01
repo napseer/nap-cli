@@ -114,6 +114,8 @@ def encrypted_node(mod, full_path="/notes/alpha", content="secret needle", metad
 
 def run():
     mod = load_module()
+    test_state = tempfile.TemporaryDirectory()
+    mod.AUTH_PATH = pathlib.Path(test_state.name) / "auth.json"
     mod.AUTH = {"account_id": ACCOUNT_ID, "token": "token", "token_expires_at": "later"}
     mod.PROJECT_VAULT_PASSPHRASE = PASSPHRASE
     mod.DEFAULT_PROJECT_ID = "project-1"
@@ -121,6 +123,7 @@ def run():
     mod.ACTIVE_MEMORY_SECRET_VERSIONS.clear()
     cache_secret(mod)
     real_active_memory_secret = mod.active_memory_secret
+    real_get_node_by_id = mod.get_node_by_id
 
     envelope = mod.encrypt_memory_bytes(
         "project-1",
@@ -247,8 +250,9 @@ def run():
     mod.ACTIVE_MEMORY_SECRET_VERSIONS.clear()
     cache_secret(mod)
     node = encrypted_node(mod, metadata={"private": "secret metadata"})
+    mod.get_node_by_id = real_get_node_by_id
     mod.request_json = lambda method, path, payload=None, **kwargs: node
-    read = mod.get_node_by_path({"path": "/notes/alpha"})
+    read = mod.get_node_by_id({"node_id": "node-1"})
     assert read["content_text"] == "secret needle"
     assert read["metadata"] == {"private": "secret metadata"}
 
@@ -257,8 +261,8 @@ def run():
     moved["folder_path"] = "/renamed"
     mod.request_json = lambda method, path, payload=None, **kwargs: {"items": [moved]}
     listed = mod.list_project_nodes({"limit": 10, "include_content": True})
-    assert listed["items"][0]["content_text"] == "secret needle"
-    assert listed["items"][0]["metadata"] == {"private": "secret metadata"}
+    assert "content_text" not in listed["items"][0]
+    assert listed["items"][0]["full_path"] == "/renamed/alpha"
 
     mod.request_json = lambda method, path, payload=None, **kwargs: {"items": [moved]}
     compact = mod.list_project_nodes({"limit": 10})
@@ -311,7 +315,7 @@ def run():
     legacy_moved["full_path"] = "/renamed/legacy"
     mod.request_json = lambda method, path, payload=None, **kwargs: legacy_moved
     try:
-        mod.get_node_by_path({"path": "/renamed/legacy"})
+        mod.get_node_by_id({"node_id": "node-1"})
     except RuntimeError:
         pass
     else:

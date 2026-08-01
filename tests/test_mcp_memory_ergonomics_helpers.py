@@ -16,6 +16,11 @@ def load_module():
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(module)
+    # Keep project resolution independent from any real .napseer/auth.json in
+    # the checkout. Store the handle on the module so the directory remains
+    # alive for the complete test invocation.
+    module._test_state = tempfile.TemporaryDirectory()
+    module.AUTH_PATH = pathlib.Path(module._test_state.name) / "auth.json"
     module.AUTH = {"account_id": "acct-1", "token": "token", "token_expires_at": "later"}
     module.DEFAULT_PROJECT_ID = "project-1"
     module.project_memory_encryption_active = lambda project_id: False

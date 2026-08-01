@@ -191,6 +191,9 @@ class RelaySocketClosed(RuntimeError):
 
 
 def local_state_dir():
+    project_root = os.environ.get("NAPSEER_PROJECT_ROOT")
+    if project_root:
+        return pathlib.Path(project_root).expanduser().resolve() / ".napseer"
     return pathlib.Path.cwd() / ".napseer"
 
 
@@ -312,7 +315,8 @@ def send_telemetry_event_async(event, component, outcome="success", **fields):
 
 
 AUTH_DIR = local_state_dir()
-AUTH_PATH = AUTH_DIR / "auth.json"
+AUTH_PATH = pathlib.Path(os.environ.get("NAPSEER_AUTH_FILE", AUTH_DIR / "auth.json")).expanduser().resolve()
+GATEWAY_AUTH_PATH = AUTH_DIR / "gateway-auth.json"
 VAULT_PATH = AUTH_DIR / "vault.json"
 LOCAL_VAULT_KEY_PATH = AUTH_DIR / "vault.local-key"
 GATEWAY_RELAY_SECRET_PATH = AUTH_DIR / "gateway-relay-secret.json"
@@ -570,6 +574,7 @@ GATEWAY_LISTENER_LAST_ERROR_AT = None
 GATEWAY_LISTENER_ACTIVE_LANES = set()
 GATEWAY_LISTENER_UNSTABLE_UNTIL = 0.0
 GATEWAY_LISTENER_STABILITY_LOCK = threading.RLock()
+AUTH_RENEW_LOCK = threading.Lock()
 GATEWAY_VAULT_SETUP_THREAD_STARTED = False
 GATEWAY_PERIODIC_LOG_STATE = {}
 WS_CLOSE_DETAILS = {}
@@ -2246,6 +2251,26 @@ def gateway_terminal_restart(args=None):
 
 def gateway_terminal_capture(args=None):
     args = args or {}
+    if args.get("terminal_id"):
+        backend, terminal = gateway_terminal_backend_from_id(
+            args.get("terminal_id"),
+            remote_authenticated=bool(args.get("remote_authenticated")),
+        )
+        if backend == "pty":
+            attach = gateway_pty_manager().attach(str(terminal["id"]))
+            output = b"".join(chunk.data for chunk in attach.chunks)
+            max_bytes = max(2_000, min(int(os.environ.get("NAPSEER_GATEWAY_CAPTURE_MAX_BYTES", "48000")), 64 * 1024))
+            output = output[-max_bytes:]
+            return {
+                "status": "captured",
+                "message": "Gateway PTY terminal output captured.",
+                "terminal_id": terminal["id"],
+                "terminal_backend": "pty",
+                "output": output.decode("utf-8", errors="replace"),
+                "output_seq": attach.newest_seq,
+                "replay_gap": attach.replay_gap,
+                "truncated": len(output) >= max_bytes,
+            }
     if args.get("_internal_target") and (args.get("tmux_target") or args.get("target")):
         target = str(args.get("tmux_target") or args.get("target"))
     elif args.get("terminal_id"):
@@ -2840,7 +2865,7 @@ def mark_gateway_listener_unstable(reason, lane_id=None):
     with GATEWAY_LISTENER_STABILITY_LOCK:
         GATEWAY_LISTENER_UNSTABLE_UNTIL = max(GATEWAY_LISTENER_UNSTABLE_UNTIL, until)
     gateway_periodic_log(
-        "relay_listener_path_marked_unstable",
+        f"relay_listener_path_marked_unstable:{lane_id or 'all'}",
         30,
         "relay_listener_path_marked_unstable",
         level="warn",
@@ -5090,6 +5115,7 @@ def handle_gateway_relay_session(connect_request, listener_sock=None):
 def gateway_relay_loop(lane_id="lane-1"):
     global GATEWAY_LISTENER_CONNECTED, GATEWAY_LISTENER_LAST_CONNECTED_AT, GATEWAY_LISTENER_LAST_ERROR, GATEWAY_LISTENER_LAST_ERROR_AT
     closed_by_relay_streak = 0
+    failure_streak = 0
     gateway_log(
         "relay_listener_thread_started",
         project_id=current_project_id(),
@@ -5103,11 +5129,13 @@ def gateway_relay_loop(lane_id="lane-1"):
             lane_index = int(str(lane_id).rsplit("-", 1)[-1]) if str(lane_id).rsplit("-", 1)[-1].isdigit() else 1
             if gateway_remote_should_run() and lane_index <= gateway_listener_target_lanes():
                 refresh_public_auth_state()
-                ensure_gateway_worker_capability(refresh=True)
+                # A relay connection does not need to rotate OAuth credentials.
+                # Refresh only after the relay actually rejects the access token.
+                ensure_gateway_worker_capability(refresh=False)
                 project_id = current_project_id()
                 agent_id = AUTH.get("agent_id")
                 gateway_periodic_log(
-                    "relay_listener_connecting",
+                    f"relay_listener_connecting:{lane_id}",
                     30,
                     "relay_listener_connecting",
                     project_id=project_id,
@@ -5140,6 +5168,7 @@ def gateway_relay_loop(lane_id="lane-1"):
                         },
                     )
                 connected_at = time.time()
+                failure_streak = 0
                 with GATEWAY_LISTENER_STABILITY_LOCK:
                     GATEWAY_LISTENER_ACTIVE_LANES.add(lane_id)
                     GATEWAY_LISTENER_CONNECTED = bool(GATEWAY_LISTENER_ACTIVE_LANES)
@@ -5228,7 +5257,7 @@ def gateway_relay_loop(lane_id="lane-1"):
                         mark_gateway_listener_unstable("repeated_relay_closes", lane_id=lane_id)
                     delay = min(30.0, 2.0 + (closed_by_relay_streak * 2.0)) + random.uniform(0.0, 1.5)
                     gateway_periodic_log(
-                        "relay_listener_backoff",
+                        f"relay_listener_backoff:{lane_id}",
                         30,
                         "relay_listener_backoff",
                         level="warn",
@@ -5246,7 +5275,7 @@ def gateway_relay_loop(lane_id="lane-1"):
                 readiness = gateway_remote_readiness()
                 blockers = gateway_remote_blockers(readiness)
                 gateway_periodic_log(
-                    "relay_listener_waiting",
+                    f"relay_listener_waiting:{lane_id}",
                     60,
                     "relay_listener_waiting",
                     level="warn",
@@ -5261,6 +5290,7 @@ def gateway_relay_loop(lane_id="lane-1"):
                     reason=",".join(blockers) if blockers else "waiting",
                 )
         except Exception as exc:
+            failure_streak += 1
             closed_by_relay_streak = 0
             with GATEWAY_LISTENER_STABILITY_LOCK:
                 GATEWAY_LISTENER_ACTIVE_LANES.discard(lane_id)
@@ -5269,7 +5299,7 @@ def gateway_relay_loop(lane_id="lane-1"):
             GATEWAY_LISTENER_LAST_ERROR_AT = iso_now()
             mark_gateway_listener_unstable(type(exc).__name__, lane_id=lane_id)
             gateway_periodic_log(
-                "relay_listener_error",
+                f"relay_listener_error:{lane_id}",
                 30,
                 "relay_listener_error",
                 level="error",
@@ -5288,7 +5318,8 @@ def gateway_relay_loop(lane_id="lane-1"):
                 gateway_remote_enabled=gateway_remote_should_run(),
                 relay_listener_unstable=time.time() < GATEWAY_LISTENER_UNSTABLE_UNTIL,
             )
-        time.sleep(2 + random.uniform(0.0, 1.0))
+        delay = min(60.0, 2.0 ** min(failure_streak, 6)) if failure_streak else 10.0
+        time.sleep(delay + random.uniform(0.0, 1.0))
 
 
 def start_gateway_relay_thread():
@@ -6747,7 +6778,7 @@ def renew_anonymous_auth_with_ssh():
     }
 
 
-def renew_auth():
+def _renew_auth_locked():
     oauth_refresh_error = None
     if AUTH.get("account_mode") in {"operator_account", "operator_project", "claimed"} and REFRESH_TOKEN:
         try:
@@ -6833,6 +6864,15 @@ def renew_auth():
         }
 
     return renew_anonymous_auth_with_ssh()
+
+
+def renew_auth():
+    # OAuth providers may rotate refresh tokens. Relay lanes run concurrently,
+    # so serialize renewal and reload the latest token written by another lane
+    # before attempting a refresh.
+    with AUTH_RENEW_LOCK:
+        refresh_public_auth_state()
+        return _renew_auth_locked()
 
 
 def jwt_claims(token):
@@ -7303,6 +7343,108 @@ def gateway_service_activate(args=None):
         "registration_id": registration_id,
         "agent_id": worker.get("agent_id") or AUTH.get("agent_id"),
         "project_id": worker.get("project_id") or DEFAULT_PROJECT_ID,
+    }
+
+
+def write_gateway_worker_auth(payload):
+    GATEWAY_AUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
+    chmod_best_effort(GATEWAY_AUTH_PATH.parent, 0o700)
+    temporary = GATEWAY_AUTH_PATH.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    chmod_best_effort(temporary, 0o600)
+    temporary.replace(GATEWAY_AUTH_PATH)
+    chmod_best_effort(GATEWAY_AUTH_PATH, 0o600)
+
+
+def gateway_worker_repair(args=None):
+    args = args or {}
+    if AUTH.get("account_mode") != "operator_project" or not DEFAULT_PROJECT_ID:
+        raise RuntimeError("gateway repair requires an attached operator project; run `nap project attach`")
+    if GATEWAY_AUTH_PATH.is_file() and not args.get("replace"):
+        return {
+            "status": "already_configured",
+            "message": "Dedicated gateway worker credentials already exist. Restart the gateway to use them; pass --replace only to replace a revoked worker identity.",
+            "gateway_auth_path": str(GATEWAY_AUTH_PATH),
+            "project_id": DEFAULT_PROJECT_ID,
+        }
+    label = str(args.get("display_name") or f"{pathlib.Path.cwd().name}-local-gateway").strip()
+    root_path = str(pathlib.Path.cwd())
+    device_fingerprint = str(AUTH.get("device_fingerprint") or socket.gethostname())
+    container_uuid = ensure_container_uuid()
+    bootstrap = request_json(
+        "POST",
+        "/v1/service-bootstrap-tokens",
+        {
+            "project_id": DEFAULT_PROJECT_ID,
+            "label": label,
+            "expires_in_hours": 1,
+            "max_uses": 1,
+        },
+    )
+    registration_result = request_json(
+        "POST",
+        "/v1/service-registrations",
+        {
+            "bootstrap_token": bootstrap["bootstrap_token"],
+            "display_name": label,
+            "device_fingerprint": device_fingerprint,
+            "container_uuid": container_uuid,
+            "root_path": root_path,
+            "default_command": normalize_gateway_command(args.get("default_command")),
+            "labels": {"source": "nap-cli-local-gateway", "managed": True},
+            "metadata": {"cwd": root_path, "base_url": BASE_URL},
+        },
+        token_required=False,
+    )
+    registration = registration_result.get("registration") or {}
+    registration_id = registration.get("id")
+    if not registration_id:
+        raise RuntimeError("gateway registration did not return an id")
+    accepted = request_json(
+        "POST",
+        f"/v1/service-registrations/{registration_id}/accept",
+        {
+            "project_id": DEFAULT_PROJECT_ID,
+            "display_name": label,
+            "capabilities": {"gateway": True, "local_mcp": False, "managed_by": "nap-cli"},
+        },
+    )
+    activation = request_json(
+        "POST",
+        f"/v1/service-registrations/{registration_id}/activate",
+        {"activation_token": registration_result["activation_token"]},
+        token_required=False,
+    )
+    worker = activation.get("worker") or accepted.get("worker") or {}
+    token = activation.get("token") or {}
+    if not token.get("access_token") or not token.get("refresh_token"):
+        raise RuntimeError("gateway activation did not return worker credentials")
+    write_gateway_worker_auth({
+        "base_url": BASE_URL,
+        "token": token["access_token"],
+        "refresh_token": token["refresh_token"],
+        "token_expires_at": token.get("expires_at"),
+        "refresh_expires_at": token.get("refresh_expires_at"),
+        "project_id": worker.get("project_id") or DEFAULT_PROJECT_ID,
+        "project_slug": AUTH.get("project_slug"),
+        "project_name": AUTH.get("project_name"),
+        "worker_id": worker.get("id"),
+        "agent_id": worker.get("agent_id"),
+        "worker_name": worker.get("name") or label,
+        "device_fingerprint": worker.get("device_fingerprint") or device_fingerprint,
+        "root_path": worker.get("root_path") or root_path,
+        "worker_capabilities": {"gateway": True, "local_mcp": False, "managed_by": "nap-cli"},
+        "account_mode": "gateway_worker",
+        "service_registration_id": registration_id,
+    })
+    return {
+        "status": "repaired",
+        "message": "Dedicated gateway worker credentials created. Restart the gateway to use them.",
+        "gateway_auth_path": str(GATEWAY_AUTH_PATH),
+        "project_id": worker.get("project_id") or DEFAULT_PROJECT_ID,
+        "agent_id": worker.get("agent_id"),
+        "worker_id": worker.get("id"),
+        "registration_id": registration_id,
     }
 
 
@@ -7854,6 +7996,72 @@ def cli_gateway_require_unlocked(args, operation="gateway operation"):
         raise RuntimeError("gateway vault is not configured; run nap gateway configure first")
     if not gateway_is_unlocked():
         gateway_open_local(cli_option(args, "--passphrase", default=None))
+
+
+def cli_gateway_service_state():
+    path = AUTH_DIR / "gateway.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        state = {}
+    try:
+        port = int(state.get("port"))
+    except (TypeError, ValueError):
+        port = 0
+    if not port:
+        raise RuntimeError("local gateway is not running; run `nap gateway start`")
+    return state, f"http://127.0.0.1:{port}"
+
+
+def cli_gateway_service_json(method, url, payload=None):
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=5) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except (TimeoutError, socket.timeout) as exc:
+        raise RuntimeError("local gateway did not respond; run `nap gateway status`") from exc
+    except urllib.error.HTTPError as exc:
+        try:
+            result = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            result = {}
+        error = result.get("error") if isinstance(result, dict) else None
+        message = error.get("message") if isinstance(error, dict) else None
+        raise RuntimeError(message or "local gateway request failed safely") from exc
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("local gateway is unavailable; run `nap gateway status` or `nap gateway restart`") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("local gateway returned an invalid response")
+    error = result.get("error")
+    if isinstance(error, dict):
+        raise RuntimeError(error.get("message") or "local gateway request failed safely")
+    return result
+
+
+def cli_gateway_service_call(route, payload=None):
+    _state, base_url = cli_gateway_service_state()
+    try:
+        session = cli_gateway_service_json("GET", f"{base_url}/local-api/session")
+    except RuntimeError:
+        # Compatibility with gateway runtimes published before the compact
+        # session endpoint existed.
+        session = cli_gateway_service_json("GET", f"{base_url}/local-api/state")
+    service_auth_path = session.get("auth_path")
+    allowed_auth_paths = {AUTH_PATH.resolve(), GATEWAY_AUTH_PATH.resolve()}
+    if service_auth_path and pathlib.Path(service_auth_path).resolve() not in allowed_auth_paths:
+        raise RuntimeError("running gateway belongs to a different project folder")
+    csrf_token = session.get("csrf_token")
+    if not csrf_token:
+        raise RuntimeError("local gateway did not provide a control-session token")
+    body = dict(payload or {})
+    body["csrf_token"] = csrf_token
+    return cli_gateway_service_json("POST", f"{base_url}{route}", body)
     require_unlocked(operation)
 
 
@@ -11302,6 +11510,13 @@ def start_local_ui(args):
                 if parsed_path.path == "/gateway/status":
                     self.send_json(200, gateway_status())
                     return
+                if parsed_path.path == "/local-api/session":
+                    self.send_json(200, {
+                        "csrf_token": csrf_token,
+                        "auth_path": str(AUTH_PATH),
+                        "project_id": current_project_id(),
+                    })
+                    return
                 if parsed_path.path == "/local-api/state":
                     self.send_json(200, self.local_state_payload(urllib.parse.parse_qs(parsed_path.query)))
                     return
@@ -13669,7 +13884,7 @@ def safe_error_matches(exc, *, status=None, service_code=None):
 def safe_auth_refresh_error():
     return SafeToolError(
         "auth_refresh_failed",
-        "Authentication refresh failed. Run `nap auth refresh`; if recovery "
+        "Authentication refresh failed. Run `nap auth repair`; if recovery "
         "fails, run `nap auth login` and then `nap project attach`.",
         status=401,
     )
@@ -13760,8 +13975,6 @@ def tool_contract_metadata(name):
         metadata["dry_run_supported"] = True
     if name in {"nap_plan_transition", "nap_crontab_put"}:
         metadata["dangerous"] = True
-    if name == "nap_auth_refresh":
-        metadata["replaces"] = "nap_login"
     return metadata
 
 
@@ -14630,11 +14843,11 @@ def cli_main(argv):
             print("""Usage:
   nap auth status
   nap auth login [--frontend-url URL] [--api-base-url URL] [--no-browser] [--timeout SECONDS]
-  nap auth refresh
+  nap auth repair
 
 `login` signs in to the account only. It does not select a project.
 Use `nap project attach` to bind this folder to an existing project.
-Refresh is automatic during authenticated calls; use `refresh` only for recovery.
+Refresh is automatic during authenticated calls; use `repair` only for recovery.
 `login-local` remains a hidden compatibility alias for `login`.""")
             return
         if subcommand in {"login", "login-local", "operator-login"}:
@@ -14646,7 +14859,7 @@ Refresh is automatic during authenticated calls; use `refresh` only for recovery
                 "port": cli_option(args, "--port", default=0),
             }), indent=2))
             return
-        if subcommand == "refresh":
+        if subcommand in {"refresh", "repair"}:
             print(json.dumps(renew_auth(), indent=2))
             return
         if subcommand in {"status", "show"}:
@@ -14764,13 +14977,20 @@ Refresh is automatic during authenticated calls; use `refresh` only for recovery
         if subcommand == "configure":
             print(json.dumps(cli_gateway_configure(args), indent=2))
             return
+        if subcommand == "repair":
+            print(json.dumps(gateway_worker_repair({
+                "display_name": cli_option(args, "--name", "--display-name", default=None),
+                "default_command": cli_option(args, "--command", "--default-command", default=None),
+                "replace": cli_flag(args, "--replace"),
+            }), indent=2))
+            return
         if subcommand == "restart":
             cli_gateway_require_unlocked(args, "restarting gateway terminal")
-            print(json.dumps(gateway_terminal_restart({}), indent=2))
+            print(json.dumps(cli_gateway_service_call("/local-api/gateway/terminal/restart", {}), indent=2))
             return
         if subcommand == "kill":
             cli_gateway_require_unlocked(args, "killing gateway terminal")
-            print(json.dumps(gateway_terminal_kill({}), indent=2))
+            print(json.dumps(cli_gateway_service_call("/local-api/gateway/terminal/kill", {}), indent=2))
             return
         if subcommand == "terminal":
             action = args[0] if args else "list"
@@ -14782,23 +15002,23 @@ Refresh is automatic during authenticated calls; use `refresh` only for recovery
             cli_gateway_require_unlocked(terminal_args, "managing gateway terminals")
             terminal_id = cli_option(terminal_args, "--terminal", "--terminal-id", "--id", default=None)
             if action == "list":
-                print(json.dumps(gateway_terminal_sessions({"terminal_id": terminal_id}), indent=2))
+                print(json.dumps(cli_gateway_service_call("/local-api/gateway/terminal/list", {"terminal_id": terminal_id}), indent=2))
                 return
             if action == "create":
-                print(json.dumps(gateway_terminal_create({
+                print(json.dumps(cli_gateway_service_call("/local-api/gateway/terminal/create", {
                     "name": cli_option(terminal_args, "--name", default=None),
                     "command": cli_option(terminal_args, "--command", "--default-command", default=None),
                 }), indent=2))
                 return
             if action == "close":
                 target_id = terminal_id or (terminal_args[0] if terminal_args and not terminal_args[0].startswith("-") else None)
-                print(json.dumps(gateway_terminal_close({"terminal_id": target_id}), indent=2))
+                print(json.dumps(cli_gateway_service_call("/local-api/gateway/terminal/close", {"terminal_id": target_id}), indent=2))
                 return
             if action == "capture":
-                print(json.dumps(gateway_terminal_capture({"terminal_id": terminal_id, "start": cli_option(terminal_args, "--start", default="-200")}), indent=2))
+                print(json.dumps(cli_gateway_service_call("/local-api/gateway/terminal/capture", {"terminal_id": terminal_id, "start": cli_option(terminal_args, "--start", default="-200")}), indent=2))
                 return
             if action == "key":
-                print(json.dumps(gateway_terminal_key({
+                print(json.dumps(cli_gateway_service_call("/local-api/gateway/terminal/key", {
                     "terminal_id": terminal_id,
                     "key": cli_option(terminal_args, "--key", default=None),
                     "text": cli_option(terminal_args, "--text", default=None),
@@ -14820,7 +15040,7 @@ Refresh is automatic during authenticated calls; use `refresh` only for recovery
                             continue
                         text_parts.append(value)
                     text = " ".join(text_parts)
-                print(json.dumps(gateway_terminal_input({"terminal_id": terminal_id, "input": text}), indent=2))
+                print(json.dumps(cli_gateway_service_call("/local-api/gateway/terminal/input", {"terminal_id": terminal_id, "input": text}), indent=2))
                 return
             if action in {"ls", "status", "new", "rm", "remove", "send"}:
                 raise RuntimeError(
@@ -14835,6 +15055,7 @@ Refresh is automatic during authenticated calls; use `refresh` only for recovery
                 )
             schedule_args = args[1:] if args else []
             cli_gateway_require_unlocked(schedule_args, "managing gateway schedules")
+            schedule_id = cli_option(schedule_args, "--schedule", "--schedule-id", "--id", default=None)
             payload = {
                 "schedule_id": schedule_id,
                 "name": cli_option(schedule_args, "--name", default=None),
@@ -14847,25 +15068,25 @@ Refresh is automatic during authenticated calls; use `refresh` only for recovery
             if cli_flag(schedule_args, "--enabled", "--on"):
                 payload["enabled"] = True
             if action == "list":
-                print(json.dumps(gateway_schedule_list({}), indent=2))
+                print(json.dumps(cli_gateway_service_call("/local-api/gateway/schedule/list", {}), indent=2))
                 return
             if action == "create":
-                print(json.dumps(gateway_schedule_create(payload), indent=2))
+                print(json.dumps(cli_gateway_service_call("/local-api/gateway/schedule/create", payload), indent=2))
                 return
             if action == "update":
                 if not payload.get("schedule_id"):
                     payload["schedule_id"] = schedule_args[0] if schedule_args and not schedule_args[0].startswith("-") else None
-                print(json.dumps(gateway_schedule_update(payload), indent=2))
+                print(json.dumps(cli_gateway_service_call("/local-api/gateway/schedule/update", payload), indent=2))
                 return
             if action == "delete":
                 if not payload.get("schedule_id"):
                     payload["schedule_id"] = schedule_args[0] if schedule_args and not schedule_args[0].startswith("-") else None
-                print(json.dumps(gateway_schedule_delete(payload), indent=2))
+                print(json.dumps(cli_gateway_service_call("/local-api/gateway/schedule/delete", payload), indent=2))
                 return
             if action == "run":
                 if not payload.get("schedule_id"):
                     payload["schedule_id"] = schedule_args[0] if schedule_args and not schedule_args[0].startswith("-") else None
-                print(json.dumps(gateway_schedule_run_now(payload), indent=2))
+                print(json.dumps(cli_gateway_service_call("/local-api/gateway/schedule/run", payload), indent=2))
                 return
             if action in {"ls", "status", "new", "edit", "rm", "remove", "run-now", "now", "schedules", "cron", "crons"}:
                 raise RuntimeError(

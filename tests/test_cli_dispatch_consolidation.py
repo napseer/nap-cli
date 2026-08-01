@@ -126,6 +126,19 @@ def test_gateway_schedule_aliases_rejected():
         expect_unknown(mod, args, "unknown gateway")
 
 
+def test_gateway_schedule_list_uses_canonical_route():
+    mod = load_module()
+    calls = []
+    mod.cli_gateway_require_unlocked = lambda args, operation: None
+    mod.cli_gateway_service_call = lambda route, args: calls.append((route, dict(args))) or {
+        "status": "listed",
+        "schedules": [],
+    }
+    with contextlib.redirect_stdout(io.StringIO()):
+        mod.cli_main(["napseer_mcp_server.py", "gateway", "schedule", "list"])
+    assert calls == [("/local-api/gateway/schedule/list", {})]
+
+
 def test_gateway_service_run_rejected():
     """Lifecycle verbs (run, start, etc.) moved to `nap service`."""
     mod = load_module()
@@ -209,6 +222,7 @@ if __name__ == "__main__":
     test_gateway_status_aliases_rejected()
     test_gateway_terminal_aliases_rejected()
     test_gateway_schedule_aliases_rejected()
+    test_gateway_schedule_list_uses_canonical_route()
     test_gateway_service_run_rejected()
     test_gateway_vault_aliases_rejected()
     test_gateway_rotate_passphrase_aliases_rejected()

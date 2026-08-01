@@ -20,6 +20,7 @@ import json
 import hashlib
 import os
 import pathlib
+import select
 import shutil
 import signal
 import socket
@@ -55,8 +56,8 @@ RUNTIME_SCRIPT_NAMES = (
     "napseer_mcp_supervisor.py",
 )
 MAX_SERVICE_LOG_BYTES = int(os.environ.get("NAPSEER_MAX_SERVICE_LOG_BYTES", str(5 * 1024 * 1024)))
-CLI_RELEASE_VERSION = "0.2.0"
-CLI_DISTRIBUTION_CONTRACT_VERSION = "2026-07-29"
+CLI_RELEASE_VERSION = "0.2.1"
+CLI_DISTRIBUTION_CONTRACT_VERSION = "2026-08-01"
 CLI_MINIMUM_CONTRACT_VERSION = "2026-05-19"
 CLI_BUNDLE_SCHEMA_VERSION = "napseer.cli.bundle.v1"
 INSTALL_PATHS = {
@@ -95,13 +96,6 @@ COMMAND_METADATA = {
     "update": {"mutates": True, "visible": True},
     "version": {"mutates": False, "visible": True},
     "help": {"mutates": False, "visible": True},
-    "chat": {"mutates": True, "visible": False},
-    "plan": {"mutates": True, "visible": False},
-    "lineage": {"mutates": False, "visible": False},
-    "agent": {"mutates": True, "visible": False},
-    "feedback": {"mutates": True, "visible": False},
-    "where": {"mutates": False, "visible": False},
-    "install": {"mutates": True, "visible": False},
 }
 
 
@@ -748,7 +742,17 @@ def start_service(kind, args):
     if kind == "ui" and "--no-browser" not in args:
         command.remove("--no-browser")
     with log_path.open("ab") as log:
-        kwargs = {"stdout": log, "stderr": subprocess.STDOUT, "cwd": str(pathlib.Path.cwd())}
+        environment = os.environ.copy()
+        gateway_auth_path = preferred_state_dir() / "gateway-auth.json"
+        if kind == "gateway" and gateway_auth_path.is_file():
+            environment["NAPSEER_AUTH_FILE"] = str(gateway_auth_path)
+            environment["NAPSEER_PROJECT_ROOT"] = str(pathlib.Path.cwd())
+        kwargs = {
+            "stdout": log,
+            "stderr": subprocess.STDOUT,
+            "cwd": str(pathlib.Path.cwd()),
+            "env": environment,
+        }
         if os.name != "nt":
             kwargs["start_new_session"] = True
         else:
@@ -850,41 +854,45 @@ def service_logs(kind, args):
 
 
 def handle_gateway(args):
-    subcommand = args[0] if args else "ls"
+    subcommand = args[0] if args else "status"
     rest = args[1:] if args else []
     if subcommand in {"help", "-h", "--help"}:
-        print("Usage: nap gateway [start|stop|status|logs|configure|setup|restart|kill|vault|terminal|schedule|service]")
+        print("Usage: nap gateway [start|stop|status|logs|setup|repair|terminal|schedule|vault]")
         print("  nap gateway start [--port PORT]       Start the local gateway service.")
         print("  nap gateway status                    Show the managed gateway process.")
-        print("  nap gateway configure [--command CMD] Configure the local gateway command.")
-        print("  nap gateway setup                     Create or migrate local gateway storage.")
+        print("  nap gateway setup [--command CMD]     Create local storage and set the default command.")
+        print("  nap gateway repair                    Create dedicated gateway worker credentials.")
         print("  nap gateway vault                     Show gateway vault status and pending setup requests.")
         print("  nap gateway vault process             Complete pending setup requests with the vault/content passphrase.")
         print("  nap gateway vault rotate-secret --kind memory")
-        print("  nap chat secret setup                 Configure chat secret state with the vault/content passphrase.")
         return 0
     if subcommand == "vault" and rest and rest[0] in {"help", "-h", "--help"}:
-        print("Usage: nap gateway vault [status|list|process|rotate-secret] [--kind memory] [--all] [--project-id ID] [--vault-passphrase TEXT]")
+        print("Usage: nap gateway vault [status|process|rotate-secret] [--kind memory] [--all] [--project-id ID] [--vault-passphrase TEXT]")
         print("  status        Show local gateway state and pending setup requests.")
         print("  process       Upload opaque client-wrapped key bundle records for backend-owned HashiCorp storage.")
         print("  rotate-secret Rotate the memory project secret from the gateway worker path.")
-        print("  Chat secrets use: nap chat secret setup|status|rotate; setup uses the same vault/content passphrase.")
         return 0
+    if subcommand == "vault" and rest and rest[0] in {"list", "ls"}:
+        raise RuntimeError("unknown gateway vault command: list; use `nap gateway vault status`")
     if subcommand == "process":
-        return run_wrapper("gateway", ["vault", "process", *rest])
+        raise RuntimeError("unknown gateway command: process; use `nap gateway vault process`")
     if subcommand == "start":
         return print_json(start_service("gateway", ["--no-browser", *rest])) or 0
     if subcommand == "stop":
         return print_json(stop_service("gateway")) or 0
-    if subcommand in {"ls", "list", "status"}:
+    if subcommand == "status":
         return print_json(list_service("gateway")) or 0
-    if subcommand in {"logs", "log"}:
+    if subcommand == "logs":
         return print_json(service_logs("gateway", rest)) or 0
     if subcommand == "configure":
-        return run_wrapper("gateway", ["configure", *rest])
-    if subcommand in {"setup", "restart", "kill", "vault", "terminal", "schedule", "service"}:
+        raise RuntimeError("unknown gateway command: configure; use `nap gateway setup --command CMD`")
+    if subcommand in {"restart", "kill"}:
+        raise RuntimeError(f"unknown gateway command: {subcommand}; use start, stop, or terminal operations")
+    if subcommand == "service":
+        raise RuntimeError("unknown gateway command: service; use `nap gateway repair` then `nap gateway start`")
+    if subcommand in {"setup", "repair", "vault", "terminal", "schedule"}:
         return run_wrapper("gateway", [subcommand, *rest])
-    raise RuntimeError("unknown gateway command; use nap gateway start|stop|configure|setup|restart|kill|logs|status|vault|terminal|schedule|service")
+    raise RuntimeError("unknown gateway command; use nap gateway start|stop|status|logs|setup|repair|terminal|schedule|vault")
 
 
 def print_json(value):
@@ -938,9 +946,9 @@ def print_command_help(command):
             "  serve    Run the stable stdio supervisor."
         ),
         "gateway": (
-            "Usage: nap gateway [setup|start|stop|restart|status|logs|vault|terminal|schedule|service]\n"
-            "Common lifecycle commands are setup, start, stop, restart, status, and logs.\n"
-            "Vault, terminal, schedule, and service are advanced capability groups."
+            "Usage: nap gateway [start|stop|status|logs|setup|repair|terminal|schedule|vault]\n"
+            "Use setup once, repair only when worker credentials are missing or revoked,\n"
+            "then operate the daemon through terminal, schedule, and vault."
         ),
         "update": (
             "Usage: nap update\n"
@@ -972,14 +980,84 @@ def mcp_status():
     worker = runtime_asset_path("napseer_mcp_server.py")
     supervisor = runtime_asset_path("napseer_mcp_supervisor.py")
     missing = runtime_assets_missing()
+    probe = mcp_runtime_probe() if not missing else {"status": "not_run", "transport": False, "read": False}
     return {
-        "status": "ok" if not missing else "repair_required",
+        "status": "probe_ok" if not missing and probe.get("status") == "ok" else "repair_required",
         "supervisor_installed": supervisor.is_file(),
         "worker_installed": worker.is_file(),
         "runtime_assets_missing": missing,
+        "fresh_process_probe": probe,
+        "client_connection": "not_observable",
+        "message": (
+            "A fresh MCP supervisor transport and authenticated read succeeded. Existing client connections are separate; restart the client if it reports Transport closed."
+            if probe.get("status") == "ok"
+            else "The installed MCP runtime did not pass a fresh-process probe."
+        ),
         "serve_command": f"{sys.executable} {supervisor}",
         "next": None if not missing else "nap mcp install",
     }
+
+
+def mcp_runtime_probe(timeout_seconds=12):
+    supervisor = runtime_asset_path("napseer_mcp_supervisor.py")
+    worker = runtime_asset_path("napseer_mcp_server.py")
+    if not supervisor.is_file() or not worker.is_file():
+        return {"status": "not_installed", "transport": False, "read": False}
+    environment = os.environ.copy()
+    environment["NAPSEER_PROJECT_ROOT"] = str(pathlib.Path.cwd())
+    process = subprocess.Popen(
+        [sys.executable, str(supervisor)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env=environment,
+    )
+
+    def request(request_id, method, params=None):
+        message = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            message["params"] = params
+        process.stdin.write(json.dumps(message) + "\n")
+        process.stdin.flush()
+        ready, _, _ = select.select([process.stdout], [], [], timeout_seconds)
+        if not ready:
+            raise TimeoutError("MCP probe timed out")
+        return json.loads(process.stdout.readline())
+
+    try:
+        initialized = request(1, "initialize", {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "nap-doctor", "version": CLI_RELEASE_VERSION},
+        })
+        listed = request(2, "tools/list")
+        read = request(3, "tools/call", {"name": "nap_library_ls", "arguments": {}})
+        tools = ((listed.get("result") or {}).get("tools") or [])
+        read_result = read.get("result") or {}
+        read_ok = not bool(read_result.get("isError"))
+        initialized_ok = bool(initialized.get("result"))
+        return {
+            "status": "ok" if initialized_ok and tools and read_ok else "failed",
+            "transport": bool(initialized_ok and tools),
+            "read": read_ok,
+            "tool_count": len(tools),
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "transport": False,
+            "read": False,
+            "error_class": exc.__class__.__name__,
+        }
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
 
 
 def handle_mcp(args):
@@ -1026,6 +1104,13 @@ def doctor_status():
         issues.append({"code": "runtime_assets_missing", "message": "local MCP runtime is incomplete", "next": "nap mcp install"})
     if not runtime_asset_path("napseer_mcp_supervisor.py").is_file():
         issues.append({"code": "supervisor_missing", "message": "stable MCP supervisor is not installed", "next": "nap mcp install"})
+    probe = mcp_runtime_probe() if not missing else {"status": "not_run", "transport": False, "read": False}
+    if not missing and probe.get("status") != "ok":
+        issues.append({
+            "code": "mcp_fresh_probe_failed",
+            "message": "fresh MCP transport or authenticated read failed",
+            "next": "nap mcp update; then restart the MCP client",
+        })
     return {
         "status": "ok" if not issues else "repair_required",
         "checks": {
@@ -1037,6 +1122,8 @@ def doctor_status():
             "project_attached": bool(auth.get("project_id")),
             "mcp_supervisor": runtime_asset_path("napseer_mcp_supervisor.py").is_file(),
             "mcp_worker": runtime_asset_path("napseer_mcp_server.py").is_file(),
+            "mcp_fresh_probe": probe,
+            "client_connection": "not_observable",
         },
         "issues": issues,
     }
@@ -1090,18 +1177,12 @@ def main(argv):
     if command == "version":
         print_json(version_status())
         return 0
-    if command == "install":
-        print("`nap install` is deprecated; use `nap mcp install`.", file=sys.stderr)
-        print_json(install_assets())
-        return 0
     if command == "update":
         result = install_assets()
         print_json({**result, "status": "updated", "message": "Napseer CLI and runtime scripts are updated."})
         return 0
     if command == "gateway":
         return handle_gateway(args)
-    if command == "chat":
-        return run_wrapper("chat", args or ["secret", "status"])
     if command == "status":
         return run_wrapper("configure", args)
     if command == "project":
@@ -1110,38 +1191,23 @@ def main(argv):
         if args[0] == "bootstrap":
             raise RuntimeError("unknown project command: bootstrap")
         return run_wrapper("project", args)
-    if command == "lineage":
-        return run_wrapper("lineage", args or ["status"])
-    if command == "plan":
-        return run_wrapper("plan", args or ["list"])
-    if command == "agent":
-        return run_wrapper("agent", args)
     if command == "auth":
         if args and args[0] == "repair":
-            return run_wrapper("auth", ["refresh", *args[1:]])
+            return run_wrapper("auth", ["repair", *args[1:]])
         if args and args[0] == "refresh":
-            print("`nap auth refresh` is deprecated; use `nap auth repair`.", file=sys.stderr)
+            raise RuntimeError("unknown auth command: refresh; use `nap auth repair`")
         return run_wrapper("auth", args)
-    if command == "feedback":
-        return run_wrapper("feedback", args)
-    if command == "where":
-        state = state_dir_status()
-        print_json(
-            {
-                "bin": shutil.which("nap") or str(BIN_DIR / "nap"),
-                "install_dir": str(INSTALL_DIR),
-                "wrapper": str(runtime_asset_path("napseer_mcp_server.py")),
-                "supervisor": str(runtime_asset_path("napseer_mcp_supervisor.py")),
-                "cwd": str(pathlib.Path.cwd()),
-                "cwd_auth_path": state["active_auth_path"],
-                "cwd_auth_configured": pathlib.Path(state["active_auth_path"]).exists(),
-                **state,
-                "path_warning": path_warning(),
-                "status": "ok",
-                "message": f"Napseer install and cwd paths resolved. {state['state_dir_message']}",
-            }
-        )
-        return 0
+    removed = {
+        "install": "use `nap mcp install`",
+        "where": "use `nap doctor` or `nap mcp status`",
+        "chat": "use the authenticated MCP chat-secret tools",
+        "plan": "use the authenticated MCP planning tools",
+        "lineage": "use the authenticated MCP lineage tools",
+        "agent": "use the authenticated MCP agent tools",
+        "feedback": "use the authenticated MCP feedback tools",
+    }
+    if command in removed:
+        raise RuntimeError(f"unknown command: {command}; {removed[command]}")
     raise RuntimeError(f"unknown command: {command}")
 
 

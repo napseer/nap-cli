@@ -80,7 +80,7 @@ def test_init_and_auth_repair_normalize_to_existing_handlers(monkeypatch):
 
     assert calls == [
         ("project", ["init", "--slug", "demo"]),
-        ("auth", ["refresh"]),
+        ("auth", ["repair"]),
     ]
 
 
@@ -121,6 +121,7 @@ def test_doctor_reports_presence_without_exposing_values(tmp_path, monkeypatch):
     (install_dir / "napseer_mcp_supervisor.py").write_text("# supervisor\n", encoding="utf-8")
     monkeypatch.setattr(module, "INSTALL_DIR", install_dir)
     monkeypatch.setattr(module, "runtime_assets_missing", lambda: [])
+    monkeypatch.setattr(module, "mcp_runtime_probe", lambda: {"status": "ok", "transport": True, "read": True, "tool_count": 56})
     monkeypatch.setattr(
         module,
         "state_dir_status",
@@ -150,6 +151,7 @@ def test_doctor_does_not_create_state_directory(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(module, "INSTALL_DIR", install_dir)
     monkeypatch.setattr(module, "runtime_assets_missing", lambda: [])
+    monkeypatch.setattr(module, "mcp_runtime_probe", lambda: {"status": "failed", "transport": False, "read": False})
 
     result = module.doctor_status()
 
@@ -229,7 +231,7 @@ def test_bundle_install_stages_validates_and_activates_atomically(tmp_path, monk
 
     result = module.install_assets()
 
-    assert result["cli_distribution"]["release_version"] == "0.2.0"
+    assert result["cli_distribution"]["release_version"] == "0.2.1"
     assert (install_dir / "current").is_symlink()
     assert (install_dir / "current" / "bundle-manifest.json").is_file()
     assert (install_dir / "current" / "napseer_mcp_server.py").is_file()

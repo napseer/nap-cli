@@ -4,6 +4,7 @@
 import importlib.util
 import pathlib
 import sys
+import tempfile
 
 
 def load_module():
@@ -30,6 +31,8 @@ def assert_raises_hashicorp_closed(fn):
 
 def run():
     mod = load_module()
+    test_state = tempfile.TemporaryDirectory()
+    mod.AUTH_PATH = pathlib.Path(test_state.name) / "auth.json"
     calls = []
 
     mod.DEFAULT_PROJECT_ID = "project-1"

@@ -5,6 +5,7 @@ import base64
 import importlib.util
 import pathlib
 import sys
+import tempfile
 
 
 PROJECT_ID = "11111111-1111-1111-1111-111111111111"
@@ -46,6 +47,8 @@ def assert_wrapped_record(mod, record, secret_kind, data_key_epoch=1):
 
 def run():
     mod = load_module()
+    test_state = tempfile.TemporaryDirectory()
+    mod.AUTH_PATH = pathlib.Path(test_state.name) / "auth.json"
     writes = []
 
     mod.AUTH = {"agent_id": "gateway-agent-1", "account_id": ACCOUNT_ID}

@@ -82,6 +82,7 @@ def run():
     })
     mod.REFRESH_TOKEN = "old-oauth-refresh"
     mod.REFRESH_EXPIRES_AT = "old-refresh-expiry"
+    mod.refresh_public_auth_state = lambda: mod.AUTH
     mod.request_form_json = lambda method, path, payload, token_required=False: {
         "access_token": "fresh-oauth-access",
         "refresh_token": "fresh-oauth-refresh",

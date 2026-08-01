@@ -4,6 +4,7 @@
 import importlib.util
 import pathlib
 import sys
+import tempfile
 
 
 PROJECT_ID = "11111111-1111-1111-1111-111111111111"
@@ -21,6 +22,8 @@ def load_module():
 
 def run():
     mod = load_module()
+    test_state = tempfile.TemporaryDirectory()
+    mod.AUTH_PATH = pathlib.Path(test_state.name) / "auth.json"
     saves = []
 
     def save_auth(updates):
@@ -37,6 +40,7 @@ def run():
     }
     mod.save_auth = save_auth
     mod.save_auth_file_credentials = save_auth
+    mod.replace_public_auth_state = lambda updates, clear_keys=(): save_auth(updates)
     mod.request_json = lambda method, path: {
         "id": PROJECT_ID,
         "slug": "existing-project",
