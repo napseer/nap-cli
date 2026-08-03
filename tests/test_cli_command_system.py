@@ -246,7 +246,7 @@ def test_bundle_install_stages_validates_and_activates_atomically(tmp_path, monk
 
     result = module.install_assets()
 
-    assert result["cli_distribution"]["release_version"] == "0.2.1"
+    assert result["cli_distribution"]["release_version"] == "0.2.2"
     assert (install_dir / "current").is_symlink()
     assert (install_dir / "current" / "bundle-manifest.json").is_file()
     assert (install_dir / "current" / "napseer_mcp_server.py").is_file()

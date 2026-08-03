@@ -7025,13 +7025,23 @@ LOCAL_PROJECT_OAUTH_SCOPE = (
     "napseer.gateway.read napseer.gateway.connect"
 )
 
+# Account login is also the first step of the new-project lifecycle. It needs
+# project creation authority plus the capabilities that will be used after the
+# newly created project is bound to this directory. Existing-project attach
+# remains narrower and receives a server-bound project token.
+OPERATOR_ACCOUNT_OAUTH_SCOPE = LOCAL_PROJECT_OAUTH_SCOPE.replace(
+    "napseer.projects.read ",
+    "napseer.projects.read napseer.projects.write ",
+    1,
+)
+
 
 def operator_account_login(args=None):
     args = args or {}
     result = oauth_loopback_authorize({
         **args,
         "flow": "operator_login",
-        "scope": args.get("scope") or "openid profile email napseer.projects.read",
+        "scope": args.get("scope") or OPERATOR_ACCOUNT_OAUTH_SCOPE,
     })
     token_expires_at = iso_timestamp_after_seconds(int(result.get("expires_in") or 0))
     replace_public_auth_state(
@@ -7054,7 +7064,10 @@ def operator_account_login(args=None):
         "base_url": result.get("api_base_url") or BASE_URL,
         "scope": result.get("scope"),
         "token_expires_at": token_expires_at,
-        "message": "Account authenticated without a project binding. Run `nap project attach` to select a project for this directory.",
+        "message": (
+            "Account authenticated without a project binding. Run `nap project attach` "
+            "for an existing project or `nap project create` for a new one."
+        ),
     }
 
 
@@ -7551,6 +7564,18 @@ def current_project_id():
 
 def create_project_with_state(args):
     ensure_enrolled(args)
+    refresh_public_auth_state()
+    if (
+        AUTH.get("account_mode") == "operator_account"
+        and AUTH.get("oauth_scope")
+        and "napseer.projects.write" not in str(AUTH.get("oauth_scope")).split()
+    ):
+        raise SafeToolError(
+            "project_create_scope_required",
+            "This account login predates project-create permission. Run `nap auth login` "
+            "again, then retry `nap project create`.",
+            status=403,
+        )
     payload = {
         "slug": args["slug"],
         "name": args["name"],
@@ -7560,21 +7585,30 @@ def create_project_with_state(args):
     try:
         project = request_json("POST", "/v1/projects", payload)
     except RuntimeError as exc:
+        if safe_error_matches(exc, status=403, service_code="insufficient_scope"):
+            raise SafeToolError(
+                "project_create_scope_required",
+                "Project creation is not authorized by this account login. Run `nap auth login` "
+                "again, then retry `nap project create`.",
+                status=403,
+                service_code="insufficient_scope",
+            ) from exc
         if "HTTP 409" not in str(exc):
             raise
         project = find_project_by_slug(args["slug"])
         if not project:
             raise
         status = "existing"
-    save_auth(
-        {
-            "base_url": BASE_URL,
-            "token": TOKEN,
-            "project_id": project["id"],
-            "project_slug": project["slug"],
-            "project_name": project["name"],
-        }
-    )
+    auth_updates = {
+        "base_url": BASE_URL,
+        "token": TOKEN,
+        "project_id": project["id"],
+        "project_slug": project["slug"],
+        "project_name": project["name"],
+    }
+    if AUTH.get("account_mode") == "operator_account":
+        auth_updates["account_mode"] = "operator_project"
+    save_auth(auth_updates)
     try:
         register_project_signing_key({"label": "local-project-key"})
     except Exception:
@@ -8119,7 +8153,8 @@ def cli_configure_status():
             "Project is configured for this directory."
             if project_configured
             else (
-                "Account authenticated; no project is attached. Run `nap project attach`."
+                "Account authenticated; no project is attached. Run `nap project attach` "
+                "for an existing project or `nap project create` for a new one."
                 if account_only
                 else "No account or project is configured for this directory."
             )
@@ -14866,7 +14901,7 @@ def cli_main(argv):
   nap auth repair
 
 `login` signs in to the account only. It does not select a project.
-Use `nap project attach` to bind this folder to an existing project.
+Use `nap project attach` for an existing project or `nap project create` for a new one.
 Refresh is automatic during authenticated calls; use `repair` only for recovery.
 `login-local` remains a hidden compatibility alias for `login`.""")
             return

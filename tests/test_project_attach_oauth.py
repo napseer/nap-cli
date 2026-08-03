@@ -80,7 +80,9 @@ def run():
     assert saves[0]["refresh_token"] == "account-refresh-token"
     assert saves[0]["account_mode"] == "operator_account"
     assert "project_id" not in saves[0]
+    assert "napseer.projects.write" in saves[0]["oauth_scope"]
     assert result["mode"] == "operator_account"
+    assert "nap project create" in result["message"]
 
     print("ok: project attach OAuth smoke passed")
 
