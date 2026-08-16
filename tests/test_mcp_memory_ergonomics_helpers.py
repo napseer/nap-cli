@@ -23,6 +23,9 @@ def load_module():
     module.AUTH_PATH = pathlib.Path(module._test_state.name) / "auth.json"
     module.AUTH = {"account_id": "acct-1", "token": "token", "token_expires_at": "later"}
     module.DEFAULT_PROJECT_ID = "project-1"
+    # Keep broad workflow coverage in this legacy suite. Dedicated profile
+    # tests exercise the production core-only default.
+    module.CONFIGURED_TOOL_PROFILES = {"all"}
     module.project_memory_encryption_active = lambda project_id: False
     return module
 
@@ -214,7 +217,7 @@ def test_node_get_accepts_node_id_without_path(mod):
         return found
 
     mod.request_json = fake_request
-    result = mod.node_get({"node_id": "node-123", "view": "render"})
+    result = mod.node_get({"node_id": "node-123", "view": "content"})
     assert result["id"] == "node-123"
     assert result["full_path"] == "/documentation/product/prd"
 
@@ -243,7 +246,7 @@ def test_node_get_edit_view_uses_id_route_not_by_path(mod):
 
 def test_node_get_rejects_path_reads(mod):
     try:
-        mod.node_get({"path": "/documentation/product/prd", "view": "render"})
+        mod.node_get({"path": "/documentation/product/prd", "view": "content"})
     except RuntimeError as exc:
         assert "path is an index/route only" in str(exc)
     else:
@@ -252,7 +255,7 @@ def test_node_get_rejects_path_reads(mod):
 
 def test_tools_include_node_by_path_descriptor(mod):
     tool_by_name = {item["name"]: item for item in mod.tools()}
-    assert len(tool_by_name) == 56
+    assert len(tool_by_name) == 51
     assert len(tool_by_name) == len(mod.tools())
 
     get_tool = next(item for item in mod.tools() if item["name"] == "nap_node_get")
@@ -274,10 +277,15 @@ def test_tools_include_node_by_path_descriptor(mod):
         "nap_patch",
         "nap_find",
         "nap_index_sync",
+        "nap_recent",
+        "nap_find_related",
+        "nap_backlinks",
+        "nap_ls_folders",
+        "nap_ls_tags",
     ]:
         assert hidden_name not in tool_by_name
 
-    for name in ["nap_discover", "nap_context", "nap_find_related", "nap_recent"]:
+    for name in ["nap_discover", "nap_context"]:
         schema = next(item for item in mod.tools() if item["name"] == name)["inputSchema"]
         view = schema["properties"].get("view")
         if view:
@@ -541,6 +549,21 @@ def test_context_and_related_use_identity_inputs(mod):
 
     def fake_request(method, path, payload=None, **kwargs):
         assert method == "GET"
+        if "/nodes/root-123/neighborhood?" in path:
+            return {
+                "nodes": [
+                    {"id": "root-123", "full_path": "/notes/root", "title": "root", "depth": 0},
+                    {"id": "linked-123", "full_path": "/notes/linked", "title": "linked", "depth": 1},
+                    {"id": "backlink-123", "full_path": "/notes/backlink", "title": "backlink", "depth": 1},
+                ],
+                "edges": [
+                    {"source": "root-123", "target": "linked-123", "relation": "references"},
+                    {"source": "backlink-123", "target": "root-123", "relation": "references"},
+                ],
+                "levels": [{"depth": 0, "node_ids": ["root-123"]}, {"depth": 1, "node_ids": ["linked-123", "backlink-123"]}],
+                "frontier": [],
+                "truncated": False,
+            }
         if path == "/v1/projects/project-1/nodes/root-123/backlinks":
             return {"items": [backlink]}
         if path == "/v1/projects/project-1/nodes/linked-123/backlinks":
@@ -550,19 +573,20 @@ def test_context_and_related_use_identity_inputs(mod):
     mod.get_node_by_id = fake_get_node_by_id
     mod.read_node_by_path = fake_read_by_path
     mod.request_json = fake_request
+    mod.node_by_path = lambda args: {"identity": {"node_id": "root-123"}}
     mod.list_project_nodes = lambda args: {"items": [root, linked]}
 
-    context = mod.get_memory_context({"node_id": "root-123", "depth": 1, "view": "paths"})
+    context = mod.get_memory_context({"node_id": "root-123", "depth": 1, "mode": "server"})
     assert [item["full_path"] for item in context["items"]] == ["/notes/root", "/notes/linked", "/notes/backlink"]
-    assert {"source": "/notes/root", "target": "/notes/linked", "relation": "references"} in context["edges"]
-    assert {"source": "/notes/backlink", "target": "/notes/root", "relation": "backlink"} in context["edges"]
+    assert {"source": "root-123", "target": "linked-123", "relation": "references"} in context["edges"]
+    assert {"source": "backlink-123", "target": "root-123", "relation": "references"} in context["edges"]
 
     related = mod.find_related_nodes({"node_id": "root-123", "view": "paths"})
     assert related["target"]["full_path"] == "/notes/root"
     assert {item["full_path"] for item in related["items"]} >= {"/notes/backlink", "/notes/linked"}
 
-    path_context = mod.get_memory_context({"path": "/notes/root", "depth": 0, "view": "paths"})
-    assert [item["full_path"] for item in path_context["items"]] == ["/notes/root"]
+    path_context = mod.get_memory_context({"path": "/notes/root", "depth": 0, "mode": "server"})
+    assert path_context["items"][0]["full_path"] == "/notes/root"
     with pytest.raises(RuntimeError, match="path is an index/route only"):
         mod.find_related_nodes({"path": "/notes/root"})
 

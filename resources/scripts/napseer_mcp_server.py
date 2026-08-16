@@ -5453,9 +5453,36 @@ def rpc_error(request_id, code, message, details=None):
     return {"jsonrpc": "2.0", "id": request_id, "error": error}
 
 
+def bounded_tool_text(value, is_error=False):
+    if is_error:
+        return json.dumps(value, indent=2)
+    if not isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
+    summary = {
+        key: value[key]
+        for key in (
+            "ok",
+            "status",
+            "changed",
+            "created",
+            "path",
+            "full_path",
+            "view",
+            "source",
+            "truncated",
+        )
+        if key in value
+    }
+    for key in ("items", "nodes", "edges", "warnings", "frontier"):
+        if isinstance(value.get(key), list):
+            summary[f"{key}_count"] = len(value[key])
+    summary["structured_result"] = True
+    return json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+
+
 def tool_result(value, is_error=False):
     return {
-        "content": [{"type": "text", "text": json.dumps(value, indent=2)}],
+        "content": [{"type": "text", "text": bounded_tool_text(value, is_error)}],
         "structuredContent": value,
         "isError": is_error,
     }
@@ -6016,6 +6043,15 @@ def release_index_file_lock(handle):
         handle.close()
 
 
+def ensure_sqlite_column(conn, table, column, declaration):
+    existing = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+
 def index_connect():
     AUTH_DIR.mkdir(exist_ok=True)
     chmod_best_effort(AUTH_DIR, 0o700)
@@ -6037,6 +6073,36 @@ def index_connect():
             indexed_at TEXT NOT NULL
         )
         """
+    )
+    ensure_sqlite_column(conn, "local_index_nodes", "title", "TEXT")
+    ensure_sqlite_column(conn, "local_index_nodes", "status", "TEXT")
+    ensure_sqlite_column(conn, "local_index_nodes", "archived", "INTEGER NOT NULL DEFAULT 0")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS local_index_edges (
+            project_id TEXT NOT NULL,
+            source_node_id TEXT NOT NULL,
+            target_ref TEXT NOT NULL,
+            target_node_id TEXT,
+            target_path TEXT,
+            relation TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            indexed_at TEXT NOT NULL,
+            PRIMARY KEY (project_id, source_node_id, target_ref, relation)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS local_index_edges_source "
+        "ON local_index_edges(project_id, source_node_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS local_index_edges_target_id "
+        "ON local_index_edges(project_id, target_node_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS local_index_edges_target_path "
+        "ON local_index_edges(project_id, target_path)"
     )
     conn.execute(
         """
@@ -6098,13 +6164,21 @@ def index_node(node):
             standard_content_for_index = (not encrypted) or backend_at_rest_decrypted
             metadata = (node.get("metadata") or {}) if standard_content_for_index and not node.get("encrypted_metadata_envelope") else {}
             content_text = (node.get("content_text") or "") if standard_content_for_index else ""
+            title = (
+                node.get("title")
+                or metadata.get("title")
+                or node.get("name")
+                or pathlib.PurePosixPath(str(node.get("full_path") or "")).name
+            )
+            status = node_status(node)
+            project_id = node.get("project_id") or DEFAULT_PROJECT_ID or ""
             conn.execute(
                 """
                 INSERT INTO local_index_nodes (
                     node_id, project_id, full_path, name, folder_path, node_type,
-                    tags_json, updated_at, indexed_at
+                    tags_json, updated_at, indexed_at, title, status, archived
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(node_id) DO UPDATE SET
                     project_id = excluded.project_id,
                     full_path = excluded.full_path,
@@ -6113,11 +6187,14 @@ def index_node(node):
                     node_type = excluded.node_type,
                     tags_json = excluded.tags_json,
                     updated_at = excluded.updated_at,
-                    indexed_at = excluded.indexed_at
+                    indexed_at = excluded.indexed_at,
+                    title = excluded.title,
+                    status = excluded.status,
+                    archived = excluded.archived
                 """,
                 (
                     node["id"],
-                    node.get("project_id") or DEFAULT_PROJECT_ID or "",
+                    project_id,
                     node.get("full_path") or "",
                     node.get("name") or "",
                     node.get("folder_path"),
@@ -6125,8 +6202,43 @@ def index_node(node):
                     compact_json_text(tags),
                     node.get("updated_at") or "",
                     iso_now(),
+                    title,
+                    status,
+                    1 if node_archived(node) else 0,
                 ),
             )
+            conn.execute(
+                "DELETE FROM local_index_edges WHERE project_id = ? AND source_node_id = ?",
+                (project_id, node["id"]),
+            )
+            for link in links:
+                if not isinstance(link, dict):
+                    continue
+                target_node_id = str(link.get("node_id") or "").strip() or None
+                target_path = str(link.get("path") or "").strip() or None
+                target_uri = str(link.get("uri") or "").strip() or None
+                target_ref = target_node_id or target_uri or target_path
+                if not target_ref:
+                    continue
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO local_index_edges (
+                        project_id, source_node_id, target_ref, target_node_id,
+                        target_path, relation, updated_at, indexed_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project_id,
+                        node["id"],
+                        target_ref,
+                        target_node_id,
+                        target_path,
+                        str(link.get("relation") or "references"),
+                        node.get("updated_at") or "",
+                        iso_now(),
+                    ),
+                )
             conn.execute("DELETE FROM local_index_fts WHERE node_id = ?", (node["id"],))
             conn.execute(
                 """
@@ -6159,6 +6271,11 @@ def remove_indexed_node(node_id):
     try:
         with index_connect() as conn:
             conn.execute("DELETE FROM local_index_fts WHERE node_id = ?", (node_id,))
+            conn.execute(
+                "DELETE FROM local_index_edges "
+                "WHERE source_node_id = ? OR target_node_id = ?",
+                (node_id, node_id),
+            )
             conn.execute("DELETE FROM local_index_nodes WHERE node_id = ?", (node_id,))
     finally:
         release_index_file_lock(lock)
@@ -8336,16 +8453,56 @@ def get_node_by_id(args):
 
 
 def node_get(args):
-    view = args.get("view", "edit")
-    if view not in {"render", "edit", "json"}:
-        raise RuntimeError("view must be render, edit, or json")
+    view = args.get("view", "content")
+    if view not in {"content", "outline", "edit"}:
+        raise RuntimeError("view must be content, outline, or edit")
+    backend_view = "edit" if view == "edit" else "render"
     if args.get("uri"):
-        return node_by_uri({"uri": args["uri"], "view": view})["node"]
-    if args.get("node_id") or args.get("id"):
-        return get_node_by_id({"node_id": args.get("node_id") or args.get("id"), "view": view})
-    if args.get("path"):
+        node = node_by_uri({"uri": args["uri"], "view": backend_view})["node"]
+    elif args.get("node_id") or args.get("id"):
+        node = get_node_by_id({"node_id": args.get("node_id") or args.get("id"), "view": backend_view})
+    elif args.get("path"):
         raise RuntimeError("path is an index/route only; resolve it with nap_node_by_path, then read with node_id or uri")
-    raise RuntimeError("one of node_id or uri is required")
+    else:
+        raise RuntimeError("one of node_id or uri is required")
+    if view == "edit":
+        return node
+    metadata = node.get("metadata") if isinstance(node.get("metadata"), dict) else {}
+    content = str(node.get("content_text") or "")
+    base = {
+        "id": node.get("id"),
+        "project_id": node.get("project_id"),
+        "canonical_uri": node_identity_payload(node).get("canonical_uri"),
+        "full_path": node.get("full_path"),
+        "name": node.get("name"),
+        "title": node.get("title") or metadata.get("title") or node.get("name"),
+        "type": node.get("type"),
+        "status": node_status(node),
+        "links": node.get("links") or [],
+        "created_at": node.get("created_at"),
+        "updated_at": node.get("updated_at"),
+        "view": view,
+    }
+    if view == "content":
+        base["content_text"] = content
+        return base
+    headings = []
+    for line_number, line in enumerate(content.splitlines(), start=1):
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if not match:
+            continue
+        title = match.group(2).strip()
+        anchor = re.sub(r"[^a-z0-9 -]", "", title.lower()).replace(" ", "-")
+        headings.append({
+            "level": len(match.group(1)),
+            "title": title,
+            "anchor": anchor,
+            "line": line_number,
+        })
+    base["abstract"] = preview_text(content, 320)
+    base["headings"] = headings
+    base["content_lines"] = len(content.splitlines())
+    return base
 
 
 def node_by_id(args):
@@ -10528,12 +10685,51 @@ def discover_memory(args):
     else:
         result = list_project_nodes({**args, "view": args.get("view") or "summary"})
         result["tool_intent"] = "list"
+    sort = str(args.get("sort") or ("relevance" if q else "updated_desc")).strip().lower()
+    if sort not in {"relevance", "updated_desc", "updated_asc", "title_asc"}:
+        raise RuntimeError("sort must be relevance, updated_desc, updated_asc, or title_asc")
+    items = list(result.get("items") or [])
+    if sort == "updated_desc":
+        items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+    elif sort == "updated_asc":
+        items.sort(key=lambda item: str(item.get("updated_at") or ""))
+    elif sort == "title_asc":
+        items.sort(key=lambda item: str(item.get("title") or item.get("name") or "").casefold())
+    result["items"] = items
+    requested_facets = unique_preserve_order(
+        str(value).strip().lower() for value in (args.get("facets") or []) if str(value).strip()
+    )
+    invalid_facets = sorted(set(requested_facets) - {"folder", "tag", "type", "status"})
+    if invalid_facets:
+        raise RuntimeError("facets must contain only folder, tag, type, or status")
+    if requested_facets:
+        counts = {}
+        for facet in requested_facets:
+            values = {}
+            for item in items:
+                if facet == "folder":
+                    item_values = [item.get("folder_path")]
+                elif facet == "tag":
+                    item_values = item.get("tags") or []
+                elif facet == "type":
+                    item_values = [item.get("type")]
+                else:
+                    item_values = [item.get("status") or node_status(item)]
+                for value in item_values:
+                    if value not in (None, ""):
+                        values[str(value)] = values.get(str(value), 0) + 1
+            counts[facet] = [
+                {"value": value, "count": count}
+                for value, count in sorted(values.items(), key=lambda pair: (-pair[1], pair[0]))
+            ]
+        result["facets"] = {"scope": "returned_items", "counts": counts}
+    result["sort"] = sort
     result["range"] = {
         "updated_after": args.get("updated_after"),
         "updated_before": args.get("updated_before"),
     }
     result["awareness"] = {
-        "default_sort": "search_relevance_then_updated_desc" if q else "updated_desc",
+        "default_sort": "relevance" if q else "updated_desc",
         "date_fields_in_rows": ["date", "created_at", "updated_at"],
         "next_step": "Use nap_node_by_path on important paths, then read by identity with nap_node_get when the preview is not enough.",
     }
@@ -10550,8 +10746,8 @@ def classify_memory_query(args):
         primary_tool = "nap_context"
         reason = "query contains explicit node path(s)"
     elif recent_intent and not raw.strip('"'):
-        primary_tool = "nap_recent"
-        reason = "query asks for recent or latest memory"
+        primary_tool = "nap_discover"
+        reason = "query asks for recent memory; use sort=updated_desc"
     elif analysis.get("terms") or analysis.get("phrases"):
         primary_tool = "nap_discover"
         reason = "query has searchable keywords and may need filters or ranges"
@@ -10574,68 +10770,227 @@ def classify_memory_query(args):
         "suggested_calls": [
             {"tool": "nap_context", "when": "You already know one or more canonical paths and need surrounding links/backlinks."},
             {"tool": "nap_discover", "when": "You need search plus folder/tag/type/status/date filters in one call."},
-            {"tool": "nap_recent", "when": "You need latest project changes by time window."},
+            {"tool": "nap_discover", "when": "You need latest project changes; omit q and use sort=updated_desc."},
             {"tool": "nap_node_by_path", "when": "You selected a path and need to resolve it to node_id / nap:// URI before reading."},
             {"tool": "nap_node_get", "when": "You have node_id or nap:// URI and need the full body."},
         ],
     }
 
 
-def get_memory_context(args):
-    raw_node_ids = args.get("node_ids") or ([args["node_id"]] if args.get("node_id") else [])
-    raw_uris = args.get("uris") or ([args["uri"]] if args.get("uri") else [])
-    raw_paths = args.get("paths") or ([args["path"]] if args.get("path") else [])
-    if not raw_node_ids and not raw_uris and not raw_paths:
+def context_seed_ids(args):
+    node_ids = [str(value).strip() for value in (args.get("node_ids") or []) if str(value).strip()]
+    if args.get("node_id"):
+        node_ids.append(str(args["node_id"]).strip())
+    uris = list(args.get("uris") or [])
+    if args.get("uri"):
+        uris.append(args["uri"])
+    for uri in uris:
+        node_ids.append(parse_nap_node_uri(str(uri))["node_id"])
+    paths = list(args.get("paths") or [])
+    if args.get("path"):
+        paths.append(args["path"])
+    for path in paths:
+        resolved = node_by_path({"path": normalize_node_path(path)})
+        node_id = (resolved.get("identity") or {}).get("node_id")
+        if node_id:
+            node_ids.append(node_id)
+    node_ids = unique_preserve_order(node_ids)
+    if not node_ids:
         raise RuntimeError("path, paths, node_id, node_ids, uri, or uris is required")
-    max_nodes = max(1, min(int(args.get("max_nodes", 20)), 100))
-    depth = max(0, min(int(args.get("depth", 1)), 2))
-    default_view = "summary"
-    view, _warnings = normalize_discovery_view(args, default=default_view)
-    queue = []
-    for node_id in raw_node_ids:
-        queue.append(("node", get_node_by_id({"node_id": node_id})))
-    for uri in raw_uris:
-        queue.append(("node", node_by_uri({"uri": uri})["node"]))
-    for path in raw_paths:
-        queue.append(("path", normalize_node_path(path)))
-    nodes = []
-    edges = []
-    seen_paths = set()
-    current_depth = 0
-    while queue and len(nodes) < max_nodes and current_depth <= depth:
-        next_queue = []
-        for kind, value in queue:
-            if len(nodes) >= max_nodes:
-                continue
-            try:
-                node = value if kind == "node" else read_node_by_path({"path": value}, allow_agent=is_agent_namespace_path(value))
-            except Exception:
-                continue
-            path = node.get("full_path")
-            if not path or path in seen_paths:
-                continue
-            seen_paths.add(path)
-            nodes.append(summarize_node(node, view=view, preview_chars=normalize_int(args.get("preview_chars"), 240, 80, 1000)))
-            links = node.get("links") if isinstance(node.get("links"), list) else []
-            for link in links:
-                target_path = link.get("path") if isinstance(link, dict) else None
-                if target_path:
-                    edges.append({"source": node["full_path"], "target": target_path, "relation": link.get("relation", "references")})
-                    if current_depth < depth:
-                        next_queue.append(("path", target_path))
-            if current_depth < depth:
-                try:
-                    backlinks = get_backlinks_by_path({"node_id": node["id"]}).get("items", [])
-                    for backlink in backlinks:
-                        source_path = backlink.get("full_path")
-                        if source_path:
-                            edges.append({"source": source_path, "target": node["full_path"], "relation": "backlink"})
-                            next_queue.append(("path", source_path))
-                except Exception:
-                    pass
-        queue = next_queue
-        current_depth += 1
-    return {"items": unique_nodes(nodes), "edges": edges[: max_nodes * 4], "view": view}
+    return node_ids
+
+
+def local_context_node(row):
+    return {
+        "id": row["node_id"],
+        "full_path": row["full_path"],
+        "name": row["name"],
+        "title": row["title"] or row["name"],
+        "type": row["node_type"],
+        "status": row["status"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def local_memory_context(args, seed_ids):
+    if not INDEX_PATH.exists():
+        raise RuntimeError("local memory index is not available; run nap reindex or use mode='server'")
+    project_id = resolve_project_id(args)
+    depth = max(0, min(int(args.get("depth", 1)), 3))
+    max_nodes = max(1, min(int(args.get("max_nodes", 40)), 100))
+    max_edges = max(1, min(int(args.get("max_edges", 80)), 400))
+    max_per_level = max(1, min(int(args.get("max_per_level", 20)), 50))
+    direction = str(args.get("direction") or "both").strip().lower()
+    relations = {str(value) for value in (args.get("relations") or []) if str(value)}
+    if direction not in {"outgoing", "incoming", "both"}:
+        raise RuntimeError("direction must be outgoing, incoming, or both")
+    with index_connect() as conn:
+        def node_row(node_id=None, path=None):
+            if node_id:
+                return conn.execute(
+                    "SELECT * FROM local_index_nodes WHERE project_id = ? AND node_id = ? AND archived = 0",
+                    (project_id, node_id),
+                ).fetchone()
+            return conn.execute(
+                "SELECT * FROM local_index_nodes WHERE project_id = ? AND full_path = ? AND archived = 0",
+                (project_id, path),
+            ).fetchone()
+
+        seed_rows = [node_row(node_id=node_id) for node_id in seed_ids]
+        seed_rows = [row for row in seed_rows if row is not None]
+        if not seed_rows:
+            raise RuntimeError("seed node is not present in the local memory index")
+        nodes = {}
+        edges = []
+        edge_keys = set()
+        seen = set()
+        frontier = []
+        truncation_reasons = []
+        levels = []
+        queue = [row["node_id"] for row in seed_rows]
+        indexed_at = ""
+        for current_depth in range(depth + 1):
+            level_ids = []
+            next_ids = []
+            for current_id in queue[:max_per_level]:
+                if current_id in seen or len(nodes) >= max_nodes:
+                    continue
+                current = node_row(node_id=current_id)
+                if current is None:
+                    continue
+                seen.add(current_id)
+                compact = local_context_node(current)
+                compact["depth"] = current_depth
+                nodes[current_id] = compact
+                level_ids.append(current_id)
+                indexed_at = max(indexed_at, str(current["indexed_at"] or ""))
+                candidates = []
+                if direction in {"outgoing", "both"}:
+                    candidates.extend(conn.execute(
+                        "SELECT * FROM local_index_edges WHERE project_id = ? AND source_node_id = ? ORDER BY relation, target_ref",
+                        (project_id, current_id),
+                    ).fetchall())
+                if direction in {"incoming", "both"}:
+                    candidates.extend(conn.execute(
+                        "SELECT * FROM local_index_edges WHERE project_id = ? AND (target_node_id = ? OR target_path = ?) ORDER BY relation, source_node_id",
+                        (project_id, current_id, current["full_path"]),
+                    ).fetchall())
+                for edge in candidates:
+                    if relations and edge["relation"] not in relations:
+                        continue
+                    target = node_row(node_id=edge["target_node_id"]) if edge["target_node_id"] else node_row(path=edge["target_path"])
+                    if target is None:
+                        continue
+                    source_id = edge["source_node_id"]
+                    target_id = target["node_id"]
+                    neighbor_id = target_id if source_id == current_id else source_id
+                    known_neighbor = neighbor_id in seen or neighbor_id in next_ids
+                    if current_depth >= depth and not known_neighbor:
+                        continue
+                    if not known_neighbor:
+                        if len(nodes) + len(next_ids) >= max_nodes:
+                            frontier.append(neighbor_id)
+                            if "max_nodes" not in truncation_reasons:
+                                truncation_reasons.append("max_nodes")
+                            continue
+                        if len(next_ids) >= max_per_level:
+                            frontier.append(neighbor_id)
+                            if "max_per_level" not in truncation_reasons:
+                                truncation_reasons.append("max_per_level")
+                            continue
+                    edge_key = (source_id, target_id, edge["relation"])
+                    if edge_key not in edge_keys:
+                        if len(edges) >= max_edges:
+                            frontier.append(neighbor_id)
+                            if "max_edges" not in truncation_reasons:
+                                truncation_reasons.append("max_edges")
+                            continue
+                        edge_keys.add(edge_key)
+                        edges.append({"source": source_id, "target": target_id, "relation": edge["relation"]})
+                    if not known_neighbor:
+                        next_ids.append(neighbor_id)
+            levels.append({"depth": current_depth, "node_ids": level_ids})
+            queue = unique_preserve_order(next_ids)
+            if not queue:
+                break
+        return {
+            "ok": True,
+            "seed_node_ids": [row["node_id"] for row in seed_rows],
+            "nodes": list(nodes.values()),
+            "items": list(nodes.values()),
+            "edges": edges,
+            "levels": levels,
+            "frontier": unique_preserve_order(frontier),
+            "truncated": bool(truncation_reasons),
+            "truncation_reasons": truncation_reasons,
+            "source": "local_index",
+            "freshness": {"indexed_at": indexed_at},
+            "warnings": [],
+            "view": "titles",
+        }
+
+
+def server_memory_context(args, seed_ids):
+    project_id = resolve_project_id(args)
+    results = []
+    for node_id in seed_ids:
+        query = {
+            "depth": max(0, min(int(args.get("depth", 1)), 3)),
+            "direction": str(args.get("direction") or "both"),
+            "max_nodes": max(1, min(int(args.get("max_nodes", 40)), 100)),
+            "max_edges": max(1, min(int(args.get("max_edges", 80)), 400)),
+            "max_per_level": max(1, min(int(args.get("max_per_level", 20)), 50)),
+        }
+        if args.get("relations"):
+            query["relations"] = ",".join(str(value) for value in args["relations"])
+        results.append(request_json(
+            "GET",
+            f"/v1/projects/{project_id}/nodes/{urllib.parse.quote(node_id, safe='')}/neighborhood?{rest_query_string(query)}",
+        ))
+    if len(results) == 1:
+        result = dict(results[0])
+        result.setdefault("items", result.get("nodes") or [])
+        result.setdefault("source", "server")
+        result.setdefault("view", "titles")
+        return result
+    nodes = unique_nodes([node for result in results for node in result.get("nodes") or []])
+    edges = unique_preserve_order(
+        compact_json_text(edge) for result in results for edge in result.get("edges") or []
+    )
+    return {
+        "ok": True,
+        "seed_node_ids": seed_ids,
+        "nodes": nodes,
+        "items": nodes,
+        "edges": [json.loads(edge) for edge in edges],
+        "levels": [result.get("levels") or [] for result in results],
+        "frontier": unique_preserve_order(value for result in results for value in result.get("frontier") or []),
+        "truncated": any(result.get("truncated") for result in results),
+        "truncation_reasons": unique_preserve_order(value for result in results for value in result.get("truncation_reasons") or []),
+        "source": "server",
+        "warnings": unique_preserve_order(value for result in results for value in result.get("warnings") or []),
+        "view": "titles",
+    }
+
+
+def get_memory_context(args):
+    seed_ids = context_seed_ids(args)
+    mode = str(args.get("mode") or "hybrid").strip().lower()
+    if mode not in {"hybrid", "local", "server"}:
+        raise RuntimeError("mode must be hybrid, local, or server")
+    if mode in {"local", "hybrid"}:
+        try:
+            return local_memory_context(args, seed_ids)
+        except Exception as exc:
+            if mode == "local":
+                raise
+            result = server_memory_context(args, seed_ids)
+            result.setdefault("warnings", []).append(
+                "Local index was unavailable or incomplete; server neighborhood was used."
+            )
+            result["local_fallback"] = safe_exception_payload(exc)
+            return result
+    return server_memory_context(args, seed_ids)
 
 
 def find_related_nodes(args):
@@ -13581,14 +13936,9 @@ CANONICAL_TOOL_NAMES = {
     "nap_update_status",
     # Project memory.
     "nap_discover",
-    "nap_recent",
     "nap_context",
-    "nap_find_related",
     "nap_node_by_path",
     "nap_node_get",
-    "nap_backlinks",
-    "nap_ls_folders",
-    "nap_ls_tags",
     "nap_create_node",
     "nap_node_patch",
     "nap_bulk",
@@ -13639,6 +13989,7 @@ CANONICAL_TOOL_NAMES = {
 COMPATIBILITY_TOOL_ALIASES = {}
 
 HIDDEN_COMPATIBILITY_TOOL_NAMES = {
+    "nap_backlinks",
     "nap_bulk_read",
     "nap_chat_secret_rotate",
     "nap_chat_secret_setup",
@@ -13650,6 +14001,7 @@ HIDDEN_COMPATIBILITY_TOOL_NAMES = {
     "nap_feedback_ls",
     "nap_feedback_resolve",
     "nap_find",
+    "nap_find_related",
     "nap_finish_work",
     "nap_gateway_configure",
     "nap_gateway_kill",
@@ -13673,6 +14025,8 @@ HIDDEN_COMPATIBILITY_TOOL_NAMES = {
     "nap_lock_release",
     "nap_lock_renew",
     "nap_ls",
+    "nap_ls_folders",
+    "nap_ls_tags",
     "nap_next_work",
     "nap_node_by_id",
     "nap_node_by_uri",
@@ -13682,6 +14036,7 @@ HIDDEN_COMPATIBILITY_TOOL_NAMES = {
     "nap_plan_supersede",
     "nap_project_create",
     "nap_reindex_project",
+    "nap_recent",
     "nap_stat",
     "nap_tee",
     "nap_tree",
@@ -13720,19 +14075,14 @@ SIMPLIFIED_TOOL_PROPERTIES = {
         "include_archived",
         "limit",
         "view",
+        "sort",
+        "facets",
     },
-    "nap_recent": {
-        "folder_path",
-        "tag",
-        "cursor",
-        "updated_after",
-        "updated_before",
-        "status",
-        "limit",
-        "view",
+    "nap_context": {
+        "node_id", "node_ids", "uri", "uris", "path", "paths", "depth",
+        "max_nodes", "max_edges", "max_per_level", "direction", "relations",
+        "mode", "view",
     },
-    "nap_context": {"node_id", "node_ids", "uri", "uris", "depth", "max_nodes", "view"},
-    "nap_find_related": {"node_id", "uri", "limit", "view"},
     "nap_kanban_list": {
         "q",
         "column",
@@ -13807,14 +14157,9 @@ TOOL_CATEGORIES.update(
         "project": ["nap_whoami", "nap_auth_refresh"],
         "memory": [
             "nap_discover",
-            "nap_recent",
             "nap_context",
-            "nap_find_related",
             "nap_node_by_path",
             "nap_node_get",
-            "nap_backlinks",
-            "nap_ls_folders",
-            "nap_ls_tags",
             "nap_create_node",
             "nap_node_patch",
             "nap_bulk",
@@ -13870,6 +14215,87 @@ TOOL_CATEGORIES.update(
         ],
     }
 )
+
+CORE_TOOL_NAMES = {
+    "nap_apropos",
+    "nap_man",
+    "nap_doctor",
+    "nap_whoami",
+    "nap_discover",
+    "nap_context",
+    "nap_node_by_path",
+    "nap_node_get",
+    "nap_create_node",
+    "nap_node_patch",
+    "nap_bulk",
+    "nap_ln",
+    "nap_mv",
+    "nap_rm",
+}
+
+TOOL_PROFILES = {
+    "workflow": set(TOOL_CATEGORIES["planning"]) | set(TOOL_CATEGORIES["kanban"]),
+    "libraries": set(TOOL_CATEGORIES["libraries"]),
+    "agents": set(TOOL_CATEGORIES["agents"]),
+    "operations": set(TOOL_CATEGORIES["gateway"]) | set(TOOL_CATEGORIES["schedules"]),
+    "maintenance": {
+        "nap_contract",
+        "nap_update_status",
+        "nap_auth_refresh",
+        "nap_mv_folder",
+        "nap_node_restore",
+        *TOOL_CATEGORIES["maintenance"],
+    },
+}
+
+REMOVED_TOOL_REPLACEMENTS = {
+    "nap_recent": "Use nap_discover without q and sort='updated_desc'.",
+    "nap_find_related": "Use nap_context with direction='both' and depth=1.",
+    "nap_backlinks": "Use nap_context with direction='incoming' and depth=1.",
+    "nap_ls_folders": "Use nap_discover with facets=['folder'].",
+    "nap_ls_tags": "Use nap_discover with facets=['tag'].",
+}
+
+# Tests and embedded clients may override this after import. None means read
+# the environment on every request so a restarted MCP server picks up config.
+CONFIGURED_TOOL_PROFILES = None
+
+
+def configured_tool_profiles():
+    configured = CONFIGURED_TOOL_PROFILES
+    if configured is None:
+        configured = {
+            value.strip().lower()
+            for value in str(os.environ.get("NAPSEER_TOOL_PROFILES") or "").split(",")
+            if value.strip()
+        }
+    unknown = set(configured) - ({"all"} | set(TOOL_PROFILES))
+    if unknown:
+        raise SafeToolError(
+            "invalid_tool_profile",
+            "Unknown NAPSEER_TOOL_PROFILES value. Supported profiles: "
+            + ", ".join(sorted(TOOL_PROFILES)),
+        )
+    return set(configured)
+
+
+def tool_profile(name):
+    if name in CORE_TOOL_NAMES:
+        return "core"
+    for profile, names in TOOL_PROFILES.items():
+        if name in names:
+            return profile
+    return None
+
+
+def enabled_tool_names():
+    profiles = configured_tool_profiles()
+    if "all" in profiles:
+        return set(CANONICAL_TOOL_NAMES)
+    enabled = set(CORE_TOOL_NAMES)
+    for profile in profiles:
+        enabled.update(TOOL_PROFILES[profile])
+    return enabled
 PUBLIC_TOOLS.add("nap_auth_refresh")
 READ_ONLY_TOOLS.add("nap_gateway_vault_ls")
 AUTO_LOCK_TOOLS.update({"nap_crontab_put", "nap_plan_transition", "nap_node_restore"})
@@ -14047,6 +14473,15 @@ def contract_profile(args=None):
             "names and explicit aliases only."
         ),
     }
+    profile["tool_profiles"] = {
+        "default": "core",
+        "active": sorted(configured_tool_profiles()),
+        "configuration": "NAPSEER_TOOL_PROFILES",
+        "available": {
+            name: sorted(tool_names) for name, tool_names in TOOL_PROFILES.items()
+        },
+        "core": sorted(CORE_TOOL_NAMES),
+    }
     return profile
 
 
@@ -14071,6 +14506,56 @@ def _simplify_schema(name, schema):
         ]
         simplified["properties"]["view"] = view_schema
     return simplified
+
+
+def _efficient_memory_schema(name, schema):
+    result = dict(schema)
+    properties = dict(result.get("properties") or {})
+    if name == "nap_discover":
+        properties["sort"] = {
+            "type": "string",
+            "enum": ["relevance", "updated_desc", "updated_asc", "title_asc"],
+            "default": "updated_desc",
+        }
+        properties["facets"] = {
+            "type": "array",
+            "items": {"type": "string", "enum": ["folder", "tag", "type", "status"]},
+            "uniqueItems": True,
+            "maxItems": 4,
+        }
+    elif name == "nap_context":
+        properties.update({
+            "depth": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1},
+            "direction": {
+                "type": "string",
+                "enum": ["outgoing", "incoming", "both"],
+                "default": "both",
+            },
+            "relations": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
+            "max_edges": {"type": "integer", "minimum": 1, "maximum": 400, "default": 80},
+            "max_per_level": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+            "mode": {
+                "type": "string",
+                "enum": ["hybrid", "local", "server"],
+                "default": "hybrid",
+            },
+        })
+        properties.pop("include_content", None)
+        properties.pop("preview_chars", None)
+        if "view" in properties:
+            properties["view"] = {
+                "type": "string",
+                "enum": ["titles", "paths", "summary", "metadata"],
+                "default": "titles",
+            }
+    elif name == "nap_node_get":
+        properties["view"] = {
+            "type": "string",
+            "enum": ["content", "outline", "edit"],
+            "default": "content",
+        }
+    result["properties"] = properties
+    return result
 
 
 def _schedule_schema():
@@ -14389,7 +14874,7 @@ def tool_annotations(name):
     }
 
 
-def tools():
+def all_tools():
     items = []
     raw_items = raw_tools()
     _validate_raw_tool_inventory(raw_items)
@@ -14400,13 +14885,13 @@ def tools():
             continue
         item = dict(tool)
         item["name"] = canonical_name
-        item["inputSchema"] = (
+        item["inputSchema"] = _efficient_memory_schema(canonical_name, (
             _schedule_schema()
             if canonical_name == "nap_crontab_put"
             else _simplify_schema(
                 canonical_name, dict(item.get("inputSchema") or {})
             )
-        )
+        ))
         item["inputSchema"] = _require_canonical_identity(
             canonical_name, item["inputSchema"]
         )
@@ -14419,6 +14904,24 @@ def tools():
                 "Explicit authentication recovery. Normal authenticated calls refresh "
                 "tokens automatically. Use `nap auth login` for account login and "
                 "`nap project attach` to bind this folder to a project."
+            )
+        if canonical_name == "nap_context":
+            item["description"] = (
+                "Read a bounded title-only neighborhood around one or more nodes. "
+                "Supports depth 0-3, incoming/outgoing/both traversal, relation filters, "
+                "explicit budgets, and local-index/server fallback without fetching bodies."
+            )
+        if canonical_name == "nap_discover":
+            item["description"] = (
+                "Discover compact project memory with keywords, structured filters, "
+                "deterministic sorting, and returned-item facets. Omit q with "
+                "sort='updated_desc' for recent memory."
+            )
+        if canonical_name == "nap_node_get":
+            item["description"] = (
+                "Read one node by canonical node_id or nap:// URI. Use content for a lean "
+                "reading view, outline for headings without the body, or edit to obtain "
+                "revision and read_fingerprint before nap_node_patch."
             )
         category = tool_category(canonical_name)
         if not item.get("description", "").startswith("["):
@@ -14438,6 +14941,11 @@ def tools():
     return items
 
 
+def tools():
+    enabled = enabled_tool_names()
+    return [tool for tool in all_tools() if tool["name"] in enabled]
+
+
 def explore_tools(args):
     category = str(args.get("category") or "").strip().lower()
     query = str(args.get("q") or "").strip().lower()
@@ -14446,7 +14954,8 @@ def explore_tools(args):
     limit = max(1, min(int(args.get("limit", 50)), 200))
     grouped = {key: [] for key in TOOL_CATEGORIES}
     grouped["other"] = []
-    tool_by_name = {tool["name"]: tool for tool in tools()}
+    active_names = enabled_tool_names()
+    tool_by_name = {tool["name"]: tool for tool in all_tools()}
     ordered_names = []
     for names in TOOL_CATEGORIES.values():
         ordered_names.extend(names)
@@ -14462,6 +14971,8 @@ def explore_tools(args):
         if query_terms and not all(term in haystack for term in query_terms):
             continue
         card = tool_card(tool, include_schemas)
+        card["enabled"] = name in active_names
+        card["profile"] = tool_profile(name)
         grouped.setdefault(tool_category_name, []).append(card)
     grouped = {key: value[:limit] for key, value in grouped.items() if value}
     return {
@@ -14469,6 +14980,8 @@ def explore_tools(args):
         "categories": list(TOOL_CATEGORIES.keys()),
         "tools_are_flat_in_mcp": True,
         "include_schemas": include_schemas,
+        "active_profiles": sorted(configured_tool_profiles()),
+        "default_profile": "core",
         "metadata_fields": contract_profile({"include_tools": False})["metadata_fields"],
         "groups": grouped,
     }
@@ -14476,9 +14989,18 @@ def explore_tools(args):
 
 def man_tool(args):
     name = str(args.get("tool") or args.get("name") or "").strip()
-    for tool in tools():
+    for tool in all_tools():
         if tool["name"] == name:
-            return tool_card(tool, include_schema=True)
+            card = tool_card(tool, include_schema=True)
+            card["enabled"] = name in enabled_tool_names()
+            card["profile"] = tool_profile(name)
+            return card
+    if name in REMOVED_TOOL_REPLACEMENTS:
+        return {
+            "name": name,
+            "removed": True,
+            "replacement": REMOVED_TOOL_REPLACEMENTS[name],
+        }
     raise RuntimeError(f"unknown tool: {name}")
 
 
@@ -14537,10 +15059,24 @@ def doctor(args):
 
 def call_tool_impl(name, args):
     args = args or {}
+    if name in REMOVED_TOOL_REPLACEMENTS:
+        raise SafeToolError(
+            "tool_removed",
+            f"{name} was removed from the efficient surface. "
+            f"{REMOVED_TOOL_REPLACEMENTS[name]}",
+        )
     if name not in CANONICAL_TOOL_NAMES and name not in COMPATIBILITY_TOOL_ALIASES:
         raise SafeToolError(
             "unknown_tool",
             "Unknown or unavailable MCP tool. Use `nap_apropos` to discover the canonical surface.",
+        )
+    canonical_name = COMPATIBILITY_TOOL_ALIASES.get(name, name)
+    if canonical_name not in enabled_tool_names():
+        profile = tool_profile(canonical_name)
+        raise SafeToolError(
+            "tool_profile_required",
+            f"{canonical_name} requires the '{profile}' tool profile. Set "
+            f"NAPSEER_TOOL_PROFILES={profile} (or include it in the comma-separated list) and restart the MCP server.",
         )
     if name not in PUBLIC_TOOLS and name in PROTECTED_TOOLS:
         require_unlocked(name)
