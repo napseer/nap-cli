@@ -14048,7 +14048,6 @@ SYNTHETIC_TOOL_NAMES = {"nap_plan_transition", "nap_node_restore"}
 
 IDENTITY_REQUIRED_TOOLS = {
     "nap_node_get": ("node_id", "uri"),
-    "nap_backlinks": ("node_id", "uri"),
     "nap_node_patch": ("node_id", "uri"),
     "nap_mv": ("node_id", "uri"),
     "nap_rm": ("node_id", "uri"),
