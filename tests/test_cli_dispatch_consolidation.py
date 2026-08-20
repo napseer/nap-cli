@@ -36,6 +36,18 @@ def expect_unknown(mod, argv, expected_fragment):
         raise AssertionError(f"expected RuntimeError for {argv}")
 
 
+def test_auth_login_rejects_history_expansion_tail_before_browser():
+    mod = load_module()
+    mod.operator_account_login = lambda _args: (_ for _ in ()).throw(
+        AssertionError("malformed auth login must fail before browser login")
+    )
+    expect_unknown(
+        mod,
+        ["napseer_mcp_server.py", "auth", "login", "project", "attach", "update"],
+        "Bash expands `!nap`",
+    )
+
+
 def test_chat_secret_aliases_rejected():
     mod = load_module()
     for args in [
@@ -214,6 +226,7 @@ def test_project_encryption_status_aliases_are_read_only_compatibility():
 
 
 if __name__ == "__main__":
+    test_auth_login_rejects_history_expansion_tail_before_browser()
     test_chat_secret_aliases_rejected()
     test_lineage_aliases_rejected()
     test_plan_aliases_rejected()

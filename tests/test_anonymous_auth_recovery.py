@@ -69,6 +69,7 @@ def test_failed_anonymous_refresh_uses_ssh_recovery():
     mod.DEFAULT_PROJECT_ID = "project"
     mod.REFRESH_TOKEN = "stale-refresh"
     mod.REFRESH_EXPIRES_AT = None
+    mod.refresh_public_auth_state = lambda: mod.AUTH
     mod.auth_public_key = lambda: "ssh-ed25519 test-public-key"
     mod.sign_with_auth_key = lambda *args: "test-signature"
     saved = []
@@ -106,7 +107,65 @@ def test_failed_anonymous_refresh_uses_ssh_recovery():
     assert saved[0]["refresh_token"] == "recovered-refresh"
 
 
+def test_failed_mixed_state_refresh_uses_ssh_recovery():
+    mod = load_module()
+    mod.AUTH = {
+        **anonymous_auth(mod),
+        "account_mode": "operator_project",
+        "oauth_client_id": "nap-cli",
+        "project_id": "project",
+        "ssh_private_key": "test-private-key",
+        "ssh_public_key": "ssh-ed25519 test-public-key",
+    }
+    mod.BASE_URL = mod.AUTH["base_url"]
+    mod.DEFAULT_PROJECT_ID = "project"
+    mod.REFRESH_TOKEN = "stale-refresh"
+    mod.REFRESH_EXPIRES_AT = None
+    mod.refresh_public_auth_state = lambda: mod.AUTH
+    mod.auth_public_key = lambda: "ssh-ed25519 test-public-key"
+    mod.sign_with_auth_key = lambda *args: "test-signature"
+    saved = []
+    mod.save_auth = lambda payload: saved.append(dict(payload))
+
+    def request_form(method, path, payload=None, token_required=False):
+        assert (method, path, token_required) == ("POST", "/v1/oauth/token", False)
+        raise RuntimeError("HTTP 401")
+
+    def request(method, path, payload=None, token_required=False):
+        if path == "/v1/enrollment/refresh":
+            raise RuntimeError("HTTP 401")
+        if path == "/v1/enrollment/challenges":
+            return {"challenge_id": "challenge", "challenge_text": "sign-me"}
+        if path == "/v1/enrollment/verify":
+            return {
+                "token": {
+                    "access_token": "recovered-access",
+                    "refresh_token": "recovered-refresh",
+                    "expires_at": "2099-01-01T00:00:00Z",
+                    "refresh_expires_at": "2099-12-31T00:00:00Z",
+                },
+                "worker": {
+                    "id": "worker",
+                    "agent_id": "agent-id",
+                    "name": "agent",
+                    "device_fingerprint": "device",
+                    "root_path": "/repo",
+                    "project_id": "project",
+                },
+            }
+        raise AssertionError(path)
+
+    mod.request_form_json = request_form
+    mod.request_json = request
+    result = mod.renew_auth()
+
+    assert result["method"] == "anonymous_ssh_recovery"
+    assert result["project_id"] == "project"
+    assert saved[0]["refresh_token"] == "recovered-refresh"
+
+
 if __name__ == "__main__":
     test_initial_enrollment_persists_refresh_credential()
     test_failed_anonymous_refresh_uses_ssh_recovery()
+    test_failed_mixed_state_refresh_uses_ssh_recovery()
     print("ok: anonymous auth recovery tests passed")

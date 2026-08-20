@@ -55,13 +55,44 @@ def run():
 
     current = {}
     mod.DEFAULT_PROJECT_ID = "stale-project"
+    bootstrap_calls = []
+
+    def bootstrap_project(args):
+        bootstrap_calls.append(dict(args))
+        mod.DEFAULT_PROJECT_ID = "anonymous-project"
+        return {"status": "created", "project_id": "anonymous-project"}
+
+    mod.bootstrap_project = bootstrap_project
+    assert mod.resolve_project_id({}) == "anonymous-project"
+    assert bootstrap_calls == [
+        {
+            "slug": mod.default_project_slug(),
+            "name": mod.default_project_name(mod.default_project_slug()),
+            "description": "Created automatically by the local Napseer MCP runtime.",
+            "encryption": "standard",
+        }
+    ]
+
+    current = {}
+    mod.DEFAULT_PROJECT_ID = None
+
+    def limited_project(_args):
+        raise mod.SafeToolError(
+            "anonymous_space_limit_reached",
+            "Anonymous space limit reached. Run `nap project claim` to authenticate and continue.",
+            status=403,
+            service_code="anonymous_space_limit_reached",
+        )
+
+    mod.bootstrap_project = limited_project
     try:
         mod.resolve_project_id({})
     except mod.SafeToolError as exc:
-        assert exc.code == "project_not_configured"
-        assert "nap project attach" in exc.safe_message
+        assert exc.code == "anonymous_space_limit_reached"
+        assert exc.service_code == "anonymous_space_limit_reached"
+        assert "nap project claim" in exc.safe_message
     else:
-        raise AssertionError("missing project selection must return an actionable safe error")
+        raise AssertionError("anonymous space limit must remain actionable")
 
     def open_success(request, timeout=None):
         requests.append(request)

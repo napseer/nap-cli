@@ -2,6 +2,7 @@
 """Regression tests for account-login -> project-create authorization."""
 
 import importlib.util
+import json
 import pathlib
 import sys
 
@@ -125,9 +126,40 @@ def test_server_scope_denial_is_actionable():
         raise AssertionError("scope denial should return an actionable error")
 
 
+def test_anonymous_limits_are_actionable_without_exposing_response_details():
+    mod = load_module()
+
+    class HttpError:
+        code = 403
+
+    for code, label in (
+        ("anonymous_space_limit_reached", "space"),
+        ("anonymous_node_limit_reached", "node"),
+    ):
+        error = mod.safe_http_error(
+            HttpError(),
+            operation="POST request",
+            body_text=json.dumps(
+                {
+                    "error": {
+                        "code": code,
+                        "message": "server detail must not be forwarded",
+                    }
+                }
+            ),
+        )
+        assert error.code == code
+        assert error.status == 403
+        assert error.service_code == code
+        assert label in error.safe_message
+        assert "nap project claim" in error.safe_message
+        assert "server detail" not in error.safe_message
+
+
 if __name__ == "__main__":
     test_account_login_requests_create_and_runtime_scopes()
     test_legacy_account_scope_fails_before_http_with_recovery()
     test_successful_create_transitions_local_state_to_project_mode()
     test_server_scope_denial_is_actionable()
+    test_anonymous_limits_are_actionable_without_exposing_response_details()
     print("ok: project create OAuth lifecycle passed")

@@ -20,6 +20,7 @@ import ast
 import contextlib
 import json
 import hashlib
+import http.client
 import os
 import pathlib
 import select
@@ -47,6 +48,10 @@ SCRIPT_NAMES = (
     "nap_install.py",
 )
 HTTP_TIMEOUT_SECONDS = int(os.environ.get("NAPSEER_HTTP_TIMEOUT_SECONDS", "30"))
+API_CONNECT_ATTEMPT_TIMEOUT_SECONDS = max(
+    0.1,
+    float(os.environ.get("NAPSEER_CONNECT_ATTEMPT_TIMEOUT_SECONDS", "2")),
+)
 LOCAL_HOST = "127.0.0.1"
 DEFAULT_GATEWAY_PORT = os.environ.get("NAPSEER_GATEWAY_PORT")
 RUNTIME_SCRIPT_NAMES = (
@@ -136,13 +141,85 @@ def api_proxy_url(parsed):
     return proxies.get(parsed.scheme) or proxies.get("all")
 
 
+def connect_with_address_fallback(
+    address,
+    timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+    source_address=None,
+    *,
+    resolver=socket.getaddrinfo,
+    socket_factory=socket.socket,
+):
+    """Connect without letting one unreachable DNS address consume the whole timeout."""
+    host, port = address
+    addresses = list(resolver(host, port, 0, socket.SOCK_STREAM))
+    addresses.sort(key=lambda item: 0 if item[0] == socket.AF_INET else 1)
+    if not addresses:
+        raise OSError("getaddrinfo returned no addresses")
+
+    if timeout is socket._GLOBAL_DEFAULT_TIMEOUT or timeout is None:
+        attempt_timeout = API_CONNECT_ATTEMPT_TIMEOUT_SECONDS
+        established_timeout = None
+    else:
+        established_timeout = float(timeout)
+        attempt_timeout = min(established_timeout, API_CONNECT_ATTEMPT_TIMEOUT_SECONDS)
+
+    last_error = None
+    for family, socktype, proto, _canonname, sockaddr in addresses:
+        sock = None
+        try:
+            sock = socket_factory(family, socktype, proto)
+            sock.settimeout(attempt_timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            sock.settimeout(established_timeout)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError("connection failed without an address error")
+
+
+class AddressFallbackHttpConnection(http.client.HTTPConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = connect_with_address_fallback
+
+
+class AddressFallbackHttpsConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = connect_with_address_fallback
+
+
+class AddressFallbackHttpHandler(urllib.request.HTTPHandler):
+    def http_open(self, request):
+        return self.do_open(AddressFallbackHttpConnection, request)
+
+
+class AddressFallbackHttpsHandler(urllib.request.HTTPSHandler):
+    def https_open(self, request):
+        return self.do_open(
+            AddressFallbackHttpsConnection,
+            request,
+            context=self._context,
+        )
+
+
 def api_urlopen(request, timeout):
     parsed = urllib.parse.urlparse(request.full_url)
     proxy = normalize_proxy_url(api_proxy_url(parsed))
-    if not proxy:
-        return urllib.request.urlopen(request, timeout=timeout)
-    proxy_url = urllib.parse.urlunparse(proxy)
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({parsed.scheme: proxy_url}))
+    proxies = {}
+    if proxy:
+        proxies[parsed.scheme] = urllib.parse.urlunparse(proxy)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler(proxies),
+        AddressFallbackHttpHandler(),
+        AddressFallbackHttpsHandler(),
+    )
     return opener.open(request, timeout=timeout)
 
 
@@ -748,6 +825,25 @@ def cli_option(args, *names, default=None):
     return default
 
 
+def validate_cli_options(args, *, flags=(), value_options=(), command_label):
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item in flags:
+            index += 1
+            continue
+        if item in value_options:
+            if index + 1 >= len(args):
+                raise RuntimeError(f"{item} requires a value")
+            index += 2
+            continue
+        raise RuntimeError(
+            f"unexpected argument {item!r} for `{command_label}`. "
+            "Bash expands `!nap`; if this followed `!nap update`, cancel it "
+            "and run `nap update` without `!`."
+        )
+
+
 def start_service(kind, args):
     wrapper = runtime_asset_path("napseer_mcp_server.py")
     require_runtime_assets()
@@ -1026,29 +1122,70 @@ def mcp_status():
     worker = runtime_asset_path("napseer_mcp_server.py")
     supervisor = runtime_asset_path("napseer_mcp_supervisor.py")
     missing = runtime_assets_missing()
-    probe = mcp_runtime_probe() if not missing else {"status": "not_run", "transport": False, "read": False}
+    probe = mcp_runtime_probe() if not missing else {
+        "status": "not_run",
+        "transport": False,
+        "contract": False,
+        "local_state": False,
+    }
+    runtime_ready = bool(
+        not missing
+        and probe.get("transport")
+        and probe.get("contract")
+        and probe.get("local_state")
+    )
+    lifecycle = mcp_lifecycle_summary(missing, probe)
+    if missing:
+        next_step = "nap mcp install"
+    elif not probe.get("transport") or not probe.get("contract"):
+        next_step = "nap mcp update; then restart the MCP client"
+    elif not runtime_ready:
+        next_step = "nap doctor"
+    else:
+        next_step = None
     return {
-        "status": "probe_ok" if not missing and probe.get("status") == "ok" else "repair_required",
+        "status": "probe_ok" if runtime_ready else "repair_required",
         "supervisor_installed": supervisor.is_file(),
         "worker_installed": worker.is_file(),
         "runtime_assets_missing": missing,
         "fresh_process_probe": probe,
+        "lifecycle": lifecycle,
         "client_connection": "not_observable",
         "message": (
-            "A fresh MCP supervisor transport and authenticated read succeeded. Existing client connections are separate; restart the client if it reports Transport closed."
-            if probe.get("status") == "ok"
-            else "The installed MCP runtime did not pass a fresh-process probe."
+            "A fresh supervisor initialized, listed the contract, and read local status. Remote project access was not tested; existing client connections remain separate."
+            if runtime_ready
+            else "The installed MCP runtime did not pass its fresh local-process lifecycle probe."
         ),
         "serve_command": f"{sys.executable} {supervisor}",
-        "next": None if not missing else "nap mcp install",
+        "next": next_step,
     }
 
 
-def mcp_runtime_probe(timeout_seconds=12):
+def mcp_lifecycle_summary(missing, probe):
+    authentication = probe.get("authentication") or {}
+    project = probe.get("project") or {}
+    return {
+        "runtime": "missing" if missing else "installed",
+        "transport": "ready" if probe.get("transport") else "failed",
+        "contract": "ready" if probe.get("contract") else "failed",
+        "local_state": "ready" if probe.get("local_state") else "failed",
+        "authentication": "configured" if authentication.get("configured") else "unconfigured",
+        "project": "configured" if project.get("configured") else "unconfigured",
+        "remote_project_access": probe.get("remote_project_access") or "not_tested",
+    }
+
+
+def mcp_runtime_probe(timeout_seconds=6):
     supervisor = runtime_asset_path("napseer_mcp_supervisor.py")
     worker = runtime_asset_path("napseer_mcp_server.py")
     if not supervisor.is_file() or not worker.is_file():
-        return {"status": "not_installed", "transport": False, "read": False}
+        return {
+            "status": "not_installed",
+            "transport": False,
+            "contract": False,
+            "local_state": False,
+        }
+    deadline = time.monotonic() + max(0.1, float(timeout_seconds))
     environment = os.environ.copy()
     environment["NAPSEER_PROJECT_ROOT"] = str(pathlib.Path.cwd())
     process = subprocess.Popen(
@@ -1060,50 +1197,115 @@ def mcp_runtime_probe(timeout_seconds=12):
         env=environment,
     )
 
+    def send_message(message):
+        if process.stdin is None:
+            raise RuntimeError("MCP probe input is unavailable")
+        process.stdin.write(json.dumps(message) + "\n")
+        process.stdin.flush()
+
     def request(request_id, method, params=None):
         message = {"jsonrpc": "2.0", "id": request_id, "method": method}
         if params is not None:
             message["params"] = params
-        process.stdin.write(json.dumps(message) + "\n")
-        process.stdin.flush()
-        ready, _, _ = select.select([process.stdout], [], [], timeout_seconds)
+        send_message(message)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("MCP probe total deadline exceeded")
+        ready, _, _ = select.select([process.stdout], [], [], remaining)
         if not ready:
-            raise TimeoutError("MCP probe timed out")
+            raise TimeoutError("MCP probe total deadline exceeded")
         return json.loads(process.stdout.readline())
 
+    def tool_payload(response):
+        result = response.get("result") or {}
+        if result.get("isError"):
+            return None
+        structured = result.get("structuredContent")
+        if isinstance(structured, dict):
+            return structured
+        for item in result.get("content") or []:
+            if not isinstance(item, dict) or item.get("type") != "text":
+                continue
+            try:
+                parsed = json.loads(item.get("text") or "")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    stage = "initialize"
+    initialized_ok = False
+    contract_ok = False
     try:
         initialized = request(1, "initialize", {
-            "protocolVersion": "2025-03-26",
+            "protocolVersion": "2025-11-25",
             "capabilities": {},
             "clientInfo": {"name": "nap-doctor", "version": CLI_RELEASE_VERSION},
         })
-        listed = request(2, "tools/list")
-        read = request(3, "tools/call", {"name": "nap_library_ls", "arguments": {}})
-        tools = ((listed.get("result") or {}).get("tools") or [])
-        read_result = read.get("result") or {}
-        read_ok = not bool(read_result.get("isError"))
         initialized_ok = bool(initialized.get("result"))
+        stage = "initialized_notification"
+        send_message({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+        stage = "tools_list"
+        listed = request(2, "tools/list")
+        tools = ((listed.get("result") or {}).get("tools") or [])
+        contract_ok = bool(tools)
+        stage = "local_status"
+        local_status = request(3, "tools/call", {"name": "nap_whoami", "arguments": {}})
+        local_payload = tool_payload(local_status)
+        local_ok = isinstance(local_payload, dict)
         return {
-            "status": "ok" if initialized_ok and tools and read_ok else "failed",
-            "transport": bool(initialized_ok and tools),
-            "read": read_ok,
+            "status": "local_ready" if initialized_ok and contract_ok and local_ok else "failed",
+            "transport": initialized_ok,
+            "contract": contract_ok,
+            "local_state": local_ok,
+            "read": local_ok,
+            "read_scope": "local_status",
             "tool_count": len(tools),
+            "authentication": {
+                "configured": bool((local_payload or {}).get("has_token")),
+                "verified": False,
+            },
+            "project": {
+                "configured": bool(
+                    (local_payload or {}).get("project_configured")
+                    or (local_payload or {}).get("project_id")
+                ),
+                "verified": False,
+            },
+            "remote_project_access": "not_tested",
         }
     except Exception as exc:
         return {
             "status": "failed",
-            "transport": False,
-            "read": False,
+            "transport": initialized_ok,
+            "contract": contract_ok,
+            "local_state": False,
             "error_class": exc.__class__.__name__,
+            "failed_stage": stage,
         }
     finally:
+        if process.stdin is not None and not process.stdin.closed:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.poll() is None:
+            shutdown_grace = max(0.0, min(0.25, deadline - time.monotonic()))
+            if shutdown_grace:
+                try:
+                    process.wait(timeout=shutdown_grace)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+            else:
+                process.terminate()
         if process.poll() is None:
             process.terminate()
             try:
-                process.wait(timeout=3)
+                process.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.wait(timeout=3)
+                process.wait(timeout=1)
 
 
 def handle_mcp(args):
@@ -1140,25 +1342,46 @@ def doctor_status():
             auth_error = "auth file is unreadable or invalid JSON"
     missing = runtime_assets_missing()
     issues = []
+    setup = []
     if auth_error:
-        issues.append({"code": "auth_file_invalid", "message": auth_error, "next": "nap auth login"})
+        issues.append({"code": "auth_file_invalid", "message": auth_error, "next": "nap auth repair"})
     elif not auth_path.exists():
-        issues.append({"code": "project_not_initialized", "message": "current folder is not initialized", "next": "nap init"})
+        setup.append({
+            "code": "project_not_initialized",
+            "message": "current folder is not initialized; anonymous setup is available without login",
+            "next": "nap init or invoke a project-scoped MCP tool",
+        })
     elif not auth.get("project_id"):
-        issues.append({"code": "project_not_attached", "message": "no project is attached", "next": "nap project attach"})
+        setup.append({
+            "code": "project_not_configured",
+            "message": "no project is configured for this folder; anonymous setup is available without login",
+            "next": "nap init",
+        })
     if missing:
         issues.append({"code": "runtime_assets_missing", "message": "local MCP runtime is incomplete", "next": "nap mcp install"})
     if not runtime_asset_path("napseer_mcp_supervisor.py").is_file():
         issues.append({"code": "supervisor_missing", "message": "stable MCP supervisor is not installed", "next": "nap mcp install"})
-    probe = mcp_runtime_probe() if not missing else {"status": "not_run", "transport": False, "read": False}
-    if not missing and probe.get("status") != "ok":
+    probe = mcp_runtime_probe() if not missing else {
+        "status": "not_run",
+        "transport": False,
+        "contract": False,
+        "local_state": False,
+    }
+    probe_ok = bool(probe.get("transport") and probe.get("contract") and probe.get("local_state"))
+    if not missing and not probe_ok:
         issues.append({
-            "code": "mcp_fresh_probe_failed",
-            "message": "fresh MCP transport or authenticated read failed",
-            "next": "nap mcp update; then restart the MCP client",
+            "code": "mcp_local_probe_failed",
+            "message": "fresh MCP transport, contract listing, or local status read failed",
+            "next": (
+                "nap mcp update; then restart the MCP client"
+                if not probe.get("transport")
+                else "inspect the failed_stage field and local project binding"
+            ),
         })
+    status = "repair_required" if issues else ("setup_available" if setup else "ok")
     return {
-        "status": "ok" if not issues else "repair_required",
+        "status": status,
+        "lifecycle": mcp_lifecycle_summary(missing, probe),
         "checks": {
             "state_directory": state["state_dir_exists"],
             "auth_file": auth_path.exists() and auth_error is None,
@@ -1172,6 +1395,7 @@ def doctor_status():
             "client_connection": "not_observable",
         },
         "issues": issues,
+        "setup": setup,
     }
 
 
@@ -1227,6 +1451,7 @@ def main(argv):
         print_json(version_status())
         return 0
     if command == "update":
+        validate_cli_options(args, command_label="nap update")
         result = install_assets()
         print_json({**result, "status": "updated", "message": "Napseer CLI and runtime scripts are updated."})
         return 0
@@ -1241,6 +1466,20 @@ def main(argv):
             raise RuntimeError("unknown project command: bootstrap")
         return run_wrapper("project", args)
     if command == "auth":
+        if args and args[0] in {"login", "login-local", "operator-login"}:
+            validate_cli_options(
+                args[1:],
+                flags={"--no-browser"},
+                value_options={
+                    "--frontend-url",
+                    "--api-base-url",
+                    "--base-url",
+                    "--timeout",
+                    "--timeout-seconds",
+                    "--port",
+                },
+                command_label="nap auth login",
+            )
         if args and args[0] == "repair":
             return run_wrapper("auth", ["repair", *args[1:]])
         if args and args[0] == "refresh":

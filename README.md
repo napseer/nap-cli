@@ -56,5 +56,19 @@ Authentication has one recovery verb: `nap auth repair`. Normal refresh is
 automatic. `nap gateway repair` creates the separate worker identity once;
 `--replace` is required to replace an existing identity.
 
+Project-scoped MCP tools are zero-login by default. In a new workspace, the
+first such tool enrolls an anonymous worker and creates its first project
+automatically; `nap init` remains the explicit equivalent. Anonymous access
+and refresh-token or SSH-key recovery continue without operator
+authentication. Authentication through `nap project claim` is required only
+after the anonymous account reaches its service limit (currently one project
+or 100 stored nodes), or when its durable local enrollment identity is no
+longer recoverable.
+
+In Bash, run commands as `nap update`, `nap auth login`, and so on. A leading
+`!` is shell history expansion: `!nap update` replays the most recent command
+whose text starts with `nap` and appends `update`; it does not invoke an
+alternate Napseer update mode.
+
 The direct wrapper remains the `nap` CLI implementation and an isolated
 protocol-debugging entrypoint.

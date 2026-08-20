@@ -22,10 +22,12 @@ auth.json shape:
 
 import json
 import base64
+import concurrent.futures
 import getpass
 import hashlib
 import html
 import hmac
+import http.client
 import os
 import pathlib
 import queue
@@ -574,6 +576,12 @@ GATEWAY_LISTENER_ACTIVE_LANES = set()
 GATEWAY_LISTENER_UNSTABLE_UNTIL = 0.0
 GATEWAY_LISTENER_STABILITY_LOCK = threading.RLock()
 AUTH_RENEW_LOCK = threading.Lock()
+AUTH_STATE_LOCK = threading.RLock()
+PROJECT_RESOLUTION_LOCK = threading.RLock()
+MCP_MUTATION_LOCK = threading.RLock()
+MCP_STDOUT_LOCK = threading.Lock()
+MCP_REQUEST_LOCAL = threading.local()
+MCP_MAX_WORKERS = max(2, int(os.environ.get("NAPSEER_MCP_MAX_WORKERS", "8")))
 GATEWAY_LOG_LOCK = threading.Lock()
 GATEWAY_VAULT_SETUP_THREAD_STARTED = False
 GATEWAY_PERIODIC_LOG_STATE = {}
@@ -800,26 +808,43 @@ def vault_exists():
 
 
 def load_public_auth_file():
-    if not AUTH_PATH.exists():
-        return {}
+    with AUTH_STATE_LOCK:
+        if not AUTH_PATH.exists():
+            return {}
+        try:
+            data = json.loads(AUTH_PATH.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"failed to read {AUTH_PATH}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"{AUTH_PATH} must contain a JSON object")
+        return data
+
+
+def atomic_write_auth_file(data):
+    AUTH_PATH.parent.mkdir(exist_ok=True)
+    chmod_best_effort(AUTH_PATH.parent, 0o700)
+    temporary = AUTH_PATH.with_name(
+        f".{AUTH_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
     try:
-        data = json.loads(AUTH_PATH.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise RuntimeError(f"failed to read {AUTH_PATH}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise RuntimeError(f"{AUTH_PATH} must contain a JSON object")
-    return data
+        temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        chmod_best_effort(temporary, 0o600)
+        os.replace(temporary, AUTH_PATH)
+        chmod_best_effort(AUTH_PATH, 0o600)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def write_public_auth(data):
-    public = {key: value for key, value in data.items() if key in AUTH_FILE_KEYS and value is not None}
-    if vault_exists() or data.get("gateway_auth_required"):
-        public["gateway_auth_required"] = True
-        public["vault_path"] = str(VAULT_PATH)
-    AUTH_PATH.parent.mkdir(exist_ok=True)
-    chmod_best_effort(AUTH_PATH.parent, 0o700)
-    AUTH_PATH.write_text(json.dumps(public, indent=2) + "\n", encoding="utf-8")
-    chmod_best_effort(AUTH_PATH, 0o600)
+    with AUTH_STATE_LOCK:
+        public = {key: value for key, value in data.items() if key in AUTH_FILE_KEYS and value is not None}
+        if vault_exists() or data.get("gateway_auth_required"):
+            public["gateway_auth_required"] = True
+            public["vault_path"] = str(VAULT_PATH)
+        atomic_write_auth_file(public)
 
 
 def read_vault(passphrase, return_key=False):
@@ -2738,13 +2763,93 @@ def api_proxy_url(parsed):
     return proxies.get(parsed.scheme) or proxies.get("all")
 
 
+def connect_with_address_fallback(
+    address,
+    timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+    source_address=None,
+    *,
+    resolver=socket.getaddrinfo,
+    socket_factory=socket.socket,
+    ipv4_only=None,
+):
+    """Connect without letting one unreachable DNS address consume the whole timeout."""
+    host, port = address
+    if ipv4_only is None:
+        ipv4_only = API_FORCE_IPV4
+    resolver_family = socket.AF_INET if ipv4_only else 0
+    addresses = list(resolver(host, port, resolver_family, socket.SOCK_STREAM))
+    if ipv4_only:
+        addresses = [item for item in addresses if item[0] == socket.AF_INET]
+    else:
+        addresses.sort(key=lambda item: 0 if item[0] == socket.AF_INET else 1)
+    if not addresses:
+        suffix = " IPv4" if ipv4_only else ""
+        raise OSError(f"getaddrinfo returned no{suffix} addresses")
+
+    if timeout is socket._GLOBAL_DEFAULT_TIMEOUT or timeout is None:
+        attempt_timeout = API_CONNECT_ATTEMPT_TIMEOUT_SECONDS
+        established_timeout = None
+    else:
+        established_timeout = float(timeout)
+        attempt_timeout = min(established_timeout, API_CONNECT_ATTEMPT_TIMEOUT_SECONDS)
+
+    last_error = None
+    for family, socktype, proto, _canonname, sockaddr in addresses:
+        sock = None
+        try:
+            sock = socket_factory(family, socktype, proto)
+            sock.settimeout(attempt_timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            sock.settimeout(established_timeout)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError("connection failed without an address error")
+
+
+class AddressFallbackHttpConnection(http.client.HTTPConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = connect_with_address_fallback
+
+
+class AddressFallbackHttpsConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = connect_with_address_fallback
+
+
+class AddressFallbackHttpHandler(urllib.request.HTTPHandler):
+    def http_open(self, request):
+        return self.do_open(AddressFallbackHttpConnection, request)
+
+
+class AddressFallbackHttpsHandler(urllib.request.HTTPSHandler):
+    def https_open(self, request):
+        return self.do_open(
+            AddressFallbackHttpsConnection,
+            request,
+            context=self._context,
+        )
+
+
 def api_urlopen(request, timeout):
     parsed = urllib.parse.urlparse(request.full_url)
     proxy = normalize_proxy_url(api_proxy_url(parsed))
-    if not proxy:
-        return urllib.request.urlopen(request, timeout=timeout)
-    proxy_url = urllib.parse.urlunparse(proxy)
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({parsed.scheme: proxy_url}))
+    proxies = {}
+    if proxy:
+        proxies[parsed.scheme] = urllib.parse.urlunparse(proxy)
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler(proxies),
+        AddressFallbackHttpHandler(),
+        AddressFallbackHttpsHandler(),
+    )
     return opener.open(request, timeout=timeout)
 
 
@@ -2775,7 +2880,9 @@ def connect_proxy_tunnel(proxy, target_host, target_port, timeout=20):
     proxy_port = proxy.port or (443 if proxy.scheme == "https" else 80)
     if proxy.scheme not in {"http", "https"}:
         raise RuntimeError("websocket proxy must use http:// or https://")
-    raw = configure_interactive_socket(socket.create_connection((proxy_host, proxy_port), timeout=timeout))
+    raw = configure_interactive_socket(
+        connect_with_address_fallback((proxy_host, proxy_port), timeout=timeout)
+    )
     sock = ssl.create_default_context().wrap_socket(raw, server_hostname=proxy_host) if proxy.scheme == "https" else raw
     target = f"{target_host}:{target_port}"
     request = (
@@ -2808,7 +2915,13 @@ def ws_connect(url, extra_headers=None):
     port = parsed.port or (443 if parsed.scheme == "wss" else 80)
     path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
     proxy = normalize_proxy_url(websocket_proxy_url(parsed))
-    raw = connect_proxy_tunnel(proxy, host, port, timeout=20) if proxy else configure_interactive_socket(socket.create_connection((host, port), timeout=20))
+    raw = (
+        connect_proxy_tunnel(proxy, host, port, timeout=20)
+        if proxy
+        else configure_interactive_socket(
+            connect_with_address_fallback((host, port), timeout=20)
+        )
+    )
     sock = ssl.create_default_context().wrap_socket(raw, server_hostname=host) if parsed.scheme == "wss" else raw
     configure_interactive_socket(sock)
     key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
@@ -5385,6 +5498,16 @@ REFRESH_EXPIRES_AT = AUTH.get("refresh_expires_at")
 PROTOCOL_VERSION = "2025-11-25"
 SCHEDULE_SIGNATURE_NAMESPACE = "napseer-schedule-v1"
 HTTP_TIMEOUT_SECONDS = int(os.environ.get("NAPSEER_HTTP_TIMEOUT_SECONDS", "30"))
+API_FORCE_IPV4 = os.environ.get("NAPSEER_FORCE_IPV4", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+API_CONNECT_ATTEMPT_TIMEOUT_SECONDS = max(
+    0.1,
+    float(os.environ.get("NAPSEER_CONNECT_ATTEMPT_TIMEOUT_SECONDS", "2")),
+)
 
 # Multi-line help for the `nap project` subcommand. Kept here (top-
 # level constant) so it stays in sync between the help branch and
@@ -5438,8 +5561,9 @@ First-time flow:
 
 
 def send(message):
-    sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    with MCP_STDOUT_LOCK:
+        sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
 
 
 def rpc_result(request_id, result):
@@ -5853,7 +5977,14 @@ def agent_scoped_folder(args):
     return f"{root}/{normalized.strip('/')}"
 
 
+def raise_if_mcp_request_cancelled():
+    cancelled = getattr(MCP_REQUEST_LOCAL, "cancelled", None)
+    if cancelled is not None and cancelled.is_set():
+        raise SafeToolError("request_cancelled", "The MCP request was cancelled.")
+
+
 def request_json(method, path, payload=None, token_required=True, retry_auth=True, extra_headers=None):
+    raise_if_mcp_request_cancelled()
     if token_required:
         # `nap project attach` may run in a separate process while this MCP
         # server stays alive. Reload the project auth file before building
@@ -5873,6 +6004,7 @@ def request_json(method, path, payload=None, token_required=True, retry_auth=Tru
     try:
         with api_urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             text = response.read().decode("utf-8")
+            raise_if_mcp_request_cancelled()
             return json.loads(text) if text else {}
     except (TimeoutError, socket.timeout) as exc:
         raise SafeToolError(
@@ -5882,6 +6014,7 @@ def request_json(method, path, payload=None, token_required=True, retry_auth=Tru
     except urllib.error.HTTPError as exc:
         error_body = exc.read(65536).decode("utf-8", errors="replace")
         exc.close()
+        raise_if_mcp_request_cancelled()
         if exc.code == 401 and token_required and retry_auth:
             try:
                 # The attach flow may have completed after this request was
@@ -5897,7 +6030,7 @@ def request_json(method, path, payload=None, token_required=True, retry_auth=Tru
                         retry_auth=False,
                         extra_headers=extra_headers,
                     )
-                renew_auth()
+                renew_auth(stale_token=request_token)
             except Exception as renew_exc:
                 raise safe_auth_refresh_error() from renew_exc
             return request_json(method, path, payload, token_required=True, retry_auth=False, extra_headers=extra_headers)
@@ -5926,6 +6059,7 @@ def rest_query_string(params):
 
 
 def request_form_json(method, path, payload, token_required=False, extra_headers=None):
+    raise_if_mcp_request_cancelled()
     if token_required and not TOKEN:
         raise RuntimeError("NAPSEER_TOKEN is required")
     body = urllib.parse.urlencode(payload).encode("utf-8")
@@ -5938,6 +6072,7 @@ def request_form_json(method, path, payload, token_required=False, extra_headers
     try:
         with api_urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             text = response.read().decode("utf-8")
+            raise_if_mcp_request_cancelled()
             return json.loads(text) if text else {}
     except (TimeoutError, socket.timeout) as exc:
         raise SafeToolError(
@@ -6854,8 +6989,15 @@ def sign_with_auth_key(namespace, text):
     return sign_text(namespace, pathlib.Path(AUTH["ssh_key_path"]).expanduser(), text)
 
 
+def has_existing_auth_signing_key():
+    if AUTH.get("ssh_private_key") and AUTH.get("ssh_public_key"):
+        return True
+    key_path = pathlib.Path(AUTH["ssh_key_path"]).expanduser()
+    return key_path.is_file() and pathlib.Path(str(key_path) + ".pub").is_file()
+
+
 def renew_anonymous_auth_with_ssh():
-    """Recover an anonymous worker using its durable local signing key."""
+    """Recover a previously enrolled worker using its durable local signing key."""
     public_key = auth_public_key()
     challenge = request_json(
         "POST",
@@ -6957,10 +7099,15 @@ def _renew_auth_locked():
                 token_required=False,
             )
         except RuntimeError as enrollment_refresh_error:
-            if oauth_refresh_error is not None:
-                raise safe_auth_refresh_error() from enrollment_refresh_error
             if AUTH.get("account_mode") in {None, "anonymous"}:
                 return renew_anonymous_auth_with_ssh()
+            if has_existing_auth_signing_key():
+                try:
+                    return renew_anonymous_auth_with_ssh()
+                except Exception as ssh_recovery_error:
+                    raise safe_auth_refresh_error() from ssh_recovery_error
+            if oauth_refresh_error is not None:
+                raise safe_auth_refresh_error() from enrollment_refresh_error
             raise
         token = refreshed["token"]
         worker = refreshed.get("worker") or {}
@@ -6992,12 +7139,22 @@ def _renew_auth_locked():
     return renew_anonymous_auth_with_ssh()
 
 
-def renew_auth():
+def renew_auth(stale_token=None):
     # OAuth providers may rotate refresh tokens. Relay lanes run concurrently,
     # so serialize renewal and reload the latest token written by another lane
-    # before attempting a refresh.
+    # before attempting a refresh. If another lane already replaced the token
+    # that received a 401, reuse that state instead of rotating credentials a
+    # second time.
     with AUTH_RENEW_LOCK:
         refresh_public_auth_state()
+        if stale_token is not None and TOKEN and TOKEN != stale_token:
+            return {
+                "status": "already_renewed",
+                "method": "concurrent_refresh",
+                "token_expires_at": TOKEN_EXPIRES_AT,
+                "refresh_expires_at": REFRESH_EXPIRES_AT,
+                "project_id": DEFAULT_PROJECT_ID,
+            }
         return _renew_auth_locked()
 
 
@@ -7236,6 +7393,11 @@ def operator_project_attach(args=None):
 
 
 def save_auth_file_credentials(updates):
+    with AUTH_STATE_LOCK:
+        return _save_auth_file_credentials_locked(updates)
+
+
+def _save_auth_file_credentials_locked(updates):
     global AUTH, BASE_URL, TOKEN, DEFAULT_PROJECT_ID, TOKEN_EXPIRES_AT, REFRESH_TOKEN, REFRESH_EXPIRES_AT
     current_public = load_public_auth_file()
     current_public.update({key: value for key, value in updates.items() if value is not None})
@@ -7250,6 +7412,11 @@ def save_auth_file_credentials(updates):
 
 
 def save_auth(updates):
+    with AUTH_STATE_LOCK:
+        return _save_auth_locked(updates)
+
+
+def _save_auth_locked(updates):
     global AUTH, BASE_URL, TOKEN, DEFAULT_PROJECT_ID, TOKEN_EXPIRES_AT, REFRESH_TOKEN, REFRESH_EXPIRES_AT, VAULT_SECRETS
     current_public = load_public_auth_file()
     cleaned = {key: value for key, value in updates.items() if value is not None}
@@ -7265,10 +7432,7 @@ def save_auth(updates):
         AUTH = load_auth(public_override=current_public, secret_override=VAULT_SECRETS if gateway_is_unlocked() else {})
     else:
         current_public.update(cleaned)
-        AUTH_PATH.parent.mkdir(exist_ok=True)
-        chmod_best_effort(AUTH_PATH.parent, 0o700)
-        AUTH_PATH.write_text(json.dumps(current_public, indent=2) + "\n", encoding="utf-8")
-        chmod_best_effort(AUTH_PATH, 0o600)
+        atomic_write_auth_file(current_public)
         AUTH = load_auth()
     BASE_URL = AUTH["base_url"].rstrip("/")
     TOKEN = AUTH["token"]
@@ -7279,6 +7443,11 @@ def save_auth(updates):
 
 
 def refresh_public_auth_state():
+    with AUTH_STATE_LOCK:
+        return _refresh_public_auth_state_locked()
+
+
+def _refresh_public_auth_state_locked():
     global AUTH, BASE_URL, TOKEN, DEFAULT_PROJECT_ID, TOKEN_EXPIRES_AT, REFRESH_TOKEN, REFRESH_EXPIRES_AT
     public = load_public_auth_file()
     AUTH = load_auth(public_override=public, secret_override=VAULT_SECRETS if gateway_is_unlocked() else {})
@@ -7659,20 +7828,41 @@ def chmod_best_effort(path, mode):
 
 
 def resolve_project_id(args):
-    # Project-scoped tools resolve their target before issuing an HTTP
-    # request. Reload auth here as well as in request_json so a long-running
-    # MCP worker observes `nap project attach` even when it started before a
-    # project was selected.
-    if AUTH_PATH.exists() or not DEFAULT_PROJECT_ID:
-        refresh_public_auth_state()
-    project_id = DEFAULT_PROJECT_ID
-    if not project_id:
-        raise SafeToolError(
-            "project_not_configured",
-            "No project is selected in this directory. Run `nap project attach` "
-            "for an existing project or `nap project create` for a new one.",
-        )
-    return project_id
+    # Concurrent read calls can all arrive before a new workspace has an auth
+    # file. Serialize only the resolution/bootstrap transition; normal reads
+    # run concurrently once a project is selected.
+    with PROJECT_RESOLUTION_LOCK:
+        # Reload here as well as in request_json so a long-running MCP worker
+        # observes `nap project attach` performed by another process.
+        if AUTH_PATH.exists() or not DEFAULT_PROJECT_ID:
+            refresh_public_auth_state()
+        project_id = DEFAULT_PROJECT_ID
+        if not project_id:
+            slug = default_project_slug()
+            try:
+                initialized = bootstrap_project(
+                    {
+                        "slug": slug,
+                        "name": default_project_name(slug),
+                        "description": "Created automatically by the local Napseer MCP runtime.",
+                        "encryption": "standard",
+                    }
+                )
+            except SafeToolError:
+                raise
+            except Exception as exc:
+                raise SafeToolError(
+                    "project_bootstrap_failed",
+                    "This directory has no Napseer project and automatic anonymous setup failed. "
+                    "Run `nap doctor`, then retry; account login is not required unless an anonymous limit was reached.",
+                ) from exc
+            project_id = initialized.get("project_id") or DEFAULT_PROJECT_ID
+            if not project_id:
+                raise SafeToolError(
+                    "project_bootstrap_failed",
+                    "Automatic anonymous setup completed without selecting a project. Run `nap doctor` and retry.",
+                )
+        return project_id
 
 
 def current_project_id():
@@ -7854,6 +8044,25 @@ def cli_option(args, *names, default=None):
 
 def cli_flag(args, *names):
     return any(name in args for name in names)
+
+
+def validate_cli_options(args, *, flags=(), value_options=(), command_label):
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item in flags:
+            index += 1
+            continue
+        if item in value_options:
+            if index + 1 >= len(args):
+                raise RuntimeError(f"{item} requires a value")
+            index += 2
+            continue
+        raise RuntimeError(
+            f"unexpected argument {item!r} for `{command_label}`. "
+            "Bash expands `!nap`; if this followed `!nap update`, cancel it "
+            "and run `nap update` without `!`."
+        )
 
 
 def cli_positionals(args):
@@ -8944,43 +9153,19 @@ def list_project_nodes(args):
     if filters["active_only"]:
         base_query["include_archived"] = False
         base_query["archived_only"] = False
-    raw_q = str(base_query.get("q") or "").strip()
-    if raw_q and not base_query.get("cursor"):
-        query_analysis = analyze_search_query(raw_q)
-        collected = []
-        diagnostics = {"server_queries": []}
-        for server_query in server_search_queries(query_analysis):
-            if len(unique_nodes(collected)) >= limit:
-                break
-            query = dict(base_query)
-            query["q"] = server_query
-            query["limit"] = max(1, limit - len(unique_nodes(collected)))
-            suffix = f"?{rest_query_string(query)}"
-            page = request_json("GET", f"/v1/projects/{project_id}/nodes{suffix}")
-            items = decrypt_nodes_for_return(filter_project_nodes(page.get("items", [])), project_id=project_id)
-            diagnostics["server_queries"].append({"q": server_query, "matched": len(items)})
-            for node in items:
-                node = dict(node)
-                node["matched_query"] = server_query
-                collected.append(node)
-        items = apply_status_filters(unique_nodes(collected), filters)[:limit]
-        return {
-            **discovery_envelope(
-                project_id,
-                items,
-                {**args, "limit": limit},
-                view=view,
-                diagnostics=diagnostics,
-                query_analysis=query_analysis,
-                warnings=view_warnings + filters["warnings"],
-            ),
-        }
-
     query = rest_query_string(base_query)
     suffix = f"?{query}" if query else ""
     result = request_json("GET", f"/v1/projects/{project_id}/nodes{suffix}")
     items = decrypt_nodes_for_return(filter_project_nodes(result.get("items", [])), project_id=project_id)
     items = apply_status_filters(items, filters)
+    raw_q = str(base_query.get("q") or "").strip()
+    query_analysis = result.get("query_analysis")
+    diagnostics = result.get("diagnostics")
+    if raw_q and not base_query.get("cursor"):
+        query_analysis = query_analysis or analyze_search_query(raw_q)
+        diagnostics = diagnostics or {
+            "server_queries": [{"q": raw_q, "matched": len(items)}],
+        }
     return discovery_envelope(
         project_id,
         items[:limit],
@@ -8988,7 +9173,8 @@ def list_project_nodes(args):
         view=view,
         next_cursor=result.get("next_cursor"),
         has_more=bool(result.get("next_cursor")),
-        query_analysis=result.get("query_analysis"),
+        diagnostics=diagnostics,
+        query_analysis=query_analysis,
         warnings=view_warnings + filters["warnings"],
     )
 
@@ -10571,16 +10757,6 @@ def unique_nodes(nodes):
     return items
 
 
-def server_search_queries(query_analysis):
-    values = [query_analysis["raw"]]
-    if query_analysis["simplified_query"] and query_analysis["simplified_query"] != query_analysis["raw"]:
-        values.append(query_analysis["simplified_query"])
-    values.extend(query_analysis["phrases"])
-    if query_analysis["terms"]:
-        values.extend(query_analysis["terms"][:5])
-    return unique_preserve_order([value for value in values if value])[:6]
-
-
 def search_memory(args):
     args = normalize_discovery_ranges(args)
     project_id = resolve_project_id(args)
@@ -10629,21 +10805,20 @@ def search_memory(args):
         diagnostics["local_index"]["skipped_reason"] = "index_missing"
 
     if mode in {"hybrid", "server"} and (mode == "server" or encryption_state == "plaintext" or len(collected) < limit):
-        remaining = limit
-        for server_query in server_search_queries(query_analysis):
-            if len(unique_nodes(collected)) >= limit:
-                break
-            server_args = {**args, "q": server_query, "limit": remaining, "view": view}
-            server = list_project_nodes(server_args).get("items", [])
-            diagnostics["server_queries"].append({"q": server_query, "matched": len(server)})
-            for node in server:
-                node = summarize_node(node, view=view)
-                node["search_source"] = "server"
-                node["matched_query"] = server_query
-                collected.append(node)
-            if server and "server" not in sources:
-                sources.append("server")
-            remaining = max(1, limit - len(unique_nodes(collected)))
+        # The backend already analyzes the raw query into important terms and
+        # ranks matches. Expanding query variants here (and again inside
+        # list_project_nodes) multiplied one discovery into many serial HTTP
+        # calls, especially on a new/sparse local index.
+        remaining = max(1, limit - len(unique_nodes(collected)))
+        server_result = list_project_nodes({**args, "q": q, "limit": remaining, "view": view})
+        server = server_result.get("items", [])
+        diagnostics["server_queries"].append({"q": q, "matched": len(server)})
+        for node in server:
+            node = summarize_node(node, view=view)
+            node["search_source"] = "server"
+            collected.append(node)
+        if server and "server" not in sources:
+            sources.append("server")
 
     items = [node for node in unique_nodes(collected) if node_in_updated_range(node, args)]
     items = apply_status_filters(items, filters)[:limit]
@@ -14325,6 +14500,21 @@ def safe_http_error(exc, *, operation="request", body_text=""):
             service_code = error
     except (TypeError, ValueError):
         service_code = ""
+    anonymous_limit_messages = {
+        "anonymous_space_limit_reached": (
+            "Anonymous space limit reached. Run `nap project claim` to authenticate and continue."
+        ),
+        "anonymous_node_limit_reached": (
+            "Anonymous node limit reached. Run `nap project claim` to authenticate and continue."
+        ),
+    }
+    if service_code in anonymous_limit_messages:
+        return SafeToolError(
+            service_code,
+            anonymous_limit_messages[service_code],
+            status=status or None,
+            service_code=service_code,
+        )
     return SafeToolError(
         f"http_{status}" if status else "http_error",
         f"Napseer {operation} failed with HTTP {status or 'error'}.",
@@ -14406,19 +14596,20 @@ WORKER_BINDING_AUTH_KEYS = {
 
 
 def replace_public_auth_state(updates, *, clear_keys=()):
-    current_public = load_public_auth_file()
-    for key in clear_keys:
-        current_public.pop(key, None)
-    current_public.update(
-        {
-            key: value
-            for key, value in (updates or {}).items()
-            if value is not None and key in AUTH_FILE_KEYS
-        }
-    )
-    write_public_auth(current_public)
-    refresh_public_auth_state()
-    return AUTH
+    with AUTH_STATE_LOCK:
+        current_public = load_public_auth_file()
+        for key in clear_keys:
+            current_public.pop(key, None)
+        current_public.update(
+            {
+                key: value
+                for key, value in (updates or {}).items()
+                if value is not None and key in AUTH_FILE_KEYS
+            }
+        )
+        write_public_auth(current_public)
+        refresh_public_auth_state()
+        return AUTH
 
 
 def tool_category(name):
@@ -15340,7 +15531,14 @@ def call_tool(name, args):
     started_at = time.time()
     tool_name = telemetry_safe_text(name, 96)
     try:
-        result = call_tool_impl(name, args)
+        if tool_side_effect(name) == "none":
+            result = call_tool_impl(name, args)
+        else:
+            # Remote writes and local lifecycle mutations share process-wide
+            # auth/index state. Keep their execution order explicit while
+            # allowing independent reads to proceed concurrently.
+            with MCP_MUTATION_LOCK:
+                result = call_tool_impl(name, args)
         send_telemetry_event_async(
             "mcp_tool_call",
             "mcp",
@@ -15395,7 +15593,105 @@ def handle(message):
             return rpc_result(request_id, tool_result(result))
         except Exception as exc:
             return rpc_result(request_id, tool_result({"error": safe_exception_payload(exc)}, is_error=True))
+    if "id" not in message:
+        # JSON-RPC notifications are one-way, including extension methods the
+        # current worker does not recognize.
+        return None
     return rpc_error(request_id, -32601, "Method not found", method)
+
+
+class McpRequestState:
+    def __init__(self, message):
+        self.message = message
+        self.cancelled = threading.Event()
+        self.future = None
+
+
+class McpRequestRuntime:
+    """Bounded concurrent request dispatcher for the stdio worker."""
+
+    def __init__(self, handler=handle, sender=send, max_workers=MCP_MAX_WORKERS):
+        self.handler = handler
+        self.sender = sender
+        self._lock = threading.Lock()
+        self._requests = {}
+        self._closed = False
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(2, int(max_workers)),
+            thread_name_prefix="napseer-mcp-tool",
+        )
+
+    @staticmethod
+    def _key(value):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    def _execute(self, key, state):
+        MCP_REQUEST_LOCAL.cancelled = state.cancelled
+        try:
+            response = self.handler(state.message)
+        except Exception:
+            response = rpc_error(state.message.get("id"), -32603, "Internal error")
+        finally:
+            with self._lock:
+                if self._requests.get(key) is state:
+                    self._requests.pop(key, None)
+            try:
+                del MCP_REQUEST_LOCAL.cancelled
+            except AttributeError:
+                pass
+        if response is not None and not state.cancelled.is_set():
+            self.sender(response)
+
+    def cancel(self, request_id):
+        key = self._key(request_id)
+        with self._lock:
+            state = self._requests.get(key)
+            if state is None or state.message.get("method") == "initialize":
+                return False
+            state.cancelled.set()
+            future = state.future
+            if future is not None and future.cancel():
+                self._requests.pop(key, None)
+            return True
+
+    def dispatch(self, message):
+        if not isinstance(message, dict):
+            self.sender(rpc_error(None, -32600, "Invalid Request"))
+            return None
+        if "id" not in message:
+            if message.get("method") == "notifications/cancelled":
+                params = message.get("params") or {}
+                if isinstance(params, dict) and "requestId" in params:
+                    self.cancel(params.get("requestId"))
+                return None
+            # Notifications are ordered on stdin and are intentionally
+            # handled before the next request is accepted. Any accidental
+            # handler return value is discarded because notifications never
+            # receive responses.
+            self.handler(message)
+            return None
+
+        key = self._key(message.get("id"))
+        state = McpRequestState(message)
+        with self._lock:
+            if self._closed:
+                return None
+            if key in self._requests:
+                self.sender(rpc_error(message.get("id"), -32600, "Duplicate in-flight request id"))
+                return None
+            self._requests[key] = state
+            state.future = self._executor.submit(self._execute, key, state)
+        return state.future
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            states = list(self._requests.values())
+        for state in states:
+            state.cancelled.set()
+            if state.future is not None:
+                state.future.cancel()
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
 
 def cli_main(argv):
@@ -15441,6 +15737,19 @@ Refresh is automatic during authenticated calls; use `repair` only for recovery.
 `login-local` remains a hidden compatibility alias for `login`.""")
             return
         if subcommand in {"login", "login-local", "operator-login"}:
+            validate_cli_options(
+                args,
+                flags={"--no-browser"},
+                value_options={
+                    "--frontend-url",
+                    "--api-base-url",
+                    "--base-url",
+                    "--timeout",
+                    "--timeout-seconds",
+                    "--port",
+                },
+                command_label="nap auth login",
+            )
             print(json.dumps(operator_account_login({
                 "frontend_url": cli_option(args, "--frontend-url", default=None),
                 "api_base_url": cli_option(args, "--api-base-url", "--base-url", default=None),
@@ -15882,15 +16191,19 @@ Refresh is automatic during authenticated calls; use `repair` only for recovery.
 
 
 def main():
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        try:
-            response = handle(json.loads(line))
-        except Exception as exc:
-            response = rpc_error(None, -32700, "Parse error")
-        if response is not None:
-            send(response)
+    runtime = McpRequestRuntime()
+    try:
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            try:
+                message = json.loads(line)
+            except (TypeError, ValueError):
+                send(rpc_error(None, -32700, "Parse error"))
+                continue
+            runtime.dispatch(message)
+    finally:
+        runtime.close()
 
 
 if __name__ == "__main__":

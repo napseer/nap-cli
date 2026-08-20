@@ -2,6 +2,8 @@ import importlib.util
 import hashlib
 import json
 import pathlib
+import time
+import pytest
 
 
 SCRIPT_PATH = (
@@ -114,6 +116,18 @@ def test_update_does_not_overwrite_repository_source(monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["status"] == "updated"
 
 
+def test_update_and_expanded_auth_tail_fail_before_side_effects(monkeypatch):
+    module = load_installer()
+    monkeypatch.setattr(module, "install_assets", fail_if_called)
+    monkeypatch.setattr(module, "run_wrapper", fail_if_called)
+
+    with pytest.raises(RuntimeError, match="unexpected argument 'extra' for `nap update`"):
+        module.main(["nap", "update", "extra"])
+
+    with pytest.raises(RuntimeError, match="Bash expands `!nap`"):
+        module.main(["nap", "auth", "login", "project", "attach", "update"])
+
+
 def test_doctor_reports_presence_without_exposing_values(tmp_path, monkeypatch):
     module = load_installer()
     state_dir = tmp_path / ".napseer"
@@ -136,7 +150,18 @@ def test_doctor_reports_presence_without_exposing_values(tmp_path, monkeypatch):
     (install_dir / "napseer_mcp_supervisor.py").write_text("# supervisor\n", encoding="utf-8")
     monkeypatch.setattr(module, "INSTALL_DIR", install_dir)
     monkeypatch.setattr(module, "runtime_assets_missing", lambda: [])
-    monkeypatch.setattr(module, "mcp_runtime_probe", lambda: {"status": "ok", "transport": True, "read": True, "tool_count": 56})
+    monkeypatch.setattr(
+        module,
+        "mcp_runtime_probe",
+        lambda: {
+            "status": "local_ready",
+            "transport": True,
+            "contract": True,
+            "local_state": True,
+            "read": True,
+            "tool_count": 56,
+        },
+    )
     monkeypatch.setattr(
         module,
         "state_dir_status",
@@ -172,6 +197,153 @@ def test_doctor_does_not_create_state_directory(tmp_path, monkeypatch):
 
     assert result["status"] == "repair_required"
     assert not state_dir.exists()
+
+
+def test_doctor_treats_missing_project_as_setup_not_runtime_repair(tmp_path, monkeypatch):
+    module = load_installer()
+    install_dir = tmp_path / "install"
+    install_dir.mkdir()
+    (install_dir / "napseer_mcp_server.py").write_text("# worker\n", encoding="utf-8")
+    (install_dir / "napseer_mcp_supervisor.py").write_text("# supervisor\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(module, "INSTALL_DIR", install_dir)
+    monkeypatch.setattr(module, "runtime_assets_missing", lambda: [])
+    monkeypatch.setattr(
+        module,
+        "mcp_runtime_probe",
+        lambda: {
+            "status": "local_ready",
+            "transport": True,
+            "contract": True,
+            "local_state": True,
+            "authentication": {"configured": False, "verified": False},
+            "project": {"configured": False, "verified": False},
+        },
+    )
+
+    result = module.doctor_status()
+
+    assert result["status"] == "setup_available"
+    assert result["issues"] == []
+    assert result["setup"][0]["code"] == "project_not_initialized"
+    assert result["lifecycle"]["transport"] == "ready"
+    assert not (tmp_path / ".napseer").exists()
+
+
+def test_mcp_status_separates_runtime_health_from_project_readiness(tmp_path, monkeypatch):
+    module = load_installer()
+    install_dir = tmp_path / "install"
+    install_dir.mkdir()
+    (install_dir / "napseer_mcp_server.py").write_text("# worker\n", encoding="utf-8")
+    (install_dir / "napseer_mcp_supervisor.py").write_text("# supervisor\n", encoding="utf-8")
+    monkeypatch.setattr(module, "INSTALL_DIR", install_dir)
+    monkeypatch.setattr(module, "runtime_assets_missing", lambda: [])
+    monkeypatch.setattr(
+        module,
+        "mcp_runtime_probe",
+        lambda: {
+            "status": "local_ready",
+            "transport": True,
+            "contract": True,
+            "local_state": True,
+            "tool_count": 56,
+            "authentication": {"configured": False, "verified": False},
+            "project": {"configured": False, "verified": False},
+        },
+    )
+
+    result = module.mcp_status()
+
+    assert result["status"] == "probe_ok"
+    assert result["lifecycle"]["runtime"] == "installed"
+    assert result["lifecycle"]["transport"] == "ready"
+    assert result["lifecycle"]["authentication"] == "unconfigured"
+    assert result["lifecycle"]["project"] == "unconfigured"
+    assert "not tested" in result["message"]
+
+
+def write_probe_server(path, trace_path, delay=0):
+    path.write_text(
+        f"""\
+import json
+import pathlib
+import sys
+import time
+
+TRACE = pathlib.Path({str(trace_path)!r})
+DELAY = {delay!r}
+
+for line in sys.stdin:
+    message = json.loads(line)
+    params = message.get("params") or {{}}
+    record = {{"method": message.get("method")}}
+    if message.get("method") == "initialize":
+        record["protocol_version"] = params.get("protocolVersion")
+    if message.get("method") == "tools/call":
+        record["tool"] = params.get("name")
+    with TRACE.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\\n")
+    if "id" not in message:
+        continue
+    time.sleep(DELAY)
+    if message.get("method") == "initialize":
+        result = {{"protocolVersion": "2025-11-25", "capabilities": {{}}, "serverInfo": {{"name": "fake", "version": "1"}}}}
+    elif message.get("method") == "tools/list":
+        result = {{"tools": [{{"name": "nap_whoami"}}]}}
+    else:
+        payload = {{"project_configured": False, "has_token": False}}
+        result = {{"structuredContent": payload, "content": [{{"type": "text", "text": json.dumps(payload)}}], "isError": False}}
+    print(json.dumps({{"jsonrpc": "2.0", "id": message["id"], "result": result}}), flush=True)
+""",
+        encoding="utf-8",
+    )
+
+
+def test_mcp_runtime_probe_uses_local_status_without_project_bootstrap(tmp_path, monkeypatch):
+    module = load_installer()
+    supervisor = tmp_path / "probe.py"
+    worker = tmp_path / "worker.py"
+    trace = tmp_path / "trace.jsonl"
+    write_probe_server(supervisor, trace)
+    worker.write_text("# exists\n", encoding="utf-8")
+    paths = {
+        "napseer_mcp_supervisor.py": supervisor,
+        "napseer_mcp_server.py": worker,
+    }
+    monkeypatch.setattr(module, "runtime_asset_path", lambda name: paths[name])
+
+    result = module.mcp_runtime_probe(timeout_seconds=2)
+    records = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+
+    assert result["status"] == "local_ready"
+    assert result["transport"] is True
+    assert result["local_state"] is True
+    assert records[0]["protocol_version"] == "2025-11-25"
+    assert [record.get("tool") for record in records if record.get("tool")] == ["nap_whoami"]
+    assert any(record["method"] == "notifications/initialized" for record in records)
+
+
+def test_mcp_runtime_probe_timeout_is_one_total_deadline(tmp_path, monkeypatch):
+    module = load_installer()
+    supervisor = tmp_path / "slow-probe.py"
+    worker = tmp_path / "worker.py"
+    trace = tmp_path / "trace.jsonl"
+    write_probe_server(supervisor, trace, delay=0.15)
+    worker.write_text("# exists\n", encoding="utf-8")
+    paths = {
+        "napseer_mcp_supervisor.py": supervisor,
+        "napseer_mcp_server.py": worker,
+    }
+    monkeypatch.setattr(module, "runtime_asset_path", lambda name: paths[name])
+    started = time.monotonic()
+
+    result = module.mcp_runtime_probe(timeout_seconds=0.2)
+
+    assert result["status"] == "failed"
+    assert result["error_class"] == "TimeoutError"
+    assert result["transport"] is True
+    assert result["contract"] is False
+    assert time.monotonic() - started < 0.35
 
 
 def test_wrapper_dispatch_never_installs_missing_runtime(monkeypatch):
