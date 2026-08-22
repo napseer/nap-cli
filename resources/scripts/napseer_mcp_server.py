@@ -5722,7 +5722,7 @@ def node_date(node):
 
 
 def node_archived(node):
-    return bool(node.get("archived_at")) or node_status(node) == "archived"
+    return bool(node.get("archived") or node.get("archived_at")) or node_status(node) == "archived"
 
 
 def status_filter_from_args(args):
@@ -5879,7 +5879,16 @@ def summarize_node(node, view="summary", preview_chars=240):
     content = node.get("snippet") or node.get("preview") or node.get("content_text")
     if content:
         item["preview"] = preview_text(content, preview_chars)
-    for key in ("search_source", "matched_query", "matched_strategy", "indexed_at", "rank"):
+    for key in (
+        "search_source",
+        "matched_query",
+        "matched_strategy",
+        "matched_fields",
+        "match_reason",
+        "search_score",
+        "indexed_at",
+        "rank",
+    ):
         if key in node:
             item[key] = node[key]
     if view == "metadata":
@@ -6232,6 +6241,48 @@ def index_connect():
         "ON local_index_nodes(project_id, full_path, archived)"
     )
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS local_index_nodes_project_folder "
+        "ON local_index_nodes(project_id, folder_path, archived)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS local_index_nodes_project_type "
+        "ON local_index_nodes(project_id, node_type, archived)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS local_index_nodes_project_status "
+        "ON local_index_nodes(project_id, status, archived)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS local_index_nodes_project_updated "
+        "ON local_index_nodes(project_id, updated_at DESC, archived)"
+    )
+    tags_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'local_index_node_tags'"
+    ).fetchone()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS local_index_node_tags (
+            project_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            PRIMARY KEY (project_id, node_id, tag)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS local_index_node_tags_lookup "
+        "ON local_index_node_tags(project_id, tag, node_id)"
+    )
+    if tags_table_exists is None:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO local_index_node_tags (project_id, node_id, tag)
+            SELECT n.project_id, n.node_id, CAST(value AS TEXT)
+            FROM local_index_nodes n, json_each(n.tags_json)
+            WHERE json_valid(n.tags_json)
+            """
+        )
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS local_index_edges (
             project_id TEXT NOT NULL,
@@ -6441,6 +6492,14 @@ def index_node(node):
                 "DELETE FROM local_index_edges WHERE project_id = ? AND source_node_id = ?",
                 (project_id, node["id"]),
             )
+            conn.execute(
+                "DELETE FROM local_index_node_tags WHERE project_id = ? AND node_id = ?",
+                (project_id, node["id"]),
+            )
+            conn.executemany(
+                "INSERT OR IGNORE INTO local_index_node_tags (project_id, node_id, tag) VALUES (?, ?, ?)",
+                ((project_id, node["id"], str(tag)) for tag in tags if str(tag).strip()),
+            )
             for link in links:
                 if not isinstance(link, dict):
                     continue
@@ -6501,6 +6560,7 @@ def remove_indexed_node(node_id):
     try:
         with index_connect() as conn:
             conn.execute("DELETE FROM local_index_fts WHERE node_id = ?", (node_id,))
+            conn.execute("DELETE FROM local_index_node_tags WHERE node_id = ?", (node_id,))
             conn.execute(
                 "DELETE FROM local_index_edges "
                 "WHERE source_node_id = ? OR target_node_id = ?",
@@ -6581,18 +6641,76 @@ def unique_preserve_order(values):
     return items
 
 
-def search_tokens(value):
-    raw_tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_.:/-]*", value.lower())
-    tokens = []
+SEARCH_INTENTS = {
+    "any",
+    "decision",
+    "rule",
+    "plan",
+    "task",
+    "implementation",
+    "documentation",
+}
+
+SEARCH_INTENT_PREFIXES = {
+    "decision": ("/decisions",),
+    "rule": ("/rules",),
+    "plan": ("/plans",),
+    "task": ("/kanban", "/work/current"),
+    "implementation": ("/implementation-notes", "/deployments", "/reviews"),
+    "documentation": ("/documentation", "/contracts", "/indexes", "/architecture", "/product"),
+}
+
+SEARCH_AUTHORITY_PREFIXES = (
+    ("/rules", 100),
+    ("/decisions", 95),
+    ("/contracts", 90),
+    ("/documentation", 85),
+    ("/indexes", 80),
+    ("/architecture", 75),
+    ("/product", 70),
+    ("/analysis", 60),
+    ("/plans", 55),
+    ("/implementation-notes", 50),
+    ("/deployments", 45),
+    ("/reviews", 40),
+    ("/kanban", 20),
+    ("/work/current", 10),
+)
+
+
+def singular_search_token(token):
+    if len(token) <= 3 or any(ch in token for ch in "._:/-"):
+        return token
+    if token.endswith("ies") and len(token) > 4:
+        return f"{token[:-3]}y"
+    if token.endswith(("sses", "ses", "xes", "zes", "ches", "shes")) and len(token) > 4:
+        return token[:-2]
+    if token.endswith("s") and not token.endswith(("ss", "us", "is")):
+        return token[:-1]
+    return token
+
+
+def search_concepts(value):
+    raw_tokens = re.findall(r"[\w][\w.:/-]*", str(value or "").lower(), flags=re.UNICODE)
+    concepts = []
     for token in raw_tokens:
         cleaned = token.strip("._:/-")
         if len(cleaned) < 3 or cleaned in SEARCH_STOP_WORDS:
             continue
-        tokens.append(cleaned)
-        if cleaned.endswith("s") and len(cleaned) > 3:
-            singular = cleaned[:-1]
-            if singular not in SEARCH_STOP_WORDS:
-                tokens.append(singular)
+        concepts.append(cleaned)
+    return unique_preserve_order(concepts)
+
+
+def search_tokens(value):
+    tokens = []
+    for concept in search_concepts(value):
+        singular = singular_search_token(concept)
+        if singular != concept and concept.startswith(singular):
+            tokens.append(singular)
+            continue
+        tokens.append(concept)
+        if singular not in SEARCH_STOP_WORDS:
+            tokens.append(singular)
     return unique_preserve_order(tokens)
 
 
@@ -6601,61 +6719,242 @@ def quote_fts(value):
 
 
 def fts_prefix_term(value):
-    term = re.sub(r"[^a-z0-9_]", "", str(value).lower())
+    term = re.sub(r"[^\w]", "", str(value).lower(), flags=re.UNICODE)
     if not term:
         return ""
     return f"{term}*"
 
 
-def analyze_search_query(value):
+def normalize_search_intent(value):
+    intent = str(value or "any").strip().lower()
+    if intent not in SEARCH_INTENTS:
+        raise RuntimeError(
+            "intent must be any, decision, rule, plan, task, implementation, or documentation"
+        )
+    return intent
+
+
+def infer_search_intent(raw):
+    lowered = str(raw or "").lower()
+    patterns = (
+        ("decision", r"\b(decide|decided|decision|rationale|why\s+(?:did|do)\s+we\s+choose)\b"),
+        ("rule", r"\b(rule|rules|policy|policies|must|constraint|constraints)\b"),
+        ("plan", r"\b(plan|plans|planned|roadmap|milestone|next\s+steps?)\b"),
+        ("task", r"\b(task|tasks|ticket|tickets|kanban|todo|backlog|blocked)\b"),
+        ("implementation", r"\b(implemented|implementation|deployed|deployment|release|commit|proof)\b"),
+        ("documentation", r"\b(documentation|docs?|spec|specification|prd|contract|architecture)\b"),
+    )
+    for intent, pattern in patterns:
+        if re.search(pattern, lowered):
+            return intent
+    return "any"
+
+
+def analyze_search_query(value, intent=None):
     raw = str(value or "").strip()
     if not raw:
         raise RuntimeError("q is required")
     phrases = [item.strip() for item in re.findall(r'"([^"]+)"', raw) if item.strip()]
+    concepts = search_concepts(raw)
     terms = search_tokens(raw)
-    simplified_terms = terms[:8]
+    selected_terms = terms[:10]
+    requested_intent = normalize_search_intent(intent)
+    inferred_intent = infer_search_intent(raw)
     return {
         "raw": raw,
         "is_long_query": len(raw.split()) > 6,
         "phrases": unique_preserve_order(phrases)[:5],
         "terms": terms[:20],
-        "simplified_query": " ".join(simplified_terms) if simplified_terms else raw,
+        "concepts": concepts[:12],
+        "selected_terms": selected_terms,
+        "simplified_query": " ".join(selected_terms[:8]) if selected_terms else raw,
+        "requested_intent": requested_intent,
+        "inferred_intent": inferred_intent,
+        "effective_intent": requested_intent if requested_intent != "any" else inferred_intent,
     }
 
 
 def fts_query(value):
     analysis = analyze_search_query(value)
-    terms = analysis["terms"]
-    if terms:
-        return " ".join(quote_fts(term) for term in terms[:6])
-    return quote_fts(analysis["raw"])
+    return compile_fts_candidate_query(analysis)
 
 
-def fts_query_variants(value):
-    analysis = analyze_search_query(value)
-    variants = []
-    for phrase in analysis["phrases"]:
-        variants.append({"strategy": "quoted_phrase", "query": quote_fts(phrase)})
-    terms = analysis["terms"]
-    if terms:
-        prefix_terms = [fts_prefix_term(term) for term in terms[:12]]
-        prefix_terms = [term for term in prefix_terms if term]
-        if prefix_terms:
-            variants.append({"strategy": "important_terms_prefix_any", "query": " OR ".join(prefix_terms)})
-        variants.append({"strategy": "important_terms_any", "query": " OR ".join(quote_fts(term) for term in terms[:12])})
-        variants.append({"strategy": "important_terms_all", "query": " ".join(quote_fts(term) for term in terms[:6])})
-        if len(terms) > 2:
-            variants.append({"strategy": "top_terms_all", "query": " ".join(quote_fts(term) for term in terms[:3])})
-    variants.append({"strategy": "raw_phrase", "query": quote_fts(analysis["raw"])})
-    deduped = []
-    seen = set()
-    for variant in variants:
-        query = variant["query"]
-        if query in seen:
-            continue
-        seen.add(query)
-        deduped.append(variant)
-    return analysis, deduped
+def compile_fts_candidate_query(analysis):
+    components = [quote_fts(phrase) for phrase in analysis.get("phrases") or []]
+    components.extend(
+        term
+        for term in (fts_prefix_term(value) for value in analysis.get("selected_terms") or [])
+        if term
+    )
+    return " OR ".join(unique_preserve_order(components)) or quote_fts(analysis["raw"])
+
+
+def fts_query_variants(value, intent=None):
+    analysis = analyze_search_query(value, intent=intent)
+    return analysis, [
+        {
+            "strategy": "single_pass_weighted_candidates",
+            "query": compile_fts_candidate_query(analysis),
+        }
+    ]
+
+
+def canonical_search_text(value):
+    return " ".join(re.findall(r"[\w]+", str(value or "").lower(), flags=re.UNICODE))
+
+
+def search_field_values(node):
+    values = {
+        "name": node.get("name"),
+        "full_path": node.get("full_path"),
+        "title": node.get("title"),
+        "folder_path": node.get("folder_path"),
+        "type": node.get("type") or node.get("node_type"),
+        "tags": node.get("tags"),
+        "aliases": node.get("aliases") or node.get("aliases_text"),
+    }
+    normalized = {}
+    for field, value in values.items():
+        if isinstance(value, list):
+            value = " ".join(str(item) for item in value)
+        normalized[field] = canonical_search_text(value)
+    return normalized
+
+
+def concept_matches_text(concept, text):
+    if not concept or not text:
+        return False
+    variants = unique_preserve_order([concept, singular_search_token(concept)])
+    field_tokens = text.split()
+    return any(token.startswith(variant) for token in field_tokens for variant in variants)
+
+
+def node_search_authority(node):
+    full_path = str(node.get("full_path") or "")
+    for prefix, score in SEARCH_AUTHORITY_PREFIXES:
+        if full_path == prefix or full_path.startswith(f"{prefix}/"):
+            return score
+    return 30
+
+
+def node_matches_search_intent(node, intent):
+    if intent == "any":
+        return False
+    full_path = str(node.get("full_path") or "")
+    return any(
+        full_path == prefix or full_path.startswith(f"{prefix}/")
+        for prefix in SEARCH_INTENT_PREFIXES.get(intent, ())
+    )
+
+
+def node_search_rank_features(node, analysis):
+    fields = search_field_values(node)
+    raw = canonical_search_text(analysis.get("raw"))
+    identity_values = [fields.get("name", ""), fields.get("title", "")]
+    full_path = fields.get("full_path", "")
+    basename = canonical_search_text(pathlib.PurePosixPath(str(node.get("full_path") or "")).name)
+    exact_identity = 0
+    if raw and raw in unique_preserve_order(identity_values + [basename]):
+        exact_identity = 3
+    elif raw and any(raw in value for value in identity_values + [full_path, basename]):
+        exact_identity = 2
+    elif any(
+        canonical_search_text(phrase)
+        and any(canonical_search_text(phrase) in value for value in identity_values + [full_path])
+        for phrase in analysis.get("phrases") or []
+    ):
+        exact_identity = 1
+
+    concepts = analysis.get("concepts") or []
+    matched_fields = []
+    matched_concepts = set()
+    for field, text in fields.items():
+        field_matched = False
+        for concept in concepts:
+            if concept_matches_text(concept, text):
+                matched_concepts.add(concept)
+                field_matched = True
+        if field_matched:
+            matched_fields.append(field)
+
+    requested_intent = analysis.get("requested_intent") or "any"
+    inferred_intent = analysis.get("inferred_intent") or "any"
+    explicit_intent_match = int(
+        requested_intent != "any" and node_matches_search_intent(node, requested_intent)
+    )
+    inferred_intent_match = int(
+        requested_intent == "any"
+        and inferred_intent != "any"
+        and node_matches_search_intent(node, inferred_intent)
+    )
+    authority = node_search_authority(node)
+    coverage = len(matched_concepts)
+    search_score = (
+        explicit_intent_match * 1_000_000
+        + exact_identity * 100_000
+        + coverage * 10_000
+        + inferred_intent_match * 5_000
+        + len(matched_fields) * 100
+        + authority
+    )
+    reasons = []
+    if explicit_intent_match:
+        reasons.append(f"requested_{requested_intent}")
+    elif inferred_intent_match:
+        reasons.append(f"inferred_{inferred_intent}")
+    if exact_identity:
+        reasons.append("exact_identity")
+    if matched_fields:
+        reasons.append(f"matched_{','.join(matched_fields)}")
+    return {
+        "explicit_intent_match": explicit_intent_match,
+        "exact_identity": exact_identity,
+        "coverage": coverage,
+        "inferred_intent_match": inferred_intent_match,
+        "matched_fields": matched_fields,
+        "authority": authority,
+        "search_score": search_score,
+        "match_reason": "; ".join(reasons) or "body_or_metadata_match",
+    }
+
+
+def search_updated_timestamp(node):
+    try:
+        return datetime.fromisoformat(
+            str(node.get("updated_at") or "").replace("Z", "+00:00")
+        ).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def rank_search_items(items, analysis, limit=None):
+    ranked = []
+    for item in items:
+        node = dict(item)
+        features = node_search_rank_features(node, analysis)
+        node["matched_fields"] = features["matched_fields"]
+        node["match_reason"] = features["match_reason"]
+        node["search_score"] = features["search_score"]
+        try:
+            bm25_rank = float(node.get("rank"))
+        except (TypeError, ValueError):
+            bm25_rank = 0.0
+        sort_key = (
+            -features["explicit_intent_match"],
+            -features["exact_identity"],
+            -features["coverage"],
+            -features["inferred_intent_match"],
+            -len(features["matched_fields"]),
+            -features["authority"],
+            bm25_rank,
+            -search_updated_timestamp(node),
+            str(node.get("full_path") or ""),
+            str(node.get("id") or node.get("node_id") or ""),
+        )
+        ranked.append((sort_key, node))
+    ranked.sort(key=lambda item: item[0])
+    nodes = [node for _, node in ranked]
+    return nodes[:limit] if limit is not None else nodes
 
 
 def local_index_diagnostics(project_id, conn=None):
@@ -6701,73 +7000,137 @@ def local_index_diagnostics(project_id, conn=None):
 def search_local_index(args):
     args = normalize_discovery_ranges(args)
     project_id = resolve_project_id(args)
-    query_analysis, variants = fts_query_variants(args.get("q"))
+    query_analysis, variants = fts_query_variants(args.get("q"), intent=args.get("intent"))
     limit = max(1, min(int(args.get("limit", 25)), 100))
-    attempts = []
-    seen = set()
-    items = []
+    candidate_limit = min(max(limit * 3, 30), 200)
+    filters = status_filter_from_args(args)
     lock = index_file_lock()
     try:
         with index_connect() as conn:
             diagnostics = local_index_diagnostics(project_id, conn)
-            for variant in variants:
-                if len(items) >= limit:
-                    break
-                try:
-                    rows = conn.execute(
-                        """
-                        SELECT n.node_id, n.project_id, n.full_path, n.name, n.folder_path, n.node_type,
-                               n.tags_json, n.updated_at, n.indexed_at,
-                               bm25(local_index_fts) AS rank
-                        FROM local_index_fts
-                        JOIN local_index_nodes n ON n.node_id = local_index_fts.node_id
-                        WHERE local_index_fts MATCH ?
-                          AND n.project_id = ?
-                          AND (? IS NULL OR n.updated_at > ?)
-                          AND (? IS NULL OR n.updated_at < ?)
-                        ORDER BY rank ASC, n.updated_at DESC
-                        LIMIT ?
-                        """,
-                        (
-                            variant["query"],
-                            project_id,
-                            args.get("updated_after"),
-                            args.get("updated_after"),
-                            args.get("updated_before"),
-                            args.get("updated_before"),
-                            limit,
-                        ),
-                    ).fetchall()
-                except sqlite3.Error as exc:
-                    attempts.append({"strategy": variant["strategy"], "matched": 0, "error": safe_exception_payload(exc)})
-                    continue
-                matched = 0
-                for row in rows:
-                    key = row["node_id"]
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    matched += 1
-                    items.append(
-                        {
-                            "id": row["node_id"],
-                            "project_id": row["project_id"],
-                            "full_path": row["full_path"],
-                            "name": row["name"],
-                            "folder_path": row["folder_path"],
-                            "type": row["node_type"],
-                            "tags": json.loads(row["tags_json"] or "[]"),
-                            "updated_at": row["updated_at"],
-                            "indexed_at": row["indexed_at"],
-                            "rank": row["rank"],
-                            "matched_strategy": variant["strategy"],
-                        }
-                    )
-                attempts.append({"strategy": variant["strategy"], "matched": matched})
+            variant = variants[0]
+            where = ["local_index_fts MATCH ?", "n.project_id = ?"]
+            parameters = [variant["query"], project_id]
+            if as_bool(args.get("archived_only"), False):
+                where.append("n.archived = 1")
+            elif not as_bool(args.get("include_archived"), False):
+                where.append("n.archived = 0")
+            if args.get("folder_path") not in (None, ""):
+                where.append("n.folder_path = ?")
+                parameters.append(str(args["folder_path"]))
+            if args.get("type") not in (None, ""):
+                where.append("n.node_type = ?")
+                parameters.append(str(args["type"]))
+            if args.get("tag") not in (None, ""):
+                where.append(
+                    "EXISTS (SELECT 1 FROM local_index_node_tags t "
+                    "WHERE t.project_id = n.project_id AND t.node_id = n.node_id AND t.tag = ?)"
+                )
+                parameters.append(str(args["tag"]))
+            if args.get("updated_after"):
+                where.append("n.updated_at > ?")
+                parameters.append(args["updated_after"])
+            if args.get("updated_before"):
+                where.append("n.updated_at < ?")
+                parameters.append(args["updated_before"])
+            statuses = filters.get("status") or []
+            if statuses:
+                where.append(f"n.status IN ({','.join('?' for _ in statuses)})")
+                parameters.extend(statuses)
+            excluded = list(filters.get("exclude_status") or [])
+            if filters.get("active_only"):
+                excluded = unique_preserve_order(excluded + sorted(ACTIVE_EXCLUDED_STATUSES))
+                where.append("n.archived = 0")
+            if excluded:
+                where.append(f"COALESCE(n.status, '') NOT IN ({','.join('?' for _ in excluded)})")
+                parameters.extend(excluded)
+            parameters.append(candidate_limit)
+            try:
+                rows = conn.execute(
+                    f"""
+                    SELECT n.node_id, n.project_id, n.full_path, n.name, n.folder_path,
+                           n.node_type, n.tags_json, n.updated_at, n.indexed_at,
+                           n.title, n.status, n.archived,
+                           local_index_fts.aliases AS aliases_text,
+                           bm25(local_index_fts, 0.0, 0.0, 8.0, 12.0, 4.0, 5.0,
+                                8.0, 6.0, 1.0, 2.0, 1.0) AS rank
+                    FROM local_index_fts
+                    JOIN local_index_nodes n ON n.node_id = local_index_fts.node_id
+                    WHERE {' AND '.join(where)}
+                    ORDER BY rank ASC, n.updated_at DESC, n.node_id ASC
+                    LIMIT ?
+                    """,
+                    parameters,
+                ).fetchall()
+            except sqlite3.Error as exc:
+                attempts = [
+                    {
+                        "strategy": variant["strategy"],
+                        "matched": 0,
+                        "query_count": 1,
+                        "error": safe_exception_payload(exc),
+                    }
+                ]
+                diagnostics["used"] = True
+                diagnostics["returned"] = 0
+                return {
+                    "items": [],
+                    "query": query_analysis,
+                    "search_strategies": attempts,
+                    "index": diagnostics,
+                }
+            candidates = [
+                {
+                    "id": row["node_id"],
+                    "project_id": row["project_id"],
+                    "full_path": row["full_path"],
+                    "name": row["name"],
+                    "title": row["title"],
+                    "folder_path": row["folder_path"],
+                    "type": row["node_type"],
+                    "tags": json.loads(row["tags_json"] or "[]"),
+                    "aliases_text": row["aliases_text"],
+                    "status": row["status"],
+                    "archived": bool(row["archived"]),
+                    "updated_at": row["updated_at"],
+                    "indexed_at": row["indexed_at"],
+                    "rank": row["rank"],
+                    "matched_strategy": variant["strategy"],
+                }
+                for row in rows
+            ]
+            items = rank_search_items(candidates, query_analysis, limit=limit)
+            attempts = [
+                {
+                    "strategy": variant["strategy"],
+                    "matched": len(rows),
+                    "returned": len(items),
+                    "query_count": 1,
+                    "candidate_limit": candidate_limit,
+                }
+            ]
             diagnostics["used"] = True
-            diagnostics["returned"] = len(items[:limit])
+            diagnostics["returned"] = len(items)
+            diagnostics["query_count"] = 1
+            diagnostics["candidate_limit"] = candidate_limit
+            diagnostics["filters_applied"] = [
+                key
+                for key in (
+                    "folder_path",
+                    "tag",
+                    "type",
+                    "updated_after",
+                    "updated_before",
+                    "status",
+                    "exclude_status",
+                    "active_only",
+                    "include_archived",
+                    "archived_only",
+                )
+                if args.get(key) not in (None, "", False, [])
+            ]
             return {
-                "items": items[:limit],
+                "items": items,
                 "query": query_analysis,
                 "search_strategies": attempts,
                 "index": diagnostics,
@@ -6796,6 +7159,7 @@ def reindex_project(args):
             set_local_graph_index_complete(project_id, False, conn)
             conn.execute("DELETE FROM local_index_fts WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM local_index_edges WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM local_index_node_tags WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM local_index_nodes WHERE project_id = ?", (project_id,))
     finally:
         release_index_file_lock(lock)
@@ -6884,6 +7248,7 @@ def clear_local_index(args):
         with index_connect() as conn:
             conn.execute("DELETE FROM local_index_fts WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM local_index_edges WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM local_index_node_tags WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM local_index_nodes WHERE project_id = ?", (project_id,))
             set_local_graph_index_complete(project_id, False, conn)
     finally:
@@ -11265,7 +11630,7 @@ def search_memory(args):
     q = str(args.get("q") or "").strip()
     if not q:
         raise RuntimeError("q is required")
-    query_analysis = analyze_search_query(q)
+    query_analysis = analyze_search_query(q, intent=args.get("intent"))
     limit = max(1, min(int(args.get("limit", 25)), 100))
     view, view_warnings = normalize_discovery_view(args, default="paths")
     filters = status_filter_from_args(args)
@@ -11287,10 +11652,10 @@ def search_memory(args):
     if mode in {"hybrid", "local"} and INDEX_PATH.exists():
         try:
             local_result = search_local_index({
+                **args,
                 "q": q,
                 "limit": limit,
-                "updated_after": args.get("updated_after"),
-                "updated_before": args.get("updated_before"),
+                "intent": query_analysis["requested_intent"],
             })
             diagnostics["local_index"] = local_result.get("index", diagnostics["local_index"])
             diagnostics["local_strategies"] = local_result.get("search_strategies", [])
@@ -11310,16 +11675,22 @@ def search_memory(args):
         diagnostics["local_index"]["skipped_reason"] = "index_missing"
 
     local_complete = bool((diagnostics.get("local_index") or {}).get("graph_complete"))
+    local_filtered = apply_status_filters(unique_nodes(collected), filters)
     server_needed = mode == "server" or (
         mode == "hybrid"
-        and (not local_complete or len(unique_nodes(collected)) < limit)
+        and (
+            not local_complete
+            or as_bool(args.get("include_archived"), False)
+            or as_bool(args.get("archived_only"), False)
+            or len(local_filtered) < limit
+        )
     )
     if server_needed:
         # The backend already analyzes the raw query into important terms and
         # ranks matches. Expanding query variants here (and again inside
         # list_project_nodes) multiplied one discovery into many serial HTTP
         # calls, especially on a new/sparse local index.
-        remaining = max(1, limit - len(unique_nodes(collected)))
+        remaining = max(1, limit - len(local_filtered))
         server_result = list_project_nodes({**args, "q": q, "limit": remaining, "view": view})
         server = server_result.get("items", [])
         diagnostics["server_queries"].append({"q": q, "matched": len(server)})
@@ -11331,7 +11702,8 @@ def search_memory(args):
             sources.append("server")
 
     items = [node for node in unique_nodes(collected) if node_in_updated_range(node, args)]
-    items = apply_status_filters(items, filters)[:limit]
+    items = apply_status_filters(items, filters)
+    items = rank_search_items(items, query_analysis, limit=limit)
     if not items and query_analysis["is_long_query"]:
         diagnostics["hint"] = "Long natural-language query produced no matches; retry with quoted exact phrases or 2-5 distinctive nouns if the target memory exists."
     response = discovery_envelope(
@@ -11424,7 +11796,18 @@ def discover_memory(args):
 def classify_memory_query(args):
     args = normalize_discovery_ranges(args or {})
     raw = str(args.get("q") or args.get("query") or "").strip()
-    analysis = analyze_search_query(raw) if raw else {"raw": "", "is_long_query": False, "phrases": [], "terms": [], "simplified_query": ""}
+    analysis = analyze_search_query(raw, intent=args.get("intent")) if raw else {
+        "raw": "",
+        "is_long_query": False,
+        "phrases": [],
+        "terms": [],
+        "concepts": [],
+        "selected_terms": [],
+        "simplified_query": "",
+        "requested_intent": normalize_search_intent(args.get("intent")),
+        "inferred_intent": "any",
+        "effective_intent": normalize_search_intent(args.get("intent")),
+    }
     exact_paths = [token for token in raw.split() if token.startswith("/") and len(token) > 1]
     recent_intent = any(term in raw.lower().split() for term in ["recent", "latest", "new", "newest", "updated"])
     if exact_paths:
@@ -11444,6 +11827,7 @@ def classify_memory_query(args):
         "classification": {
             "primary_tool": primary_tool,
             "reason": reason,
+            "search_intent": analysis.get("effective_intent", "any"),
             "exact_paths": exact_paths,
             "recent_intent": recent_intent,
             "range": {
@@ -13217,6 +13601,7 @@ def raw_tools():
                 "properties": {
                     "q": {"type": "string"},
                     "query": {"type": "string"},
+                    "intent": {"type": "string", "enum": ["any", "decision", "rule", "plan", "task", "implementation", "documentation"], "default": "any"},
                     "updated_after": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD lower bound on updated_at."},
                     "updated_before": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD upper bound on updated_at."},
                     "since": {"type": "string", "description": "Alias for updated_after."},
@@ -13301,6 +13686,13 @@ def raw_tools():
                 "required": ["q"],
                 "properties": {
                     "q": {"type": "string", "description": "Search text. Natural language is accepted; distinctive nouns, paths, tags, or quoted phrases produce better matches than full instructions."},
+                    "intent": {"type": "string", "enum": ["any", "decision", "rule", "plan", "task", "implementation", "documentation"], "default": "any"},
+                    "folder_path": {"type": "string"},
+                    "tag": {"type": "string"},
+                    "type": {"type": "string"},
+                    "active_only": {"type": "boolean", "default": False},
+                    "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "exclude_status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
                     "updated_after": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD lower bound on updated_at."},
                     "updated_before": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD upper bound on updated_at."},
                     "since": {"type": "string", "description": "Alias for updated_after."},
@@ -13328,6 +13720,10 @@ def raw_tools():
                 "required": ["q"],
                 "properties": {
                     "q": {"type": "string", "description": "Search text. Natural language is accepted; distinctive nouns, paths, tags, or quoted phrases produce better matches than full instructions."},
+                    "intent": {"type": "string", "enum": ["any", "decision", "rule", "plan", "task", "implementation", "documentation"], "default": "any", "description": "Optional ranking intent. It boosts the requested information class without hard-filtering other valid matches."},
+                    "folder_path": {"type": "string"},
+                    "tag": {"type": "string"},
+                    "type": {"type": "string"},
                     "mode": {"type": "string", "enum": ["hybrid", "server", "local"], "default": "hybrid"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                     "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "paths"},
@@ -13337,6 +13733,8 @@ def raw_tools():
                     "until": {"type": "string", "description": "Alias for updated_before."},
                     "include_content": {"type": "boolean", "default": False, "description": "Legacy no-op; read full bodies with nap_node_get by node_id or uri."},
                     "active_only": {"type": "boolean", "default": False},
+                    "include_archived": {"type": "boolean", "default": False},
+                    "archived_only": {"type": "boolean", "default": False},
                     "status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
                     "exclude_status": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
                     "verbose": {"type": "boolean", "default": False},
@@ -13353,6 +13751,7 @@ def raw_tools():
                 "properties": {
                     "q": {"type": "string", "description": "Keywords or natural-language query. Omit to list recent nodes by filters."},
                     "keywords": {"type": "string", "description": "Alias for q."},
+                    "intent": {"type": "string", "enum": ["any", "decision", "rule", "plan", "task", "implementation", "documentation"], "default": "any", "description": "Optional ranking intent. It boosts canonical records of that class without hard-filtering other matches."},
                     "folder_path": {"type": "string"},
                     "tag": {"type": "string"},
                     "type": {"type": "string"},
@@ -14788,6 +15187,7 @@ IDENTITY_REQUIRED_TOOLS = {
 SIMPLIFIED_TOOL_PROPERTIES = {
     "nap_discover": {
         "q",
+        "intent",
         "folder_path",
         "tag",
         "type",
@@ -15258,7 +15658,13 @@ def _efficient_memory_schema(name, schema):
         properties["sort"] = {
             "type": "string",
             "enum": ["relevance", "updated_desc", "updated_asc", "title_asc"],
-            "default": "updated_desc",
+            "description": "Defaults to relevance when q is present and updated_desc when q is omitted.",
+        }
+        properties["intent"] = {
+            "type": "string",
+            "enum": ["any", "decision", "rule", "plan", "task", "implementation", "documentation"],
+            "default": "any",
+            "description": "Boost one information class without hard-filtering other valid matches.",
         }
         properties["facets"] = {
             "type": "array",
