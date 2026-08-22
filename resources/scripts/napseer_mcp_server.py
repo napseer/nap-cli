@@ -11119,6 +11119,8 @@ def local_memory_context(args, seed_ids):
                 nodes[current_id] = compact
                 level_ids.append(current_id)
                 indexed_at = max(indexed_at, str(current["indexed_at"] or ""))
+                if current_depth >= depth:
+                    continue
                 candidates = []
                 if direction in {"outgoing", "both"}:
                     candidates.extend(conn.execute(
@@ -11130,18 +11132,24 @@ def local_memory_context(args, seed_ids):
                         "SELECT * FROM local_index_edges WHERE project_id = ? AND (target_node_id = ? OR target_path = ?) ORDER BY relation, source_node_id",
                         (project_id, current_id, current["full_path"]),
                     ).fetchall())
+                resolved_candidates = []
                 for edge in candidates:
                     if relations and edge["relation"] not in relations:
                         continue
                     target = node_row(node_id=edge["target_node_id"]) if edge["target_node_id"] else node_row(path=edge["target_path"])
                     if target is None:
                         continue
+                    resolved_candidates.append((edge, target))
+                resolved_candidates.sort(key=lambda item: (
+                    item[0]["source_node_id"],
+                    item[1]["node_id"],
+                    item[0]["relation"],
+                ))
+                for edge, target in resolved_candidates:
                     source_id = edge["source_node_id"]
                     target_id = target["node_id"]
                     neighbor_id = target_id if source_id == current_id else source_id
                     known_neighbor = neighbor_id in seen or neighbor_id in next_ids
-                    if current_depth >= depth and not known_neighbor:
-                        continue
                     if not known_neighbor:
                         if len(nodes) + len(next_ids) >= max_nodes:
                             frontier.append(neighbor_id)

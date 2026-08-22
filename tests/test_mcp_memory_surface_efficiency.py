@@ -150,6 +150,48 @@ def test_hybrid_context_falls_back_until_local_graph_coverage_is_complete(mod):
     assert calls == [["root"]]
 
 
+def test_local_context_does_not_emit_edges_beyond_requested_depth(mod):
+    state = tempfile.TemporaryDirectory()
+    mod._surface_depth_state = state
+    mod.AUTH_DIR = pathlib.Path(state.name)
+    mod.INDEX_PATH = mod.AUTH_DIR / "index.sqlite"
+    mod.INDEX_LOCK_PATH = mod.AUTH_DIR / "index.sqlite.lock"
+    nodes = [
+        {
+            "id": "root", "project_id": "project-1", "full_path": "/docs/root",
+            "folder_path": "/docs", "name": "root", "type": "note", "metadata": {},
+            "tags": [], "links": [
+                {"node_id": "left", "relation": "references"},
+                {"node_id": "right", "relation": "references"},
+            ], "content_text": "", "updated_at": "2026-08-16T12:00:00Z",
+        },
+        {
+            "id": "left", "project_id": "project-1", "full_path": "/docs/left",
+            "folder_path": "/docs", "name": "left", "type": "note", "metadata": {},
+            "tags": [], "links": [{"node_id": "right", "relation": "explains"}],
+            "content_text": "", "updated_at": "2026-08-16T12:01:00Z",
+        },
+        {
+            "id": "right", "project_id": "project-1", "full_path": "/docs/right",
+            "folder_path": "/docs", "name": "right", "type": "note", "metadata": {},
+            "tags": [], "links": [], "content_text": "",
+            "updated_at": "2026-08-16T12:02:00Z",
+        },
+    ]
+    for item in nodes:
+        mod.index_node(item)
+
+    result = mod.get_memory_context({
+        "node_id": "root", "mode": "local", "depth": 1, "direction": "both",
+    })
+
+    assert {item["id"] for item in result["nodes"]} == {"root", "left", "right"}
+    assert result["edges"] == [
+        {"source": "root", "target": "left", "relation": "references"},
+        {"source": "root", "target": "right", "relation": "references"},
+    ]
+
+
 def test_index_sync_upgrades_pre_graph_index_with_full_reindex(mod):
     state = tempfile.TemporaryDirectory()
     mod._surface_upgrade_state = state
