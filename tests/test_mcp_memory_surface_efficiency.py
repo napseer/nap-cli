@@ -28,11 +28,11 @@ def mod(monkeypatch):
     return module
 
 
-def test_default_surface_is_exactly_the_core_fourteen(mod):
+def test_default_surface_is_exactly_the_core_fifteen(mod):
     assert [tool["name"] for tool in mod.tools()] == [
         "nap_apropos", "nap_man", "nap_doctor", "nap_whoami",
         "nap_discover", "nap_context", "nap_node_by_path", "nap_node_get",
-        "nap_create_node", "nap_node_patch", "nap_bulk", "nap_ln",
+        "nap_create_node", "nap_node_patch", "nap_bulk", "nap_batch", "nap_ln",
         "nap_mv", "nap_rm",
     ]
 

@@ -255,7 +255,7 @@ def test_node_get_rejects_path_reads(mod):
 
 def test_tools_include_node_by_path_descriptor(mod):
     tool_by_name = {item["name"]: item for item in mod.tools()}
-    assert len(tool_by_name) == 51
+    assert len(tool_by_name) == 52
     assert len(tool_by_name) == len(mod.tools())
 
     get_tool = next(item for item in mod.tools() if item["name"] == "nap_node_get")

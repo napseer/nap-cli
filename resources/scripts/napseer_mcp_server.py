@@ -582,6 +582,15 @@ MCP_MUTATION_LOCK = threading.RLock()
 MCP_STDOUT_LOCK = threading.Lock()
 MCP_REQUEST_LOCAL = threading.local()
 MCP_MAX_WORKERS = max(2, int(os.environ.get("NAPSEER_MCP_MAX_WORKERS", "8")))
+MCP_BATCH_MAX_ACTIONS = 32
+MCP_BATCH_MAX_PARALLEL = max(
+    1,
+    min(8, int(os.environ.get("NAPSEER_MCP_BATCH_MAX_PARALLEL", "8"))),
+)
+MCP_BATCH_READ_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=MCP_BATCH_MAX_PARALLEL,
+    thread_name_prefix="napseer-mcp-batch-read",
+)
 GATEWAY_LOG_LOCK = threading.Lock()
 GATEWAY_VAULT_SETUP_THREAD_STARTED = False
 GATEWAY_PERIODIC_LOG_STATE = {}
@@ -10015,6 +10024,388 @@ def finish_work(args):
         "stopped_at": stopped_at,
     }
 
+
+BATCH_ALLOWED_CATEGORIES = {"memory", "planning", "kanban", "libraries", "agents"}
+
+
+def _batch_error(code, message):
+    raise SafeToolError(code, message)
+
+
+def _batch_order_predecessors(actions):
+    """Return implicit completion barriers and reject cycles in the full DAG."""
+    order_predecessors = {action["id"]: set() for action in actions}
+    action_ids = [action["id"] for action in actions]
+    for index, action in enumerate(actions):
+        if action["side_effect"] == "none":
+            continue
+        # A mutation is an array-order barrier: everything before it must be
+        # terminal, and nothing after it may start until it is terminal.
+        order_predecessors[action["id"]].update(action_ids[:index])
+        for later_id in action_ids[index + 1:]:
+            order_predecessors[later_id].add(action["id"])
+
+    predecessors = {
+        action["id"]: set(action["depends_on"]) | order_predecessors[action["id"]]
+        for action in actions
+    }
+    followers = {action_id: set() for action_id in action_ids}
+    indegree = {action_id: len(dependencies) for action_id, dependencies in predecessors.items()}
+    for action_id, dependencies in predecessors.items():
+        for dependency_id in dependencies:
+            followers[dependency_id].add(action_id)
+    ready = [action_id for action_id in action_ids if indegree[action_id] == 0]
+    visited = 0
+    while ready:
+        action_id = ready.pop(0)
+        visited += 1
+        for follower_id in sorted(followers[action_id]):
+            indegree[follower_id] -= 1
+            if indegree[follower_id] == 0:
+                ready.append(follower_id)
+    if visited != len(actions):
+        _batch_error(
+            "batch_dependency_cycle",
+            "Batch dependencies conflict with each other or with mutation barriers.",
+        )
+    return order_predecessors
+
+
+def validate_batch(args):
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        _batch_error("invalid_batch", "nap_batch arguments must be an object")
+    args = dict(args)
+    unknown_top_level = set(args) - {
+        "actions",
+        "failure_policy",
+        "dry_run",
+        "max_parallel",
+    }
+    if unknown_top_level:
+        _batch_error(
+            "invalid_batch",
+            "Unknown nap_batch fields: " + ", ".join(sorted(unknown_top_level)),
+        )
+    raw_actions = require_operation_items(
+        args,
+        key="actions",
+        max_items=MCP_BATCH_MAX_ACTIONS,
+    )
+    enabled_names = enabled_tool_names()
+    actions = []
+    seen_ids = set()
+    for index, raw_action in enumerate(raw_actions):
+        unknown_action_fields = set(raw_action) - {
+            "id",
+            "tool",
+            "reason",
+            "arguments",
+            "depends_on",
+        }
+        if unknown_action_fields:
+            _batch_error(
+                "invalid_batch_action",
+                f"Unknown actions[{index}] fields: "
+                + ", ".join(sorted(unknown_action_fields)),
+            )
+        if not isinstance(raw_action.get("id"), str):
+            _batch_error("invalid_batch_action", f"actions[{index}].id must be a string")
+        action_id = raw_action["id"].strip()
+        if not action_id:
+            _batch_error("invalid_batch_action", f"actions[{index}].id is required")
+        if len(action_id) > 80 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]*", action_id):
+            _batch_error(
+                "invalid_batch_action",
+                f"actions[{index}].id must be 1-80 safe identifier characters",
+            )
+        if action_id in seen_ids:
+            _batch_error("duplicate_batch_action", f"duplicate batch action id: {action_id}")
+        seen_ids.add(action_id)
+
+        if not isinstance(raw_action.get("tool"), str):
+            _batch_error("invalid_batch_action", f"actions[{index}].tool must be a string")
+        tool_name = raw_action["tool"].strip()
+        if tool_name not in CANONICAL_TOOL_NAMES or tool_name == "nap_batch":
+            _batch_error(
+                "batch_tool_not_allowed",
+                f"actions[{index}].tool is not an allowed canonical batch tool",
+            )
+        category = tool_category(tool_name)
+        side_effect = tool_side_effect(tool_name)
+        if (
+            category not in BATCH_ALLOWED_CATEGORIES
+            or side_effect not in {"none", "remote-write"}
+            or tool_name in SECRET_ACCEPTING_TOOLS
+        ):
+            _batch_error(
+                "batch_tool_not_allowed",
+                f"{tool_name} is outside the project-memory batch capability boundary",
+            )
+        if tool_name not in enabled_names:
+            profile = tool_profile(tool_name)
+            _batch_error(
+                "tool_profile_required",
+                f"{tool_name} requires the '{profile}' tool profile before it can be batched",
+            )
+        if "arguments" not in raw_action:
+            _batch_error("invalid_batch_action", f"actions[{index}].arguments is required")
+        arguments = raw_action["arguments"]
+        if not isinstance(arguments, dict):
+            _batch_error("invalid_batch_action", f"actions[{index}].arguments must be an object")
+        if not isinstance(raw_action.get("reason"), str):
+            _batch_error("invalid_batch_action", f"actions[{index}].reason must be a string")
+        reason = require_operation_reason(raw_action.get("reason"), f"actions[{index}].reason")
+        depends_on = raw_action.get("depends_on") or []
+        if not isinstance(depends_on, list) or any(not isinstance(value, str) for value in depends_on):
+            _batch_error("invalid_batch_action", f"actions[{index}].depends_on must be an array of action ids")
+        if len(depends_on) != len(set(depends_on)):
+            _batch_error("invalid_batch_action", f"actions[{index}].depends_on must contain unique ids")
+        actions.append({
+            "index": index,
+            "id": action_id,
+            "tool": tool_name,
+            "arguments": arguments,
+            "reason": reason,
+            "depends_on": list(depends_on),
+            "side_effect": side_effect,
+        })
+
+    for action in actions:
+        for dependency_id in action["depends_on"]:
+            if dependency_id not in seen_ids:
+                _batch_error(
+                    "unknown_batch_dependency",
+                    f"{action['id']} depends on unknown action id: {dependency_id}",
+                )
+            if dependency_id == action["id"]:
+                _batch_error(
+                    "batch_dependency_cycle",
+                    f"{action['id']} cannot depend on itself",
+                )
+
+    order_predecessors = _batch_order_predecessors(actions)
+    contains_mutations = any(action["side_effect"] != "none" for action in actions)
+    failure_policy = normalize_failure_policy(
+        args,
+        "stop_on_error" if contains_mutations else "continue_on_error",
+    )
+    if "max_parallel" in args and (
+        isinstance(args["max_parallel"], bool)
+        or not isinstance(args["max_parallel"], int)
+    ):
+        _batch_error("invalid_batch", "max_parallel must be an integer")
+    max_parallel = normalize_int(
+        args.get("max_parallel"),
+        min(4, MCP_BATCH_MAX_PARALLEL),
+        1,
+        MCP_BATCH_MAX_PARALLEL,
+    )
+    return {
+        "actions": actions,
+        "order_predecessors": order_predecessors,
+        "contains_mutations": contains_mutations,
+        "failure_policy": failure_policy,
+        "max_parallel": max_parallel,
+    }
+
+
+def _batch_action_result(action, status, *, result=None, error=None, duration_ms=0, skip_reason=None):
+    item = {
+        "index": action["index"],
+        "id": action["id"],
+        "tool": action["tool"],
+        "reason": action["reason"],
+        "depends_on": action["depends_on"],
+        "side_effect": action["side_effect"],
+        "status": status,
+        "ok": status in {"succeeded", "planned"},
+        "duration_ms": max(0, int(duration_ms)),
+    }
+    if result is not None:
+        item["result"] = result
+    if error is not None:
+        item["error"] = error
+    if skip_reason is not None:
+        item["skip_reason"] = skip_reason
+    return item
+
+
+def _call_batch_action(action, cancelled):
+    sentinel = object()
+    previous_cancelled = getattr(MCP_REQUEST_LOCAL, "cancelled", sentinel)
+    if cancelled is not None:
+        MCP_REQUEST_LOCAL.cancelled = cancelled
+    started_at = time.monotonic()
+    try:
+        raise_if_mcp_request_cancelled()
+        if action["side_effect"] == "none":
+            result = call_tool_impl(action["tool"], action["arguments"])
+        else:
+            with MCP_MUTATION_LOCK:
+                raise_if_mcp_request_cancelled()
+                result = call_tool_impl(action["tool"], action["arguments"])
+        return _batch_action_result(
+            action,
+            "succeeded",
+            result=result,
+            duration_ms=(time.monotonic() - started_at) * 1000,
+        )
+    except Exception as exc:
+        return _batch_action_result(
+            action,
+            "failed",
+            error=safe_exception_payload(exc),
+            duration_ms=(time.monotonic() - started_at) * 1000,
+        )
+    finally:
+        if previous_cancelled is sentinel:
+            try:
+                del MCP_REQUEST_LOCAL.cancelled
+            except AttributeError:
+                pass
+        else:
+            MCP_REQUEST_LOCAL.cancelled = previous_cancelled
+
+
+def execute_batch(args):
+    plan = validate_batch(args)
+    actions = plan["actions"]
+    failure_policy = plan["failure_policy"]
+    max_parallel = plan["max_parallel"]
+    if failure_policy == "dry_run":
+        return {
+            "ok": True,
+            "mode": "dependency_aware",
+            "failure_policy": failure_policy,
+            "contains_mutations": plan["contains_mutations"],
+            "max_parallel": max_parallel,
+            "results": [
+                _batch_action_result(
+                    action,
+                    "planned",
+                    result={
+                        "argument_keys": sorted(action["arguments"]),
+                        "mutation_barrier": action["side_effect"] != "none",
+                    },
+                )
+                for action in actions
+            ],
+            "execution_order": [],
+            "execution_waves": [],
+            "stopped_at": None,
+        }
+
+    action_by_id = {action["id"]: action for action in actions}
+    pending = set(action_by_id)
+    results_by_id = {}
+    execution_order = []
+    execution_waves = []
+    stopped_at = None
+    parallel_read_groups = 0
+    cancelled = getattr(MCP_REQUEST_LOCAL, "cancelled", None)
+
+    while pending:
+        raise_if_mcp_request_cancelled()
+        if stopped_at is not None and failure_policy == "stop_on_error":
+            for action in actions:
+                if action["id"] in pending:
+                    results_by_id[action["id"]] = _batch_action_result(
+                        action,
+                        "skipped",
+                        skip_reason=f"stopped after failed action {stopped_at}",
+                    )
+            pending.clear()
+            break
+
+        skipped_any = False
+        for action in actions:
+            if action["id"] not in pending:
+                continue
+            failed_dependencies = [
+                dependency_id
+                for dependency_id in action["depends_on"]
+                if dependency_id in results_by_id
+                and results_by_id[dependency_id]["status"] != "succeeded"
+            ]
+            if failed_dependencies:
+                results_by_id[action["id"]] = _batch_action_result(
+                    action,
+                    "skipped",
+                    skip_reason="dependency did not succeed: " + ", ".join(failed_dependencies),
+                )
+                pending.remove(action["id"])
+                skipped_any = True
+        if skipped_any:
+            continue
+
+        ready = []
+        for action in actions:
+            if action["id"] not in pending:
+                continue
+            required_terminal = set(action["depends_on"]) | plan["order_predecessors"][action["id"]]
+            if all(dependency_id in results_by_id for dependency_id in required_terminal):
+                ready.append(action)
+        if not ready:
+            _batch_error(
+                "batch_scheduler_stalled",
+                "Batch scheduler could not make progress after validation.",
+            )
+
+        ready_mutations = [action for action in ready if action["side_effect"] != "none"]
+        if ready_mutations:
+            selected = min(ready_mutations, key=lambda action: action["index"])
+            result = _call_batch_action(selected, cancelled)
+            results_by_id[selected["id"]] = result
+            execution_order.append(selected["id"])
+            execution_waves.append([selected["id"]])
+            pending.remove(selected["id"])
+            if (
+                result["status"] == "failed"
+                and failure_policy == "stop_on_error"
+                and stopped_at is None
+            ):
+                stopped_at = selected["id"]
+            continue
+
+        selected_reads = ready[:max_parallel]
+        parallel_read_groups += 1
+        selected_ids = [action["id"] for action in selected_reads]
+        execution_order.extend(selected_ids)
+        execution_waves.append(selected_ids)
+        future_actions = {
+            MCP_BATCH_READ_EXECUTOR.submit(_call_batch_action, action, cancelled): action
+            for action in selected_reads
+        }
+        for future in concurrent.futures.as_completed(future_actions):
+            action = future_actions[future]
+            result = future.result()
+            results_by_id[action["id"]] = result
+            pending.remove(action["id"])
+        if failure_policy == "stop_on_error" and stopped_at is None:
+            failed_reads = [
+                action for action in selected_reads
+                if results_by_id[action["id"]]["status"] == "failed"
+            ]
+            if failed_reads:
+                stopped_at = min(failed_reads, key=lambda action: action["index"])["id"]
+        raise_if_mcp_request_cancelled()
+
+    ordered_results = [results_by_id[action["id"]] for action in actions]
+    return {
+        "ok": all(result["status"] == "succeeded" for result in ordered_results),
+        "mode": "dependency_aware",
+        "failure_policy": failure_policy,
+        "contains_mutations": plan["contains_mutations"],
+        "max_parallel": max_parallel,
+        "parallel_read_groups": parallel_read_groups,
+        "results": ordered_results,
+        "execution_order": execution_order,
+        "execution_waves": execution_waves,
+        "stopped_at": stopped_at,
+    }
+
 def kanban_card_by_path(path):
     node = read_node_by_path({"path": normalize_node_path(path), "view": "render"})
     if not normalize_node_path(node.get("full_path") or "").startswith("/kanban/"):
@@ -14217,6 +14608,7 @@ CANONICAL_TOOL_NAMES = {
     "nap_create_node",
     "nap_node_patch",
     "nap_bulk",
+    "nap_batch",
     "nap_ln",
     "nap_mv",
     "nap_mv_folder",
@@ -14319,7 +14711,7 @@ HIDDEN_COMPATIBILITY_TOOL_NAMES = {
     "nap_update_self",
 }
 
-SYNTHETIC_TOOL_NAMES = {"nap_plan_transition", "nap_node_restore"}
+SYNTHETIC_TOOL_NAMES = {"nap_plan_transition", "nap_node_restore", "nap_batch"}
 
 IDENTITY_REQUIRED_TOOLS = {
     "nap_node_get": ("node_id", "uri"),
@@ -14437,6 +14829,7 @@ TOOL_CATEGORIES.update(
             "nap_create_node",
             "nap_node_patch",
             "nap_bulk",
+            "nap_batch",
             "nap_ln",
             "nap_mv",
             "nap_mv_folder",
@@ -14502,6 +14895,7 @@ CORE_TOOL_NAMES = {
     "nap_create_node",
     "nap_node_patch",
     "nap_bulk",
+    "nap_batch",
     "nap_ln",
     "nap_mv",
     "nap_rm",
@@ -14742,9 +15136,12 @@ def tool_auth_mode(name):
 
 def tool_contract_metadata(name):
     metadata = _base_tool_contract_metadata(name)
-    if name == "nap_plan_transition":
+    if name in {"nap_batch", "nap_plan_transition"}:
         metadata["dry_run_supported"] = True
-    if name in {"nap_plan_transition", "nap_crontab_put"}:
+    if name == "nap_batch":
+        metadata["lock_policy"] = "per-action-mutation-barrier"
+        metadata["idempotency"] = "mixed-no-replay"
+    if name in {"nap_batch", "nap_plan_transition", "nap_crontab_put"}:
         metadata["dangerous"] = True
     return metadata
 
@@ -15031,6 +15428,75 @@ def _require_canonical_identity(name, schema):
 
 def _synthetic_tools():
     return [
+        {
+            "name": "nap_batch",
+            "description": (
+                "Execute a validated dependency graph of project-memory actions in one MCP call. "
+                "Independent reads run concurrently; every mutation is an ordered, exclusive barrier "
+                "and is never replayed. Each action requires a concise user-visible reason."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "required": ["actions"],
+                "properties": {
+                    "failure_policy": {
+                        "type": "string",
+                        "enum": ["stop_on_error", "continue_on_error", "dry_run"],
+                        "description": (
+                            "Defaults to continue_on_error for read-only batches and "
+                            "stop_on_error when any action mutates state."
+                        ),
+                    },
+                    "dry_run": {"type": "boolean", "default": False},
+                    "max_parallel": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MCP_BATCH_MAX_PARALLEL,
+                        "default": min(4, MCP_BATCH_MAX_PARALLEL),
+                        "description": "Maximum dependency-ready reads from this call that may overlap.",
+                    },
+                    "actions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": MCP_BATCH_MAX_ACTIONS,
+                        "items": {
+                            "type": "object",
+                            "required": ["id", "tool", "reason", "arguments"],
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 80,
+                                    "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+                                },
+                                "tool": {
+                                    "type": "string",
+                                    "description": (
+                                        "Enabled canonical memory, planning, Kanban, library, "
+                                        "or agent-memory tool. nap_batch cannot invoke itself."
+                                    ),
+                                },
+                                "reason": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 600,
+                                    "description": "Concise user-visible intent for this action.",
+                                },
+                                "arguments": {"type": "object"},
+                                "depends_on": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "uniqueItems": True,
+                                    "default": [],
+                                },
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
         {
             "name": "nap_plan_transition",
             "description": (
@@ -15489,6 +15955,8 @@ def call_tool_impl(name, args):
         return move_folder(args)
     if name == "nap_bulk":
         return bulk_upsert_nodes(args)
+    if name == "nap_batch":
+        return execute_batch(args)
     if name == "nap_finish_work":
         return finish_work(args)
     if name == "nap_project_create":
@@ -15631,7 +16099,11 @@ def call_tool(name, args):
     started_at = time.time()
     tool_name = telemetry_safe_text(name, 96)
     try:
-        if tool_side_effect(name) == "none":
+        if name == "nap_batch":
+            # Batch validates its complete graph first, overlaps only reads,
+            # and acquires the mutation lock around each write barrier.
+            result = call_tool_impl(name, args)
+        elif tool_side_effect(name) == "none":
             result = call_tool_impl(name, args)
         else:
             # Remote writes and local lifecycle mutations share process-wide
@@ -16304,6 +16776,7 @@ def main():
             runtime.dispatch(message)
     finally:
         runtime.close()
+        MCP_BATCH_READ_EXECUTOR.shutdown(wait=True, cancel_futures=True)
 
 
 if __name__ == "__main__":
