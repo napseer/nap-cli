@@ -296,7 +296,12 @@ def run():
     active = mod.list_project_nodes({"folder_path": "/plans", "active_only": True})
     assert [item["full_path"] for item in active["items"]] == ["/plans/active"]
     status_filtered = mod.list_project_nodes({"folder_path": "/plans", "status": ["completed"], "view": "paths"})
-    assert status_filtered["items"] == [{"full_path": "/plans/done", "type": "note", "status": "completed"}]
+    assert status_filtered["items"] == [{
+        "node_id": "done",
+        "full_path": "/plans/done",
+        "type": "note",
+        "status": "completed",
+    }]
 
     def search_response(method, path, payload=None, **kwargs):
         assert "q=" in path

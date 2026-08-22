@@ -24,6 +24,9 @@ def load_module():
 def mod(monkeypatch):
     monkeypatch.delenv("NAPSEER_TOOL_PROFILES", raising=False)
     module = load_module()
+    module._auth_state = tempfile.TemporaryDirectory()
+    module.AUTH_PATH = pathlib.Path(module._auth_state.name) / "auth.json"
+    module.AUTH = {"account_id": "acct-1", "token": "token"}
     module.CONFIGURED_TOOL_PROFILES = None
     return module
 

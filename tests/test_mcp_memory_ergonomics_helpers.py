@@ -591,6 +591,39 @@ def test_context_and_related_use_identity_inputs(mod):
         mod.find_related_nodes({"path": "/notes/root"})
 
 
+def test_hybrid_context_resolves_path_inside_complete_local_snapshot(mod):
+    with tempfile.TemporaryDirectory() as tmp:
+        state_dir = pathlib.Path(tmp)
+        mod.AUTH_DIR = state_dir
+        mod.INDEX_PATH = state_dir / "index.sqlite"
+        mod.INDEX_LOCK_PATH = state_dir / "index.lock"
+        indexed = node("/notes/local-root", "active", node_type="note")
+        indexed["id"] = "local-root-123"
+        mod.index_node(indexed)
+        mod.set_local_graph_index_complete("project-1", True)
+
+        def unexpected_request(*_args, **_kwargs):
+            raise AssertionError("complete local context must not make an HTTP request")
+
+        mod.request_json = unexpected_request
+        result = mod.get_memory_context({
+            "path": "/notes/local-root",
+            "depth": 0,
+            "mode": "hybrid",
+        })
+
+        assert result["source"] == "local_index"
+        assert result["seed_node_ids"] == ["local-root-123"]
+        assert result["items"][0]["full_path"] == "/notes/local-root"
+        with mod.index_connect() as conn:
+            plan = conn.execute(
+                "EXPLAIN QUERY PLAN SELECT node_id FROM local_index_nodes "
+                "WHERE project_id = ? AND full_path = ? AND archived = 0",
+                ("project-1", "/notes/local-root"),
+            ).fetchall()
+        assert any("local_index_nodes_project_path" in row["detail"] for row in plan)
+
+
 def test_local_helper_ui_forms_submit_identity_for_existing_node_actions():
     source = (pathlib.Path(__file__).resolve().parents[1] / "resources" / "scripts" / "napseer_mcp_server.py").read_text()
     assert "name='node_id' value='{html.escape(item.get('id') or '')}'" in source
@@ -643,6 +676,7 @@ def test_recent_memory_defaults_to_paths(mod):
     assert result["ok"] is True
     assert result["view"] == "paths"
     assert result["items"] == [{
+        "node_id": "id-recent-title",
         "full_path": "/notes/recent-title",
         "type": "note",
         "status": "active",
@@ -671,6 +705,7 @@ def test_recent_memory_accepts_date_aliases_and_returns_dates(mod):
     mod.request_json = fake_request
     result = mod.recent_memory({"since": "2026-05-05", "until": "2026-05-06"})
     assert result["items"] == [{
+        "node_id": "id-recent-title",
         "full_path": "/notes/recent-title",
         "type": "note",
         "status": "active",
@@ -699,6 +734,7 @@ def test_find_defaults_to_paths_and_requests_compact_rest_view(mod):
     assert result["ok"] is True
     assert result["view"] == "paths"
     assert result["items"] == [{
+        "node_id": "id-found",
         "full_path": "/plans/found",
         "type": "plan",
         "status": "planned",
@@ -721,6 +757,8 @@ def test_discover_uses_search_when_keywords_present(mod):
     assert calls and calls[-1]["q"] == "gateway relay"
     assert calls[-1]["view"] == "summary"
     assert "date" in result["awareness"]["date_fields_in_rows"]
+    assert "item.node_id" in result["awareness"]["next_step"]
+    assert "outside discovery" in result["awareness"]["next_step"]
 
 
 def test_classify_query_points_exact_paths_to_context(mod):
@@ -748,7 +786,11 @@ def test_title_view_requests_summary_rest_view_without_content(mod):
     result = mod.list_project_nodes({"view": "titles"})
     assert result["ok"] is True
     assert result["view"] == "titles"
-    assert result["items"] == [{"title": "Readable Title", "full_path": "/notes/titled"}]
+    assert result["items"] == [{
+        "node_id": "id-titled",
+        "title": "Readable Title",
+        "full_path": "/notes/titled",
+    }]
     assert "content_text" not in result["items"][0]
 
 

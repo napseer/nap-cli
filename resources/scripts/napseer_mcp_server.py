@@ -418,6 +418,7 @@ PUBLIC_AUTH_KEYS = {
     "project_id",
     "project_slug",
     "project_name",
+    "project_encryption_state",
     "project_signing_key_fingerprint",
     "worker_id",
     "agent_id",
@@ -5478,6 +5479,7 @@ def load_auth(public_override=None, secret_override=None):
         "project_id": os.environ.get("NAPSEER_PROJECT_ID") or merged.get("project_id"),
         "project_slug": merged.get("project_slug"),
         "project_name": merged.get("project_name"),
+        "project_encryption_state": merged.get("project_encryption_state"),
         "project_signing_key_fingerprint": merged.get("project_signing_key_fingerprint"),
         "worker_id": merged.get("worker_id"),
         "agent_id": merged.get("agent_id"),
@@ -5831,18 +5833,21 @@ def metadata_summary(node):
 
 
 def summarize_node(node, view="summary", preview_chars=240):
+    node_id = node.get("node_id") or node.get("id")
     if view == "full":
         return strip_node_content(node, include_content=True)
     metadata = node_metadata(node)
     status = node_status(node)
     if view == "titles":
         item = {
+            "node_id": node_id,
             "title": node.get("title") or metadata.get("title") or node.get("name") or pathlib.PurePosixPath(str(node.get("full_path") or "")).name,
             "full_path": node.get("full_path"),
         }
         return {key: value for key, value in item.items() if value not in (None, "")}
     if view == "paths":
         item = {
+            "node_id": node_id,
             "full_path": node.get("full_path"),
             "type": node.get("type"),
             "status": status,
@@ -5856,6 +5861,7 @@ def summarize_node(node, view="summary", preview_chars=240):
 
     item = {
         "id": node.get("id"),
+        "node_id": node_id,
         "project_id": node.get("project_id"),
         "full_path": node.get("full_path"),
         "type": node.get("type"),
@@ -6222,6 +6228,10 @@ def index_connect():
     ensure_sqlite_column(conn, "local_index_nodes", "status", "TEXT")
     ensure_sqlite_column(conn, "local_index_nodes", "archived", "INTEGER NOT NULL DEFAULT 0")
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS local_index_nodes_project_path "
+        "ON local_index_nodes(project_id, full_path, archived)"
+    )
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS local_index_edges (
             project_id TEXT NOT NULL,
@@ -6294,6 +6304,27 @@ def local_graph_index_state(project_id, conn=None):
         return read(conn)
     with index_connect() as connection:
         return read(connection)
+
+
+def local_index_node_ids_by_path(project_id, paths, require_complete=True):
+    """Resolve paths inside one coherent local-index snapshot."""
+    if not INDEX_PATH.exists():
+        return {}, {"graph_complete": False, "graph_completed_at": None}
+    normalized_paths = unique_preserve_order(normalize_node_path(path) for path in paths)
+    with index_connect() as connection:
+        graph_state = local_graph_index_state(project_id, connection)
+        if require_complete and not graph_state["graph_complete"]:
+            return {}, graph_state
+        resolved = {}
+        for path in normalized_paths:
+            row = connection.execute(
+                "SELECT node_id FROM local_index_nodes "
+                "WHERE project_id = ? AND full_path = ? AND archived = 0",
+                (project_id, path),
+            ).fetchone()
+            if row is not None:
+                resolved[path] = row["node_id"]
+        return resolved, graph_state
 
 
 def set_local_graph_index_complete(project_id, complete, conn=None):
@@ -8000,6 +8031,7 @@ def create_project_with_state(args):
         "project_id": project["id"],
         "project_slug": project["slug"],
         "project_name": project["name"],
+        "project_encryption_state": project.get("encryption_state") or "standard",
     }
     if AUTH.get("account_mode") == "operator_account":
         auth_updates["account_mode"] = "operator_project"
@@ -11199,10 +11231,10 @@ def start_project_heartbeat_thread():
 
 
 def project_encryption_state(project_id):
-    try:
-        return request_json("GET", f"/v1/projects/{project_id}/encryption/status").get("state") or "standard"
-    except Exception:
-        return "plaintext"
+    if str(project_id or "") != str(current_project_id() or ""):
+        return "unknown"
+    state = str(AUTH.get("project_encryption_state") or "").strip().lower()
+    return state if state in {"standard", "plaintext", "encrypted", "e2e"} else "unknown"
 
 
 def strip_node_content(node, include_content=False):
@@ -11240,6 +11272,9 @@ def search_memory(args):
     mode = str(args.get("mode") or "hybrid").strip().lower()
     if mode not in {"hybrid", "server", "local"}:
         raise RuntimeError("mode must be hybrid, server, or local")
+    # Encryption mode is durable local project metadata. Do not spend one
+    # public-API round trip discovering it before every local FTS query. An
+    # unknown value is deliberately treated as local-first below.
     encryption_state = project_encryption_state(project_id)
     collected = []
     sources = []
@@ -11274,7 +11309,12 @@ def search_memory(args):
     elif mode in {"hybrid", "local"}:
         diagnostics["local_index"]["skipped_reason"] = "index_missing"
 
-    if mode in {"hybrid", "server"} and (mode == "server" or encryption_state == "plaintext" or len(collected) < limit):
+    local_complete = bool((diagnostics.get("local_index") or {}).get("graph_complete"))
+    server_needed = mode == "server" or (
+        mode == "hybrid"
+        and (not local_complete or len(unique_nodes(collected)) < limit)
+    )
+    if server_needed:
         # The backend already analyzes the raw query into important terms and
         # ranks matches. Expanding query variants here (and again inside
         # list_project_nodes) multiplied one discovery into many serial HTTP
@@ -11376,7 +11416,7 @@ def discover_memory(args):
     result["awareness"] = {
         "default_sort": "relevance" if q else "updated_desc",
         "date_fields_in_rows": ["date", "created_at", "updated_at"],
-        "next_step": "Use nap_node_by_path on important paths, then read by identity with nap_node_get when the preview is not enough.",
+        "next_step": "Read a selected row directly with nap_node_get using item.node_id. Use nap_node_by_path only when a path came from outside discovery and has no node_id.",
     }
     return result
 
@@ -11416,13 +11456,13 @@ def classify_memory_query(args):
             {"tool": "nap_context", "when": "You already know one or more canonical paths and need surrounding links/backlinks."},
             {"tool": "nap_discover", "when": "You need search plus folder/tag/type/status/date filters in one call."},
             {"tool": "nap_discover", "when": "You need latest project changes; omit q and use sort=updated_desc."},
-            {"tool": "nap_node_by_path", "when": "You selected a path and need to resolve it to node_id / nap:// URI before reading."},
-            {"tool": "nap_node_get", "when": "You have node_id or nap:// URI and need the full body."},
+            {"tool": "nap_node_by_path", "when": "You only have an external path with no node_id and need canonical identity."},
+            {"tool": "nap_node_get", "when": "A discovery row already supplied node_id, or you have a nap:// URI, and need the full body."},
         ],
     }
 
 
-def context_seed_ids(args):
+def context_seed_ids(args, mode="hybrid"):
     node_ids = [str(value).strip() for value in (args.get("node_ids") or []) if str(value).strip()]
     if args.get("node_id"):
         node_ids.append(str(args["node_id"]).strip())
@@ -11434,8 +11474,24 @@ def context_seed_ids(args):
     paths = list(args.get("paths") or [])
     if args.get("path"):
         paths.append(args["path"])
-    for path in paths:
-        resolved = node_by_path({"path": normalize_node_path(path)})
+    normalized_paths = unique_preserve_order(normalize_node_path(path) for path in paths)
+    for path in normalized_paths:
+        reject_agent_namespace_path(path)
+    locally_resolved = {}
+    if normalized_paths and mode in {"local", "hybrid"}:
+        project_id = resolve_project_id(args)
+        locally_resolved, _graph_state = local_index_node_ids_by_path(
+            project_id,
+            normalized_paths,
+            require_complete=mode == "hybrid",
+        )
+    for path in normalized_paths:
+        if path in locally_resolved:
+            node_ids.append(locally_resolved[path])
+            continue
+        if mode == "local":
+            raise RuntimeError("seed path is not present in the local memory index")
+        resolved = node_by_path({"path": path})
         node_id = (resolved.get("identity") or {}).get("node_id")
         if node_id:
             node_ids.append(node_id)
@@ -11633,10 +11689,10 @@ def server_memory_context(args, seed_ids):
 
 
 def get_memory_context(args):
-    seed_ids = context_seed_ids(args)
     mode = str(args.get("mode") or "hybrid").strip().lower()
     if mode not in {"hybrid", "local", "server"}:
         raise RuntimeError("mode must be hybrid, local, or server")
+    seed_ids = context_seed_ids(args, mode=mode)
     if mode in {"local", "hybrid"}:
         try:
             if mode == "hybrid":
@@ -13291,7 +13347,7 @@ def raw_tools():
         },
         {
             "name": "nap_discover",
-            "description": "Intent-shaped project memory discovery. Combine keywords, folder/tag/type/status filters, updated_at ranges, recent sorting, and compact date-aware rows before resolving paths with nap_node_by_path or reading identity with nap_node_get.",
+            "description": "Intent-shaped project memory discovery. Compact rows carry node_id; pass a selected row's node_id directly to nap_node_get. Use nap_node_by_path only for an external path that has no identity.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -13320,7 +13376,7 @@ def raw_tools():
         },
         {
             "name": "nap_find",
-            "description": "Structured active memory search by folder, tag, path, or query. Returns path/date rows by default; resolve selected paths with nap_node_by_path before identity reads.",
+            "description": "Structured active memory search by folder, tag, path, or query. Compact rows carry node_id for direct nap_node_get reads.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -13807,7 +13863,7 @@ def raw_tools():
         },
         {
             "name": "nap_node_get",
-            "description": "Read one node by canonical node_id or nap:// URI. Paths are indexes/routes only; resolve a path with nap_node_by_path, then read by node_id or uri. Use view='edit' before nap_node_patch to get revision and read_fingerprint.",
+            "description": "Read one node by canonical node_id or nap:// URI. Discovery rows already carry node_id; use nap_node_by_path only when an external path has no identity. Use view='edit' before nap_node_patch to get revision and read_fingerprint.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -13846,7 +13902,7 @@ def raw_tools():
         },
         {
             "name": "nap_node_by_path",
-            "description": "Resolve a path index/route to canonical node identity. This does not read full node content; use returned node_id or nap:// URI with nap_node_get, nap_node_by_id, or nap_node_by_uri.",
+            "description": "Resolve an external path index/route that has no node_id to canonical identity. Discovery rows already carry node_id and should go directly to nap_node_get. This tool does not read full node content.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path"],

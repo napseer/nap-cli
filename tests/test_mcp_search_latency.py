@@ -74,3 +74,43 @@ def test_sparse_index_search_latency_does_not_scale_with_query_variants(tmp_path
     elapsed = time.monotonic() - started
     assert len(calls) == 1
     assert elapsed < 0.15
+
+
+def test_complete_local_search_skips_remote_encryption_preflight_and_search(tmp_path):
+    mod = load_module()
+    mod.INDEX_PATH = tmp_path / "index.sqlite"
+    mod.INDEX_PATH.touch()
+    mod.resolve_project_id = lambda _args: "project-1"
+    mod.project_encryption_state = lambda _project_id: "unknown"
+    items = [
+        {
+            "id": f"node-{index}",
+            "project_id": "project-1",
+            "full_path": f"/notes/result-{index}",
+            "name": f"result-{index}",
+            "type": "note",
+            "tags": [],
+            "updated_at": "2026-08-22T00:00:00Z",
+        }
+        for index in range(5)
+    ]
+    mod.local_index_diagnostics = lambda _project_id: {
+        "exists": True,
+        "graph_complete": True,
+    }
+    mod.search_local_index = lambda _args: {
+        "items": items,
+        "query": {"terms": ["result"]},
+        "search_strategies": [],
+        "index": {"exists": True, "graph_complete": True},
+    }
+
+    def unexpected_request(*_args, **_kwargs):
+        raise AssertionError("complete local search must not make an HTTP request")
+
+    mod.request_json = unexpected_request
+    result = mod.search_memory({"q": "result", "limit": 5, "view": "summary"})
+
+    assert result["sources"] == ["local"]
+    assert len(result["items"]) == 5
+    assert all(item["node_id"].startswith("node-") for item in result["items"])
