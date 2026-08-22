@@ -70,9 +70,18 @@ for line in sys.stdin:
 
 
 class SupervisorClient:
-    def __init__(self, worker_path: pathlib.Path, project_root: pathlib.Path | None = None):
+    def __init__(
+        self,
+        worker_path: pathlib.Path,
+        project_root: pathlib.Path | None = None,
+        watch_paths: tuple[pathlib.Path, ...] = (),
+    ):
         environment = os.environ.copy()
         environment["NAPSEER_MCP_WORKER_PATH"] = str(worker_path)
+        if watch_paths:
+            environment["NAPSEER_MCP_WORKER_WATCH_PATHS"] = os.pathsep.join(
+                str(path) for path in watch_paths
+            )
         environment["NAPSEER_MCP_RESPONSE_TIMEOUT_SECONDS"] = "5"
         environment["NAPSEER_TELEMETRY"] = "0"
         if project_root is not None:
@@ -268,6 +277,33 @@ def test_reloads_replaced_worker_between_requests(tmp_path):
         os.utime(worker_path, None)
 
         assert client.request(2, "tools/list")["result"]["version"] == 2
+    finally:
+        client.close()
+
+
+def test_reloads_stable_launcher_when_watched_runtime_is_replaced(tmp_path):
+    runtime_path = tmp_path / "runtime.py"
+    launcher_path = tmp_path / "launcher.py"
+    write_worker(runtime_path, 1)
+    launcher_path.write_text(
+        "import runpy\n"
+        f"runpy.run_path({str(runtime_path)!r}, run_name='__main__')\n",
+        encoding="utf-8",
+    )
+    client = SupervisorClient(launcher_path, watch_paths=(runtime_path,))
+    try:
+        first = client.request(1, "initialize")
+        launcher_identity = launcher_path.stat().st_mtime_ns
+
+        time.sleep(0.01)
+        write_worker(runtime_path, 2)
+        os.utime(runtime_path, None)
+
+        second = client.request(2, "tools/list")
+
+        assert first["result"]["version"] == 1
+        assert second["result"]["version"] == 2
+        assert launcher_path.stat().st_mtime_ns == launcher_identity
     finally:
         client.close()
 

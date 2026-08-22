@@ -12,7 +12,8 @@ session. This supervisor owns those client-facing pipes while treating
   notification to the worker;
 - a worker exit fails every affected in-flight request once and never replays
   it automatically;
-- a replaced worker is reloaded at the next quiescent request boundary.
+- a replaced worker, or an explicitly configured runtime dependency behind a
+  stable launcher, is reloaded at the next quiescent request boundary.
 
 The supervisor never logs MCP payloads, tool results, auth state, or child
 stderr. Protocol stdout contains JSON-RPC messages only.
@@ -39,6 +40,11 @@ WORKER_PATH = pathlib.Path(
         pathlib.Path(__file__).resolve().with_name("napseer_mcp_server.py"),
     )
 ).expanduser()
+WORKER_WATCH_PATHS = tuple(
+    pathlib.Path(value).expanduser()
+    for value in os.environ.get("NAPSEER_MCP_WORKER_WATCH_PATHS", "").split(os.pathsep)
+    if value.strip()
+)
 RESPONSE_TIMEOUT_SECONDS = max(
     1,
     int(os.environ.get("NAPSEER_MCP_RESPONSE_TIMEOUT_SECONDS", "60")),
@@ -58,6 +64,15 @@ class WorkerUnavailable(RuntimeError):
 def source_identity(path: pathlib.Path) -> tuple[int, int, int]:
     stat = path.stat()
     return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def runtime_identity(
+    worker_path: pathlib.Path,
+    watch_paths: tuple[pathlib.Path, ...] = (),
+) -> tuple[tuple[int, int, int], ...]:
+    """Identify every source whose replacement changes the worker runtime."""
+
+    return tuple(source_identity(path) for path in (worker_path, *watch_paths))
 
 
 def parse_message(message: bytes):
@@ -121,10 +136,16 @@ class PendingRequest:
 
 
 class Worker:
-    def __init__(self, path: pathlib.Path, unsolicited: Callable[[bytes], None] | None = None):
+    def __init__(
+        self,
+        path: pathlib.Path,
+        unsolicited: Callable[[bytes], None] | None = None,
+        watch_paths: tuple[pathlib.Path, ...] = (),
+    ):
         self.path = path
+        self.watch_paths = tuple(watch_paths)
         self.process: subprocess.Popen[bytes] | None = None
-        self.identity: tuple[int, int, int] | None = None
+        self.identity: tuple[tuple[int, int, int], ...] | None = None
         self.generation = 0
         self.unsolicited = unsolicited
         self._lifecycle_lock = threading.RLock()
@@ -237,7 +258,7 @@ class Worker:
         with self._lifecycle_lock:
             self._stop_locked()
             try:
-                identity = source_identity(self.path)
+                identity = runtime_identity(self.path, self.watch_paths)
                 process = subprocess.Popen(
                     [sys.executable, "-u", str(self.path)],
                     stdin=subprocess.PIPE,
@@ -275,7 +296,7 @@ class Worker:
     def ensure_current(self) -> None:
         with self._lifecycle_lock:
             try:
-                current_identity = source_identity(self.path)
+                current_identity = runtime_identity(self.path, self.watch_paths)
             except OSError as exc:
                 self._stop_locked()
                 raise WorkerUnavailable("Napseer MCP worker is missing") from exc
@@ -361,7 +382,11 @@ def supervise() -> int:
             sys.stdout.buffer.write(response if response.endswith(b"\n") else response + b"\n")
             sys.stdout.buffer.flush()
 
-    worker = Worker(WORKER_PATH, unsolicited=emit)
+    worker = Worker(
+        WORKER_PATH,
+        unsolicited=emit,
+        watch_paths=WORKER_WATCH_PATHS,
+    )
     waiters = concurrent.futures.ThreadPoolExecutor(
         max_workers=MAX_IN_FLIGHT_REQUESTS,
         thread_name_prefix="napseer-mcp-request",

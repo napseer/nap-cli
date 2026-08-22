@@ -46,6 +46,12 @@ directory, add a trusted project `.codex/config.toml` override with both
 `cwd` and `NAPSEER_PROJECT_ROOT`. MCP processes inherit their launch directory;
 they cannot infer a later client workspace switch over stdio.
 
+If `NAPSEER_MCP_WORKER_PATH` points to a stable launcher that loads a separate,
+replaceable runtime, set `NAPSEER_MCP_WORKER_WATCH_PATHS` to the
+`os.pathsep`-separated runtime paths. The supervisor then reloads the launcher
+after any watched runtime is atomically replaced, preserving the same bounded,
+non-replaying request lifecycle used for direct workers.
+
 The public operator surface is intentionally small:
 
 ```text
