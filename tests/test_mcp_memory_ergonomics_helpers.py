@@ -263,6 +263,11 @@ def test_tools_include_node_by_path_descriptor(mod):
     assert "node_id" in get_tool["inputSchema"]["properties"]
     assert "uri" in get_tool["inputSchema"]["properties"]
     assert "path" not in get_tool["inputSchema"]["properties"]
+    assert "node_id returned by nap_discover" in get_tool["description"]
+
+    discover_tool = next(item for item in mod.tools() if item["name"] == "nap_discover")
+    assert "node_id on every row" in discover_tool["description"]
+    assert "directly to nap_node_get" in discover_tool["description"]
 
     tool = next(item for item in mod.tools() if item["name"] == "nap_node_by_path")
     assert tool["inputSchema"]["required"] == ["path"]

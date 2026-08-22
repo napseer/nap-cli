@@ -15726,14 +15726,17 @@ def all_tools():
         if canonical_name == "nap_discover":
             item["description"] = (
                 "Discover compact project memory with keywords, structured filters, "
-                "deterministic sorting, and returned-item facets. Omit q with "
-                "sort='updated_desc' for recent memory."
+                "deterministic sorting, returned-item facets, and node_id on every row. "
+                "Pass a selected row's node_id directly to nap_node_get; use "
+                "nap_node_by_path only for an external path without identity. Omit q "
+                "with sort='updated_desc' for recent memory."
             )
         if canonical_name == "nap_node_get":
             item["description"] = (
-                "Read one node by canonical node_id or nap:// URI. Use content for a lean "
-                "reading view, outline for headings without the body, or edit to obtain "
-                "revision and read_fingerprint before nap_node_patch."
+                "Read one node by canonical node_id or nap:// URI, including node_id "
+                "returned by nap_discover. Use content for a lean reading view, outline "
+                "for headings without the body, or edit to obtain revision and "
+                "read_fingerprint before nap_node_patch."
             )
         category = tool_category(canonical_name)
         if not item.get("description", "").startswith("["):
