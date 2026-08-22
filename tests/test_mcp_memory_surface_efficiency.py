@@ -123,6 +123,67 @@ def test_local_context_returns_title_radius_without_node_bodies(mod):
     assert result["source"] == "local_index"
 
 
+def test_hybrid_context_falls_back_until_local_graph_coverage_is_complete(mod):
+    state = tempfile.TemporaryDirectory()
+    mod._surface_fallback_state = state
+    mod.AUTH_DIR = pathlib.Path(state.name)
+    mod.INDEX_PATH = mod.AUTH_DIR / "index.sqlite"
+    mod.INDEX_LOCK_PATH = mod.AUTH_DIR / "index.sqlite.lock"
+    mod.index_node({
+        "id": "root", "project_id": "project-1", "full_path": "/docs/root",
+        "folder_path": "/docs", "name": "root", "type": "note",
+        "metadata": {"title": "Root"}, "tags": [], "links": [],
+        "content_text": "body", "updated_at": "2026-08-16T12:00:00Z",
+    })
+    calls = []
+
+    def server_context(_args, seed_ids):
+        calls.append(seed_ids)
+        return {"ok": True, "nodes": [{"id": "root"}], "edges": [], "source": "server"}
+
+    mod.server_memory_context = server_context
+
+    result = mod.get_memory_context({"node_id": "root", "mode": "hybrid"})
+
+    assert result["source"] == "server"
+    assert result["local_fallback"]
+    assert calls == [["root"]]
+
+
+def test_index_sync_upgrades_pre_graph_index_with_full_reindex(mod):
+    state = tempfile.TemporaryDirectory()
+    mod._surface_upgrade_state = state
+    mod.AUTH_DIR = pathlib.Path(state.name)
+    mod.INDEX_PATH = mod.AUTH_DIR / "index.sqlite"
+    mod.INDEX_LOCK_PATH = mod.AUTH_DIR / "index.sqlite.lock"
+    mod.index_node({
+        "id": "old", "project_id": "project-1", "full_path": "/docs/old",
+        "folder_path": "/docs", "name": "old", "type": "note",
+        "metadata": {}, "tags": [], "links": [], "content_text": "old",
+        "updated_at": "2026-08-16T12:00:00Z",
+    })
+    fresh = {
+        "id": "fresh", "project_id": "project-1", "full_path": "/docs/fresh",
+        "folder_path": "/docs", "name": "fresh", "type": "note",
+        "metadata": {}, "tags": [],
+        "links": [{"node_id": "target", "relation": "references"}],
+        "content_text": "fresh", "updated_at": "2026-08-16T12:01:00Z",
+    }
+    mod.request_json = lambda *_args, **_kwargs: {"items": [fresh], "next_cursor": None}
+
+    result = mod.sync_local_index({})
+
+    assert result["mode"] == "full_reindex"
+    assert result["reason"] == "local_graph_index_incomplete"
+    assert result["graph_complete"] is True
+    assert result["index"]["graph_complete"] is True
+    with mod.index_connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM local_index_edges WHERE project_id = ?",
+            ("project-1",),
+        ).fetchone()[0] == 1
+
+
 def test_discovery_sort_and_returned_item_facets(mod):
     mod.list_project_nodes = lambda args: {
         "items": [

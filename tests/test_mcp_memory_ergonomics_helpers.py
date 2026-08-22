@@ -781,7 +781,8 @@ def test_index_status_reports_sync_high_water_mark(mod):
         status = mod.index_status({})
         assert status["count"] == 1
         assert status["latest_node_updated_at"] == "2026-05-06T12:00:00Z"
-        assert status["sync_recommended"] is False
+        assert status["graph_complete"] is False
+        assert status["sync_recommended"] is True
 
 
 def test_index_sync_fetches_incremental_changes_and_removes_archived_nodes(mod):
@@ -794,6 +795,7 @@ def test_index_sync_fetches_incremental_changes_and_removes_archived_nodes(mod):
         existing["id"] = "existing-node"
         existing["updated_at"] = "2026-05-06T12:00:00Z"
         mod.index_node(existing)
+        mod.set_local_graph_index_complete("project-1", True)
 
         fresh = node("/notes/fresh", "active", content="fresh sync needle")
         fresh["id"] = "fresh-node"
@@ -817,6 +819,8 @@ def test_index_sync_fetches_incremental_changes_and_removes_archived_nodes(mod):
         assert result["seen"] == 2
         assert result["indexed"] == 1
         assert result["removed"] == 1
+        assert result["mode"] == "incremental"
+        assert result["index"]["graph_complete"] is True
         assert calls
         local = mod.search_local_index({"q": "fresh needle"})
         assert [item["id"] for item in local["items"]] == ["fresh-node"]

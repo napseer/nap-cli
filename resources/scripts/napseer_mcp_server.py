@@ -6228,6 +6228,15 @@ def index_connect():
         """
     )
     conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS local_index_state (
+            project_id TEXT PRIMARY KEY,
+            graph_complete INTEGER NOT NULL DEFAULT 0,
+            graph_completed_at TEXT
+        )
+        """
+    )
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS local_index_edges_source "
         "ON local_index_edges(project_id, source_node_id)"
     )
@@ -6258,6 +6267,52 @@ def index_connect():
     )
     chmod_best_effort(INDEX_PATH, 0o600)
     return conn
+
+
+def local_graph_index_state(project_id, conn=None):
+    def read(connection):
+        row = connection.execute(
+            "SELECT graph_complete, graph_completed_at "
+            "FROM local_index_state WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        return {
+            "graph_complete": bool(row and row["graph_complete"]),
+            "graph_completed_at": row["graph_completed_at"] if row else None,
+        }
+
+    if conn is not None:
+        return read(conn)
+    with index_connect() as connection:
+        return read(connection)
+
+
+def set_local_graph_index_complete(project_id, complete, conn=None):
+    completed_at = iso_now() if complete else None
+
+    def write(connection):
+        connection.execute(
+            """
+            INSERT INTO local_index_state (
+                project_id, graph_complete, graph_completed_at
+            )
+            VALUES (?, ?, ?)
+            ON CONFLICT(project_id) DO UPDATE SET
+                graph_complete = excluded.graph_complete,
+                graph_completed_at = excluded.graph_completed_at
+            """,
+            (project_id, 1 if complete else 0, completed_at),
+        )
+
+    if conn is not None:
+        write(conn)
+        return
+    lock = index_file_lock()
+    try:
+        with index_connect() as connection:
+            write(connection)
+    finally:
+        release_index_file_lock(lock)
 
 
 def flatten_index_values(value):
@@ -6586,6 +6641,11 @@ def local_index_diagnostics(project_id, conn=None):
                 "sync_recommended": count == 0,
             }
         )
+        graph_state = local_graph_index_state(project_id, connection)
+        diagnostics.update(graph_state)
+        diagnostics["sync_recommended"] = bool(
+            diagnostics["sync_recommended"] or not graph_state["graph_complete"]
+        )
         return diagnostics
 
     if conn is not None:
@@ -6682,7 +6742,7 @@ def reindex_project(args):
     nodes = []
     cursor = None
     while True:
-        query = {"limit": limit}
+        query = {"limit": limit, "view": "full"}
         if cursor:
             query["cursor"] = cursor
         page = request_json("GET", f"/v1/projects/{project_id}/nodes?{rest_query_string(query)}")
@@ -6693,13 +6753,21 @@ def reindex_project(args):
     lock = index_file_lock()
     try:
         with index_connect() as conn:
+            set_local_graph_index_complete(project_id, False, conn)
             conn.execute("DELETE FROM local_index_fts WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM local_index_edges WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM local_index_nodes WHERE project_id = ?", (project_id,))
     finally:
         release_index_file_lock(lock)
     for node in nodes:
         index_node(node)
-    return {"project_id": project_id, "indexed": len(nodes), "index_path": str(INDEX_PATH)}
+    set_local_graph_index_complete(project_id, True)
+    return {
+        "project_id": project_id,
+        "indexed": len(nodes),
+        "index_path": str(INDEX_PATH),
+        "graph_complete": True,
+    }
 
 
 def sync_local_index(args):
@@ -6709,6 +6777,15 @@ def sync_local_index(args):
     include_archived = as_bool(args.get("include_archived"), True)
     lookback_seconds = normalize_int(args.get("lookback_seconds"), 5, 0, 3600)
     status_before = local_index_diagnostics(project_id)
+    if not status_before.get("graph_complete"):
+        result = reindex_project({**args, "project_id": project_id, "limit": limit})
+        return {
+            **result,
+            "status": "synced",
+            "mode": "full_reindex",
+            "reason": "local_graph_index_incomplete",
+            "index": local_index_diagnostics(project_id),
+        }
     latest_node_updated_at = status_before.get("latest_node_updated_at")
     updated_after = args.get("updated_after") or iso_minus_seconds(latest_node_updated_at, lookback_seconds)
     nodes = []
@@ -6766,7 +6843,9 @@ def clear_local_index(args):
     try:
         with index_connect() as conn:
             conn.execute("DELETE FROM local_index_fts WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM local_index_edges WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM local_index_nodes WHERE project_id = ?", (project_id,))
+            set_local_graph_index_complete(project_id, False, conn)
     finally:
         release_index_file_lock(lock)
     return {"project_id": project_id, "cleared": True}
@@ -11000,6 +11079,7 @@ def local_memory_context(args, seed_ids):
     if direction not in {"outgoing", "incoming", "both"}:
         raise RuntimeError("direction must be outgoing, incoming, or both")
     with index_connect() as conn:
+        graph_state = local_graph_index_state(project_id, conn)
         def node_row(node_id=None, path=None):
             if node_id:
                 return conn.execute(
@@ -11088,6 +11168,11 @@ def local_memory_context(args, seed_ids):
             queue = unique_preserve_order(next_ids)
             if not queue:
                 break
+        warnings = []
+        if not graph_state["graph_complete"]:
+            warnings.append(
+                "Local graph index coverage is incomplete; run nap index sync before relying on local-only neighborhoods."
+            )
         return {
             "ok": True,
             "seed_node_ids": [row["node_id"] for row in seed_rows],
@@ -11099,8 +11184,8 @@ def local_memory_context(args, seed_ids):
             "truncated": bool(truncation_reasons),
             "truncation_reasons": truncation_reasons,
             "source": "local_index",
-            "freshness": {"indexed_at": indexed_at},
-            "warnings": [],
+            "freshness": {"indexed_at": indexed_at, **graph_state},
+            "warnings": warnings,
             "view": "titles",
         }
 
@@ -11155,6 +11240,13 @@ def get_memory_context(args):
         raise RuntimeError("mode must be hybrid, local, or server")
     if mode in {"local", "hybrid"}:
         try:
+            if mode == "hybrid":
+                project_id = resolve_project_id(args)
+                graph_state = local_graph_index_state(project_id)
+                if not graph_state["graph_complete"]:
+                    raise RuntimeError(
+                        "local graph index coverage is incomplete; run nap index sync"
+                    )
             return local_memory_context(args, seed_ids)
         except Exception as exc:
             if mode == "local":
