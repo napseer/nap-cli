@@ -30,7 +30,14 @@ def test_natural_language_discovery_uses_one_backend_search_request(tmp_path):
 
     def request(method, path, payload=None, **_kwargs):
         calls.append((method, path, payload))
-        return {"items": [], "next_cursor": None, "query_analysis": {"mode": "terms"}}
+        return {
+            "items": [],
+            "next_cursor": None,
+            "query_analysis": {"mode": "terms"},
+            "search_strategy": "identity_fts",
+            "search_coverage": "identity_only",
+            "search_projection": "postgres_identity_v1",
+        }
 
     mod.request_json = request
 
@@ -46,6 +53,9 @@ def test_natural_language_discovery_uses_one_backend_search_request(tmp_path):
     assert len(calls) == 1
     assert calls[0][0] == "GET"
     assert "/nodes?" in calls[0][1]
+    assert result["search_strategy"] == "identity_fts"
+    assert result["search_coverage"] == "identity_only"
+    assert result["search_projection"] == "postgres_identity_v1"
 
 
 def test_sparse_index_search_latency_does_not_scale_with_query_variants(tmp_path):
@@ -102,7 +112,7 @@ def test_complete_local_search_skips_remote_encryption_preflight_and_search(tmp_
         "items": items,
         "query": {"terms": ["result"]},
         "search_strategies": [],
-        "index": {"exists": True, "graph_complete": True},
+        "index": {"exists": True, "graph_complete": True, "used": True},
     }
 
     def unexpected_request(*_args, **_kwargs):
@@ -112,6 +122,9 @@ def test_complete_local_search_skips_remote_encryption_preflight_and_search(tmp_
     result = mod.search_memory({"q": "result", "limit": 5, "view": "summary"})
 
     assert result["sources"] == ["local"]
+    assert result["search_strategy"] == "local_fts"
+    assert result["search_coverage"] == "identity_and_local_body"
+    assert result["search_projection"] == "sqlite_fts5_current"
     assert len(result["items"]) == 5
     assert all(item["node_id"].startswith("node-") for item in result["items"])
 

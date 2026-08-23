@@ -5929,7 +5929,21 @@ def node_route_reference(node):
     return {key: value for key, value in item.items() if value not in (None, "")}
 
 
-def discovery_envelope(project_id, items, args, *, view=None, next_cursor=None, has_more=None, diagnostics=None, query_analysis=None, warnings=None):
+def discovery_envelope(
+    project_id,
+    items,
+    args,
+    *,
+    view=None,
+    next_cursor=None,
+    has_more=None,
+    diagnostics=None,
+    query_analysis=None,
+    warnings=None,
+    search_strategy=None,
+    search_coverage=None,
+    search_projection=None,
+):
     view = view or normalize_discovery_view(args)[0]
     limit = normalize_int(args.get("limit"), DISCOVERY_DEFAULT_LIMIT, 1, discovery_max_limit(view))
     preview_chars = normalize_int(args.get("preview_chars"), 240, 80, 1000)
@@ -5945,6 +5959,12 @@ def discovery_envelope(project_id, items, args, *, view=None, next_cursor=None, 
         "omitted_fields": [] if view == "full" else ["content_text"],
         "budget": {"limit": limit, "max_limit": discovery_max_limit(view), "preview_chars": preview_chars},
     }
+    if search_strategy:
+        response["search_strategy"] = search_strategy
+    if search_coverage:
+        response["search_coverage"] = search_coverage
+    if search_projection:
+        response["search_projection"] = search_projection
     if as_bool(args.get("verbose"), False):
         if query_analysis is not None:
             response["query_analysis"] = query_analysis
@@ -9661,6 +9681,9 @@ def list_project_nodes(args):
         diagnostics=diagnostics,
         query_analysis=query_analysis,
         warnings=view_warnings + filters["warnings"],
+        search_strategy=result.get("search_strategy"),
+        search_coverage=result.get("search_coverage"),
+        search_projection=result.get("search_projection"),
     )
 
 
@@ -11643,6 +11666,7 @@ def search_memory(args):
     encryption_state = project_encryption_state(project_id)
     collected = []
     sources = []
+    server_search = {}
     diagnostics = {
         "query": query_analysis,
         "local_index": local_index_diagnostics(project_id),
@@ -11692,6 +11716,11 @@ def search_memory(args):
         # calls, especially on a new/sparse local index.
         remaining = max(1, limit - len(local_filtered))
         server_result = list_project_nodes({**args, "q": q, "limit": remaining, "view": view})
+        server_search = {
+            key: server_result.get(key)
+            for key in ("search_strategy", "search_coverage", "search_projection")
+            if server_result.get(key)
+        }
         server = server_result.get("items", [])
         diagnostics["server_queries"].append({"q": q, "matched": len(server)})
         for node in server:
@@ -11719,6 +11748,19 @@ def search_memory(args):
     response["mode"] = mode
     response["encryption_state"] = encryption_state
     response["sources"] = sources
+    local_used = bool((diagnostics.get("local_index") or {}).get("used"))
+    if local_used and server_needed:
+        response["search_strategy"] = "fused"
+        response["search_coverage"] = "identity_and_local_body"
+        response["search_projection"] = "+".join(
+            filter(None, ["sqlite_fts5_current", server_search.get("search_projection")])
+        )
+    elif local_used:
+        response["search_strategy"] = "local_fts"
+        response["search_coverage"] = "identity_and_local_body"
+        response["search_projection"] = "sqlite_fts5_current"
+    elif server_needed:
+        response.update(server_search)
     return response
 
 
