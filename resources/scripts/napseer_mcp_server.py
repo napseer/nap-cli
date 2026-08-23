@@ -5873,7 +5873,11 @@ def summarize_node(node, view="summary", preview_chars=240):
         "created_at": node.get("created_at"),
         "metadata_summary": metadata_summary(node),
         "updated_at": node.get("updated_at"),
-        "links_count": len(node.get("links") or []) if isinstance(node.get("links"), list) else 0,
+        "links_count": (
+            node.get("links_count")
+            if node.get("links_count") is not None
+            else len(node.get("links") or []) if isinstance(node.get("links"), list) else 0
+        ),
         "archived": node_archived(node),
     }
     content = node.get("snippet") or node.get("preview") or node.get("content_text")
@@ -6204,14 +6208,23 @@ def request_project_write(method, path, payload, project_id, purpose, scope_type
     )
 
 
-def index_file_lock():
+INDEX_SCHEMA_INIT_LOCK = threading.Lock()
+INDEX_SCHEMA_READY = {}
+
+
+def raw_index_file_lock(*, shared=False):
     AUTH_DIR.mkdir(exist_ok=True)
     chmod_best_effort(AUTH_DIR, 0o700)
     handle = INDEX_LOCK_PATH.open("a+b")
     chmod_best_effort(INDEX_LOCK_PATH, 0o600)
     if fcntl is not None:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
     return handle
+
+
+def index_file_lock(*, shared=False):
+    ensure_index_schema()
+    return raw_index_file_lock(shared=shared)
 
 
 def release_index_file_lock(handle):
@@ -6231,12 +6244,16 @@ def ensure_sqlite_column(conn, table, column, declaration):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
 
-def index_connect():
+def open_index_connection():
     AUTH_DIR.mkdir(exist_ok=True)
     chmod_best_effort(AUTH_DIR, 0o700)
     conn = sqlite3.connect(str(INDEX_PATH), timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
+def initialize_index_schema(conn):
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute(
         """
@@ -6355,8 +6372,38 @@ def index_connect():
         )
         """
     )
-    chmod_best_effort(INDEX_PATH, 0o600)
-    return conn
+
+
+def index_storage_identity():
+    try:
+        stat = INDEX_PATH.stat()
+        return (stat.st_dev, stat.st_ino)
+    except FileNotFoundError:
+        return None
+
+
+def ensure_index_schema():
+    key = str(INDEX_PATH.resolve())
+    identity = index_storage_identity()
+    if identity is not None and INDEX_SCHEMA_READY.get(key) == identity:
+        return
+    with INDEX_SCHEMA_INIT_LOCK:
+        identity = index_storage_identity()
+        if identity is not None and INDEX_SCHEMA_READY.get(key) == identity:
+            return
+        lock = raw_index_file_lock()
+        try:
+            with open_index_connection() as conn:
+                initialize_index_schema(conn)
+            chmod_best_effort(INDEX_PATH, 0o600)
+            INDEX_SCHEMA_READY[key] = index_storage_identity()
+        finally:
+            release_index_file_lock(lock)
+
+
+def index_connect():
+    ensure_index_schema()
+    return open_index_connection()
 
 
 def local_graph_index_state(project_id, conn=None):
@@ -7009,12 +7056,8 @@ def local_index_diagnostics(project_id, conn=None):
 
     if conn is not None:
         return read(conn)
-    lock = index_file_lock()
-    try:
-        with index_connect() as connection:
-            return read(connection)
-    finally:
-        release_index_file_lock(lock)
+    with index_connect() as connection:
+        return read(connection)
 
 
 def search_local_index(args):
@@ -7024,9 +7067,7 @@ def search_local_index(args):
     limit = max(1, min(int(args.get("limit", 25)), 100))
     candidate_limit = min(max(limit * 3, 30), 200)
     filters = status_filter_from_args(args)
-    lock = index_file_lock()
-    try:
-        with index_connect() as conn:
+    with index_connect() as conn:
             diagnostics = local_index_diagnostics(project_id, conn)
             variant = variants[0]
             where = ["local_index_fts MATCH ?", "n.project_id = ?"]
@@ -7155,8 +7196,6 @@ def search_local_index(args):
                 "search_strategies": attempts,
                 "index": diagnostics,
             }
-    finally:
-        release_index_file_lock(lock)
 
 
 def reindex_project(args):
@@ -9645,6 +9684,261 @@ def get_backlinks_by_path(args):
     return {"target": {"id": target["id"], "full_path": target["full_path"]}, **backlinks}
 
 
+LOCAL_BROWSE_CURSOR_PREFIX = "li1."
+
+
+def normalize_discovery_sort(args, *, queried=False):
+    default = "relevance" if queried else "updated_desc"
+    sort = str(args.get("sort") or default).strip().lower()
+    if sort not in {"relevance", "updated_desc", "updated_asc", "title_asc"}:
+        raise RuntimeError("sort must be relevance, updated_desc, updated_asc, or title_asc")
+    if not queried and sort == "relevance":
+        sort = "updated_desc"
+    return sort
+
+
+def local_browse_cursor_fingerprint(project_id, args, view, sort, filters):
+    shape = {
+        "project_id": project_id,
+        "view": view,
+        "sort": sort,
+        "folder_path": args.get("folder_path"),
+        "tag": args.get("tag"),
+        "type": args.get("type"),
+        "updated_after": args.get("updated_after"),
+        "updated_before": args.get("updated_before"),
+        "status": sorted(filters.get("status") or []),
+        "exclude_status": sorted(filters.get("exclude_status") or []),
+        "active_only": bool(filters.get("active_only")),
+        "include_archived": as_bool(args.get("include_archived"), False),
+        "archived_only": as_bool(args.get("archived_only"), False),
+    }
+    canonical = json.dumps(shape, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+
+
+def encode_local_browse_cursor(fingerprint, sort, row):
+    if sort == "title_asc":
+        key = [
+            str(row.get("_cursor_title_key") or row.get("title") or row.get("name") or "").lower(),
+            row["id"],
+        ]
+    else:
+        key = [row.get("updated_at") or "", row["id"]]
+    payload = json.dumps(
+        {"fp": fingerprint, "sort": sort, "key": key},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return LOCAL_BROWSE_CURSOR_PREFIX + base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def decode_local_browse_cursor(cursor, fingerprint, sort):
+    if not cursor:
+        return None
+    text = str(cursor).strip()
+    if not text.startswith(LOCAL_BROWSE_CURSOR_PREFIX):
+        return None
+    encoded = text[len(LOCAL_BROWSE_CURSOR_PREFIX):]
+    if not encoded or len(encoded) > 4096:
+        raise RuntimeError("local discovery cursor is invalid")
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode((encoded + padding).encode("ascii")))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        raise RuntimeError("local discovery cursor is invalid") from None
+    key = payload.get("key") if isinstance(payload, dict) else None
+    if payload.get("fp") != fingerprint or payload.get("sort") != sort:
+        raise RuntimeError("local discovery cursor filters do not match request")
+    if not isinstance(key, list) or len(key) != 2 or not all(isinstance(value, str) for value in key):
+        raise RuntimeError("local discovery cursor is invalid")
+    return key
+
+
+def browse_local_index(args, *, view, sort):
+    args = normalize_discovery_ranges(args)
+    project_id = resolve_project_id(args)
+    limit = normalize_int(args.get("limit"), DISCOVERY_DEFAULT_LIMIT, 1, discovery_max_limit(view))
+    filters = status_filter_from_args(args)
+    fingerprint = local_browse_cursor_fingerprint(project_id, args, view, sort, filters)
+    cursor_key = decode_local_browse_cursor(args.get("cursor"), fingerprint, sort)
+
+    with index_connect() as conn:
+        diagnostics = local_index_diagnostics(project_id, conn)
+        if not diagnostics.get("graph_complete"):
+            raise RuntimeError("local compact discovery requires a complete local index snapshot")
+
+        where = ["n.project_id = ?", "n.archived = 0"]
+        parameters = [project_id]
+        if args.get("folder_path") not in (None, ""):
+            where.append("n.folder_path = ?")
+            parameters.append(str(args["folder_path"]))
+        if args.get("type") not in (None, ""):
+            where.append("n.node_type = ?")
+            parameters.append(str(args["type"]))
+        if args.get("tag") not in (None, ""):
+            where.append(
+                "EXISTS (SELECT 1 FROM local_index_node_tags t "
+                "WHERE t.project_id = n.project_id AND t.node_id = n.node_id AND t.tag = ?)"
+            )
+            parameters.append(str(args["tag"]))
+        if args.get("updated_after"):
+            where.append("n.updated_at > ?")
+            parameters.append(args["updated_after"])
+        if args.get("updated_before"):
+            where.append("n.updated_at < ?")
+            parameters.append(args["updated_before"])
+        statuses = filters.get("status") or []
+        if statuses:
+            where.append(f"n.status IN ({','.join('?' for _ in statuses)})")
+            parameters.extend(statuses)
+        excluded = list(filters.get("exclude_status") or [])
+        if filters.get("active_only"):
+            excluded = unique_preserve_order(excluded + sorted(ACTIVE_EXCLUDED_STATUSES))
+        if excluded:
+            where.append(f"COALESCE(n.status, '') NOT IN ({','.join('?' for _ in excluded)})")
+            parameters.extend(excluded)
+
+        title_key = "LOWER(COALESCE(NULLIF(n.title, ''), n.name))"
+        if cursor_key:
+            value, node_id = cursor_key
+            if sort == "updated_desc":
+                where.append("(n.updated_at < ? OR (n.updated_at = ? AND n.node_id > ?))")
+                parameters.extend([value, value, node_id])
+            elif sort == "updated_asc":
+                where.append("(n.updated_at > ? OR (n.updated_at = ? AND n.node_id > ?))")
+                parameters.extend([value, value, node_id])
+            else:
+                where.append(f"({title_key} > ? OR ({title_key} = ? AND n.node_id > ?))")
+                parameters.extend([value, value, node_id])
+
+        if sort == "updated_asc":
+            order_by = "n.updated_at ASC, n.node_id ASC"
+        elif sort == "title_asc":
+            order_by = f"{title_key} ASC, n.node_id ASC"
+        else:
+            order_by = "n.updated_at DESC, n.node_id ASC"
+        parameters.append(limit + 1)
+        rows = conn.execute(
+            f"""
+            SELECT n.node_id, n.project_id, n.full_path, n.name, n.folder_path,
+                   n.node_type, n.tags_json, n.updated_at, n.indexed_at,
+                   n.title, n.status, n.archived, {title_key} AS title_sort_key,
+                   (SELECT COUNT(*) FROM local_index_edges e
+                    WHERE e.project_id = n.project_id AND e.source_node_id = n.node_id) AS links_count
+            FROM local_index_nodes n
+            WHERE {' AND '.join(where)}
+            ORDER BY {order_by}
+            LIMIT ?
+            """,
+            parameters,
+        ).fetchall()
+
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        items = []
+        for row in page_rows:
+            status = row["status"]
+            item = {
+                "id": row["node_id"],
+                "node_id": row["node_id"],
+                "project_id": row["project_id"],
+                "full_path": row["full_path"],
+                "name": row["name"],
+                "title": row["title"],
+                "_cursor_title_key": row["title_sort_key"],
+                "folder_path": row["folder_path"],
+                "type": row["node_type"],
+                "tags": json.loads(row["tags_json"] or "[]"),
+                "status": status,
+                "metadata_summary": {"status": status} if status else {},
+                "links_count": row["links_count"],
+                "archived": bool(row["archived"]),
+                "updated_at": row["updated_at"],
+                "indexed_at": row["indexed_at"],
+                "search_source": "local",
+            }
+            items.append(item)
+
+        next_cursor = None
+        if has_more and items:
+            next_cursor = encode_local_browse_cursor(fingerprint, sort, items[-1])
+        diagnostics["used"] = True
+        diagnostics["returned"] = len(items)
+        diagnostics["query_count"] = 1
+        diagnostics["cursor_contract"] = "local_identity_keyset_v1"
+
+    response = discovery_envelope(
+        project_id,
+        items,
+        {**args, "limit": limit},
+        view=view,
+        next_cursor=next_cursor,
+        has_more=has_more,
+        diagnostics={"local_index": diagnostics},
+        warnings=filters["warnings"],
+        search_strategy="local_snapshot_browse",
+        search_coverage="identity_status_tags_links",
+        search_projection="sqlite_compact_identity_v1",
+    )
+    response["source"] = "local_index"
+    response["sources"] = ["local"]
+    response["freshness"] = {
+        "latest_indexed_at": diagnostics.get("latest_indexed_at"),
+        "latest_node_updated_at": diagnostics.get("latest_node_updated_at"),
+        "graph_complete": diagnostics.get("graph_complete"),
+        "graph_completed_at": diagnostics.get("graph_completed_at"),
+    }
+    if view == "summary":
+        response["omitted_fields"] = unique_preserve_order(
+            response.get("omitted_fields", [])
+            + ["created_at", "preview", "metadata_summary_except_status"]
+        )
+    return response
+
+
+def browse_project_nodes(args, *, default_view="summary"):
+    args = normalize_discovery_ranges(args)
+    view, _warnings = normalize_discovery_view(args, default=default_view)
+    mode = str(args.get("mode") or "hybrid").strip().lower()
+    if mode not in {"hybrid", "server", "local"}:
+        raise RuntimeError("mode must be hybrid, server, or local")
+    sort = normalize_discovery_sort(args, queried=False)
+    cursor = str(args.get("cursor") or "").strip()
+    local_cursor = cursor.startswith(LOCAL_BROWSE_CURSOR_PREFIX)
+    if mode == "server" and local_cursor:
+        raise RuntimeError("local discovery cursor cannot be used in explicit server mode")
+
+    local_contract_supported = (
+        mode != "server"
+        and view in {"titles", "paths", "summary"}
+        and not as_bool(args.get("include_archived"), False)
+        and not as_bool(args.get("archived_only"), False)
+        and (not cursor or local_cursor)
+    )
+    if not local_contract_supported:
+        if local_cursor:
+            raise RuntimeError("local discovery cursor requires the same complete local snapshot routing")
+        if mode == "local":
+            raise RuntimeError(
+                "local compact discovery requires a complete active-node index and titles, paths, or summary view"
+            )
+        return list_project_nodes(args)
+
+    diagnostics = local_index_diagnostics(resolve_project_id(args))
+    local_supported = bool(diagnostics.get("graph_complete"))
+    if local_supported:
+        return browse_local_index(args, view=view, sort=sort)
+    if local_cursor:
+        raise RuntimeError("local discovery cursor requires the same complete local snapshot routing")
+    if mode == "local":
+        raise RuntimeError(
+            "local compact discovery requires a complete active-node index and titles, paths, or summary view"
+        )
+    return list_project_nodes(args)
+
+
 def list_project_nodes(args):
     args = normalize_discovery_ranges(args)
     project_id = resolve_project_id(args)
@@ -11772,7 +12066,7 @@ def recent_memory(args):
     for key in ["folder_path", "tag", "updated_before", "updated_after", "cursor"]:
         if args.get(key):
             query[key] = args[key]
-    return list_project_nodes(query)
+    return browse_project_nodes(query, default_view="paths")
 
 
 def discover_memory(args):
@@ -11782,11 +12076,12 @@ def discover_memory(args):
         result = search_memory({**args, "q": q, "view": args.get("view") or "summary"})
         result["tool_intent"] = "search"
     else:
-        result = list_project_nodes({**args, "view": args.get("view") or "summary"})
+        result = browse_project_nodes(
+            {**args, "view": args.get("view") or "summary"},
+            default_view="summary",
+        )
         result["tool_intent"] = "list"
-    sort = str(args.get("sort") or ("relevance" if q else "updated_desc")).strip().lower()
-    if sort not in {"relevance", "updated_desc", "updated_asc", "title_asc"}:
-        raise RuntimeError("sort must be relevance, updated_desc, updated_asc, or title_asc")
+    sort = normalize_discovery_sort(args, queried=bool(q))
     items = list(result.get("items") or [])
     if sort == "updated_desc":
         items.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
@@ -13801,6 +14096,7 @@ def raw_tools():
                     "updated_before": {"type": "string", "description": "RFC3339 timestamp or YYYY-MM-DD upper bound on updated_at."},
                     "since": {"type": "string", "description": "Alias for updated_after."},
                     "until": {"type": "string", "description": "Alias for updated_before."},
+                    "cursor": {"type": "string", "description": "Opaque cursor returned by the preceding call with the same filters, view, and sort."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                     "view": {"type": "string", "enum": ["titles", "paths", "summary", "metadata", "full"], "default": "summary"},
                     "mode": {"type": "string", "enum": ["hybrid", "server", "local"], "default": "hybrid"},
@@ -15235,10 +15531,15 @@ SIMPLIFIED_TOOL_PROPERTIES = {
         "type",
         "updated_after",
         "updated_before",
+        "cursor",
         "status",
         "include_archived",
+        "archived_only",
+        "active_only",
+        "exclude_status",
         "limit",
         "view",
+        "mode",
         "sort",
         "facets",
     },

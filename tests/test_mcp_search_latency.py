@@ -1,7 +1,11 @@
 import importlib.util
 import pathlib
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
 
 
 def load_module():
@@ -189,6 +193,181 @@ def test_single_pass_ranking_prefers_exact_canonical_identity(tmp_path):
             "candidate_limit": 30,
         }
     ]
+
+
+def test_complete_local_compact_browse_uses_keyset_cursor_without_http(tmp_path):
+    mod = load_module()
+    configure_local_index(mod, tmp_path)
+    for index in range(7):
+        item = indexed_node(
+            f"/plans/item-{index}",
+            node_type="plan",
+            tags=["performance"],
+            status="active",
+        )
+        item["updated_at"] = f"2026-08-2{index}T00:00:00Z"
+        mod.index_node(item)
+    mod.set_local_graph_index_complete("project-1", True)
+
+    def unexpected_request(*_args, **_kwargs):
+        raise AssertionError("complete local compact browse must not make an HTTP request")
+
+    mod.request_json = unexpected_request
+    first = mod.discover_memory(
+        {
+            "folder_path": "/plans",
+            "tag": "performance",
+            "limit": 3,
+            "view": "paths",
+        }
+    )
+    second = mod.discover_memory(
+        {
+            "folder_path": "/plans",
+            "tag": "performance",
+            "limit": 3,
+            "view": "paths",
+            "cursor": first["next_cursor"],
+        }
+    )
+
+    assert first["source"] == "local_index"
+    assert first["search_strategy"] == "local_snapshot_browse"
+    assert first["search_projection"] == "sqlite_compact_identity_v1"
+    assert first["freshness"]["graph_complete"] is True
+    assert first["next_cursor"].startswith(mod.LOCAL_BROWSE_CURSOR_PREFIX)
+    assert [item["updated_at"] for item in first["items"]] == sorted(
+        (item["updated_at"] for item in first["items"]), reverse=True
+    )
+    assert not ({item["node_id"] for item in first["items"]} & {item["node_id"] for item in second["items"]})
+    assert all(item["node_id"] for item in first["items"] + second["items"])
+
+
+def test_local_compact_browse_cursor_is_bound_to_filters(tmp_path):
+    mod = load_module()
+    configure_local_index(mod, tmp_path)
+    for index in range(3):
+        mod.index_node(indexed_node(f"/plans/item-{index}", node_type="plan"))
+    mod.set_local_graph_index_complete("project-1", True)
+
+    first = mod.discover_memory({"folder_path": "/plans", "limit": 1, "view": "summary"})
+    with pytest.raises(RuntimeError, match="cursor filters do not match"):
+        mod.discover_memory(
+            {
+                "folder_path": "/decisions",
+                "limit": 1,
+                "view": "summary",
+                "cursor": first["next_cursor"],
+            }
+        )
+
+
+def test_local_compact_browse_title_order_is_global_across_pages(tmp_path):
+    mod = load_module()
+    configure_local_index(mod, tmp_path)
+    for title in ["Zulu", "alpha", "Mike", "bravo"]:
+        item = indexed_node(f"/notes/{title}")
+        item["title"] = title
+        mod.index_node(item)
+    mod.set_local_graph_index_complete("project-1", True)
+
+    first = mod.discover_memory({"limit": 2, "view": "titles", "sort": "title_asc"})
+    second = mod.discover_memory(
+        {"limit": 2, "view": "titles", "sort": "title_asc", "cursor": first["next_cursor"]}
+    )
+
+    assert [item["title"] for item in first["items"] + second["items"]] == [
+        "alpha",
+        "bravo",
+        "Mike",
+        "Zulu",
+    ]
+
+
+def test_compact_browse_falls_back_once_when_local_contract_is_incomplete(tmp_path):
+    mod = load_module()
+    configure_local_index(mod, tmp_path)
+    mod.index_node(indexed_node("/plans/local", node_type="plan"))
+    calls = []
+
+    def request(method, path, payload=None, **_kwargs):
+        calls.append((method, path, payload))
+        return {"items": [], "next_cursor": None}
+
+    mod.request_json = request
+    result = mod.discover_memory({"folder_path": "/plans", "limit": 5, "view": "paths"})
+
+    assert result["ok"] is True
+    assert len(calls) == 1
+    assert calls[0][0] == "GET"
+    assert "/nodes?" in calls[0][1]
+    with pytest.raises(RuntimeError, match="complete active-node index"):
+        mod.discover_memory(
+            {"folder_path": "/plans", "limit": 5, "view": "paths", "mode": "local"}
+        )
+
+
+def test_local_search_reads_overlap_without_writer_file_lock(tmp_path):
+    mod = load_module()
+    configure_local_index(mod, tmp_path)
+    for index in range(4):
+        mod.index_node(indexed_node(f"/notes/result-{index}", content="shared needle"))
+    mod.set_local_graph_index_complete("project-1", True)
+
+    def unexpected_writer_lock(*_args, **_kwargs):
+        raise AssertionError("read-only local search must not acquire the writer file lock")
+
+    mod.index_file_lock = unexpected_writer_lock
+    original_rank = mod.rank_search_items
+    rendezvous = threading.Barrier(2)
+
+    def overlapping_rank(items, analysis, limit=None):
+        rendezvous.wait(timeout=1)
+        return original_rank(items, analysis, limit=limit)
+
+    mod.rank_search_items = overlapping_rank
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(mod.search_local_index, {"q": "shared needle", "limit": 2})
+            for _ in range(2)
+        ]
+        results = [future.result(timeout=2) for future in futures]
+
+    assert all(len(result["items"]) == 2 for result in results)
+
+
+def test_index_schema_initializes_once_and_revalidates_replacement(tmp_path):
+    mod = load_module()
+    configure_local_index(mod, tmp_path)
+    original_initialize = mod.initialize_index_schema
+    calls = []
+
+    def counted_initialize(conn):
+        calls.append(str(mod.INDEX_PATH))
+        return original_initialize(conn)
+
+    mod.initialize_index_schema = counted_initialize
+    with mod.index_connect():
+        pass
+    with mod.index_connect():
+        pass
+    assert len(calls) == 1
+
+    replacement = tmp_path / "replacement.sqlite"
+    replacement.touch()
+    replacement.replace(mod.INDEX_PATH)
+    with mod.index_connect():
+        pass
+    assert len(calls) == 2
+
+
+def test_discover_contract_advertises_local_routing_and_pagination():
+    mod = load_module()
+    tool = next(item for item in mod.tools() if item["name"] == "nap_discover")
+    properties = tool["inputSchema"]["properties"]
+
+    assert "cursor" in properties
+    assert properties["mode"]["enum"] == ["hybrid", "server", "local"]
 
 
 def test_query_planner_normalizes_plurals_and_reports_intent():
