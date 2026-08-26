@@ -140,6 +140,7 @@ def test_context_and_node_read_schemas_are_bounded(mod):
     assert "max_per_level" in context
     assert context["node_ids"]["maxItems"] == 10
     assert context["paths"]["maxItems"] == 10
+    assert context["shortcuts"]["maxItems"] == 10
     assert context["uris"]["maxItems"] == 10
 
     node_get = by_name["nap_node_get"]["inputSchema"]["properties"]
@@ -226,6 +227,89 @@ def test_local_context_returns_title_radius_without_node_bodies(mod):
     ]
     assert "content_text" not in result["nodes"][0]
     assert result["source"] == "local_index"
+
+
+def test_local_context_resolves_anchor_shortcut_without_extra_tool(mod):
+    state = tempfile.TemporaryDirectory()
+    mod._surface_shortcut_state = state
+    mod.AUTH_DIR = pathlib.Path(state.name)
+    mod.INDEX_PATH = mod.AUTH_DIR / "index.sqlite"
+    mod.INDEX_LOCK_PATH = mod.AUTH_DIR / "index.sqlite.lock"
+    mod.index_node({
+        "id": "anchor", "project_id": "project-1",
+        "full_path": "/routes/project/core", "folder_path": "/routes/project",
+        "name": "core", "type": "anchor_route", "aliases": ["shortcut.project"],
+        "metadata": {"title": "Project"}, "tags": [],
+        "links": [{"node_id": "definition", "relation": "defines"}],
+        "content_text": "route body", "updated_at": "2026-08-16T12:00:00Z",
+    })
+    mod.index_node({
+        "id": "definition", "project_id": "project-1",
+        "full_path": "/documentation/product/what-we-are-building",
+        "folder_path": "/documentation/product", "name": "what-we-are-building",
+        "type": "definition", "aliases": [], "metadata": {"title": "Product"},
+        "tags": [], "links": [], "content_text": "definition body",
+        "updated_at": "2026-08-16T12:01:00Z",
+    })
+
+    result = mod.get_memory_context({
+        "shortcut": "@Project", "mode": "local", "depth": 1,
+        "direction": "outgoing",
+    })
+
+    assert result["seed_node_ids"] == ["anchor"]
+    assert [item["id"] for item in result["nodes"]] == ["anchor", "definition"]
+    assert all("content_text" not in item for item in result["nodes"])
+
+
+def test_duplicate_local_anchor_shortcuts_fail_closed(mod):
+    state = tempfile.TemporaryDirectory()
+    mod._surface_duplicate_shortcut_state = state
+    mod.AUTH_DIR = pathlib.Path(state.name)
+    mod.INDEX_PATH = mod.AUTH_DIR / "index.sqlite"
+    mod.INDEX_LOCK_PATH = mod.AUTH_DIR / "index.sqlite.lock"
+    for index in range(2):
+        mod.index_node({
+            "id": f"anchor-{index}", "project_id": "project-1",
+            "full_path": f"/routes/project/{index}", "folder_path": "/routes/project",
+            "name": str(index), "type": "anchor_route", "aliases": ["shortcut.project"],
+            "metadata": {}, "tags": [], "links": [], "content_text": "",
+            "updated_at": f"2026-08-16T12:0{index}:00Z",
+        })
+
+    with pytest.raises(mod.SafeToolError) as ambiguous:
+        mod.get_memory_context({"shortcut": "@project", "mode": "local"})
+
+    assert ambiguous.value.code == "anchor_shortcut_ambiguous"
+
+
+def test_anchor_integrity_reports_budgets_duplicates_and_broken_links(mod):
+    state = tempfile.TemporaryDirectory()
+    mod._surface_anchor_health_state = state
+    mod.AUTH_DIR = pathlib.Path(state.name)
+    mod.INDEX_PATH = mod.AUTH_DIR / "index.sqlite"
+    mod.INDEX_LOCK_PATH = mod.AUTH_DIR / "index.sqlite.lock"
+    for index in range(2):
+        mod.index_node({
+            "id": f"anchor-{index}", "project_id": "project-1",
+            "full_path": f"/routes/project/{index}", "folder_path": "/routes/project",
+            "name": str(index), "type": "anchor_route", "aliases": ["shortcut.project"],
+            "metadata": {}, "tags": [],
+            "links": ([{"path": "/missing", "relation": "routes-to"}] if index == 0 else []),
+            "content_text": "", "updated_at": f"2026-08-16T12:0{index}:00Z",
+        })
+    mod.set_local_graph_index_complete("project-1", True)
+
+    report = mod.local_anchor_integrity()
+
+    assert report["ok"] is False
+    assert report["graph_complete"] is True
+    assert report["duplicate_shortcuts"][0]["shortcut"] == "@project"
+    assert report["broken_anchor_links"] == [{
+        "source": "/routes/project/0",
+        "target": "/missing",
+        "relation": "routes-to",
+    }]
 
 
 def test_local_context_reports_partial_and_total_missing_seeds_actionably(mod):

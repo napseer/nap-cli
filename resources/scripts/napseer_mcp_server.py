@@ -5679,6 +5679,42 @@ def normalize_node_path(value):
     return "/" + str(value or "").strip().strip("/")
 
 
+ANCHOR_SHORTCUT_PREFIX = "shortcut."
+ANCHOR_MAX_OUTGOING_EDGES = 12
+
+
+def normalize_anchor_shortcut(value):
+    value = str(value or "").strip()
+    if not value.startswith("@"):
+        raise SafeToolError(
+            "invalid_anchor_shortcut",
+            "Anchor shortcuts must start with '@', for example @project.",
+        )
+    name = value[1:]
+    if (
+        not name
+        or len(name) > 64
+        or not name[0].isalnum()
+        or not all(ch.isascii() and (ch.isalnum() or ch in "._-") for ch in name)
+    ):
+        raise SafeToolError(
+            "invalid_anchor_shortcut",
+            "Anchor shortcuts must be @ followed by letters, numbers, '.', '_', or '-'.",
+        )
+    return f"@{name.lower()}"
+
+
+def anchor_shortcut_alias(value):
+    return f"{ANCHOR_SHORTCUT_PREFIX}{normalize_anchor_shortcut(value)[1:]}"
+
+
+def normalize_node_route_reference(value):
+    value = str(value or "").strip()
+    if value.startswith("@"):
+        return normalize_anchor_shortcut(value)
+    return normalize_node_path(value)
+
+
 def is_agent_namespace_path(value):
     normalized = normalize_node_path(value)
     return normalized == AGENT_NAMESPACE or normalized.startswith(f"{AGENT_NAMESPACE}/")
@@ -6317,6 +6353,7 @@ def initialize_index_schema(conn):
     ensure_sqlite_column(conn, "local_index_nodes", "title", "TEXT")
     ensure_sqlite_column(conn, "local_index_nodes", "status", "TEXT")
     ensure_sqlite_column(conn, "local_index_nodes", "archived", "INTEGER NOT NULL DEFAULT 0")
+    ensure_sqlite_column(conn, "local_index_nodes", "aliases_json", "TEXT NOT NULL DEFAULT '[]'")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS local_index_nodes_project_path "
         "ON local_index_nodes(project_id, full_path, archived)"
@@ -6468,25 +6505,52 @@ def local_graph_index_state(project_id, conn=None):
         return read(connection)
 
 
-def local_index_node_ids_by_path(project_id, paths, require_complete=True):
-    """Resolve paths inside one coherent local-index snapshot."""
+def local_index_node_ids_by_reference(project_id, references, require_complete=True):
+    """Resolve paths and @shortcuts inside one coherent local-index snapshot."""
     if not INDEX_PATH.exists():
         return {}, {"graph_complete": False, "graph_completed_at": None}
-    normalized_paths = unique_preserve_order(normalize_node_path(path) for path in paths)
+    normalized_references = unique_preserve_order(
+        normalize_node_route_reference(reference) for reference in references
+    )
     with index_connect() as connection:
         graph_state = local_graph_index_state(project_id, connection)
         if require_complete and not graph_state["graph_complete"]:
             return {}, graph_state
         resolved = {}
-        for path in normalized_paths:
+        for reference in normalized_references:
+            if reference.startswith("@"):
+                alias = anchor_shortcut_alias(reference)
+                rows = connection.execute(
+                    "SELECT node_id, full_path FROM local_index_nodes "
+                    "WHERE project_id = ? AND archived = 0 "
+                    "AND EXISTS (SELECT 1 FROM json_each(aliases_json) WHERE value = ?) "
+                    "ORDER BY full_path, node_id LIMIT 2",
+                    (project_id, alias),
+                ).fetchall()
+                if len(rows) > 1:
+                    raise SafeToolError(
+                        "anchor_shortcut_ambiguous",
+                        f"Anchor shortcut {reference} resolves to more than one active node. "
+                        "Remove the duplicate shortcut alias before navigating through it.",
+                        status=409,
+                        service_code="anchor_shortcut_ambiguous",
+                    )
+                if rows:
+                    resolved[reference] = rows[0]["node_id"]
+                continue
             row = connection.execute(
                 "SELECT node_id FROM local_index_nodes "
                 "WHERE project_id = ? AND full_path = ? AND archived = 0",
-                (project_id, path),
+                (project_id, reference),
             ).fetchone()
             if row is not None:
-                resolved[path] = row["node_id"]
+                resolved[reference] = row["node_id"]
         return resolved, graph_state
+
+
+def local_index_node_ids_by_path(project_id, paths, require_complete=True):
+    """Compatibility helper for callers that resolve only route paths."""
+    return local_index_node_ids_by_reference(project_id, paths, require_complete)
 
 
 def set_local_graph_index_complete(project_id, complete, conn=None):
@@ -6568,9 +6632,9 @@ def index_node(node):
                 """
                 INSERT INTO local_index_nodes (
                     node_id, project_id, full_path, name, folder_path, node_type,
-                    tags_json, updated_at, indexed_at, title, status, archived
+                    tags_json, updated_at, indexed_at, title, status, archived, aliases_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(node_id) DO UPDATE SET
                     project_id = excluded.project_id,
                     full_path = excluded.full_path,
@@ -6582,7 +6646,8 @@ def index_node(node):
                     indexed_at = excluded.indexed_at,
                     title = excluded.title,
                     status = excluded.status,
-                    archived = excluded.archived
+                    archived = excluded.archived,
+                    aliases_json = excluded.aliases_json
                 """,
                 (
                     node["id"],
@@ -6597,6 +6662,7 @@ def index_node(node):
                     title,
                     status,
                     1 if node_archived(node) else 0,
+                    compact_json_text(aliases),
                 ),
             )
             conn.execute(
@@ -9204,10 +9270,13 @@ def create_signed_schedule(args):
 
 def get_node_by_path(args, allow_agent=False):
     project_id = resolve_project_id(args)
-    path = args["path"]
-    if not allow_agent:
-        reject_agent_namespace_path(path)
-    params = {"path": path}
+    reference = args.get("shortcut") or args.get("path")
+    if not reference:
+        raise RuntimeError("path or shortcut is required")
+    reference = normalize_node_route_reference(reference)
+    if not allow_agent and not reference.startswith("@"):
+        reject_agent_namespace_path(reference)
+    params = {"path": reference}
     payload = request_json("GET", f"/v1/projects/{project_id}/nodes/by-path?{rest_query_string(params)}")
     if isinstance(payload, dict) and isinstance(payload.get("route"), dict):
         route = dict(payload["route"])
@@ -9334,9 +9403,13 @@ def node_by_uri(args):
 
 
 def node_by_path(args):
-    path = normalize_node_path(args["path"])
-    route = get_node_by_path({"path": path})
-    identity = route.get("identity") if isinstance(route.get("identity"), dict) else node_identity_payload(route, project_id=route.get("project_id"), lookup_kind="path", lookup_value=path)
+    supplied = [key for key in ("path", "shortcut") if args.get(key)]
+    if len(supplied) != 1:
+        raise RuntimeError("exactly one of path or shortcut is required")
+    reference = normalize_node_route_reference(args[supplied[0]])
+    route = get_node_by_path({"path": reference})
+    lookup_kind = "shortcut" if reference.startswith("@") else "path"
+    identity = route.get("identity") if isinstance(route.get("identity"), dict) else node_identity_payload(route, project_id=route.get("project_id"), lookup_kind=lookup_kind, lookup_value=reference)
     return {
         "ok": True,
         "status": "resolved",
@@ -12417,10 +12490,11 @@ def classify_memory_query(args):
         "effective_intent": normalize_search_intent(args.get("intent")),
     }
     exact_paths = [token for token in raw.split() if token.startswith("/") and len(token) > 1]
+    exact_shortcuts = [token for token in raw.split() if token.startswith("@") and len(token) > 1]
     recent_intent = any(term in raw.lower().split() for term in ["recent", "latest", "new", "newest", "updated"])
-    if exact_paths:
+    if exact_paths or exact_shortcuts:
         primary_tool = "nap_context"
-        reason = "query contains explicit node path(s)"
+        reason = "query contains explicit node route(s)"
     elif recent_intent and not raw.strip('"'):
         primary_tool = "nap_discover"
         reason = "query asks for recent memory; use sort=updated_desc"
@@ -12437,6 +12511,7 @@ def classify_memory_query(args):
             "reason": reason,
             "search_intent": analysis.get("effective_intent", "any"),
             "exact_paths": exact_paths,
+            "exact_shortcuts": exact_shortcuts,
             "recent_intent": recent_intent,
             "range": {
                 "updated_after": args.get("updated_after"),
@@ -12598,25 +12673,34 @@ def context_seed_ids(args, mode="hybrid"):
     paths = list(args.get("paths") or [])
     if args.get("path"):
         paths.append(args["path"])
-    normalized_paths = unique_preserve_order(normalize_node_path(path) for path in paths)
-    for path in normalized_paths:
-        reject_agent_namespace_path(path)
+    shortcuts = list(args.get("shortcuts") or [])
+    if args.get("shortcut"):
+        shortcuts.append(args["shortcut"])
+    references = [*paths, *shortcuts]
+    normalized_references = unique_preserve_order(
+        normalize_node_route_reference(reference) for reference in references
+    )
+    for reference in normalized_references:
+        if not reference.startswith("@"):
+            reject_agent_namespace_path(reference)
     locally_resolved = {}
-    if normalized_paths and mode in {"local", "hybrid"}:
+    if normalized_references and mode in {"local", "hybrid"}:
         project_id = resolve_project_id(args)
-        locally_resolved, _graph_state = local_index_node_ids_by_path(
+        locally_resolved, _graph_state = local_index_node_ids_by_reference(
             project_id,
-            normalized_paths,
+            normalized_references,
             require_complete=mode == "hybrid",
         )
-    for path in normalized_paths:
-        if path in locally_resolved:
-            node_ids.append(locally_resolved[path])
+    for reference in normalized_references:
+        if reference in locally_resolved:
+            node_ids.append(locally_resolved[reference])
             continue
         if mode == "local":
             raise context_seed_not_found()
         try:
-            resolved = node_by_path({"path": path})
+            resolved = node_by_path({
+                "shortcut" if reference.startswith("@") else "path": reference
+            })
         except Exception as exc:
             if context_service_not_found(exc):
                 raise context_seed_not_found() from exc
@@ -12628,7 +12712,9 @@ def context_seed_ids(args, mode="hybrid"):
             raise context_seed_not_found()
     node_ids = unique_preserve_order(node_ids)
     if not node_ids:
-        raise RuntimeError("path, paths, node_id, node_ids, uri, or uris is required")
+        raise RuntimeError(
+            "shortcut, shortcuts, path, paths, node_id, node_ids, uri, or uris is required"
+        )
     if len(node_ids) > CONTEXT_MAX_SEEDS:
         raise SafeToolError(
             "too_many_context_seeds",
@@ -14746,10 +14832,12 @@ def raw_tools():
         },
         {
             "name": "nap_context",
-            "description": "Resolve one or more paths, node IDs, or nap:// URIs and fetch bounded outgoing links and backlinks in one call.",
+            "description": "Resolve one or more anchor shortcuts, paths, node IDs, or nap:// URIs and fetch bounded outgoing links and backlinks in one call.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "shortcut": {"type": "string", "description": "Project-defined anchor such as @project or @current."},
+                    "shortcuts": {"type": "array", "items": {"type": "string"}},
                     "path": {"type": "string", "description": "Readable route to resolve internally; canonical identity is returned in the result."},
                     "paths": {"type": "array", "items": {"type": "string"}},
                     "node_id": {"type": "string"},
@@ -14838,7 +14926,7 @@ def raw_tools():
         },
         {
             "name": "nap_doctor",
-            "description": "Run a local/project health report covering auth, index, gateway, and tool registry state.",
+            "description": "Run a local/project health report covering auth, index, anchor-graph integrity, gateway, and tool registry state.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         },
         {
@@ -15081,13 +15169,17 @@ def raw_tools():
         },
         {
             "name": "nap_node_by_path",
-            "description": "Resolve an external path index/route that has no node_id to canonical identity. Discovery rows already carry node_id and should go directly to nap_node_get. This tool does not read full node content.",
+            "description": "Resolve an external path index/route or project-defined @shortcut to canonical identity. Discovery rows already carry node_id and should go directly to nap_node_get. This tool does not read full node content.",
             "inputSchema": {
                 "type": "object",
-                "required": ["path"],
                 "properties": {
                     "path": {"type": "string", "description": "Index/route path such as /documentation/product/prd."},
+                    "shortcut": {"type": "string", "description": "Anchor shortcut such as @project or @current."},
                 },
+                "oneOf": [
+                    {"required": ["path"]},
+                    {"required": ["shortcut"]},
+                ],
                 "additionalProperties": False,
             },
         },
@@ -15986,7 +16078,8 @@ SIMPLIFIED_TOOL_PROPERTIES = {
         "facets",
     },
     "nap_context": {
-        "node_id", "node_ids", "uri", "uris", "path", "paths", "depth",
+        "node_id", "node_ids", "uri", "uris", "path", "paths",
+        "shortcut", "shortcuts", "depth",
         "max_nodes", "max_edges", "max_per_level", "direction", "relations",
         "mode", "view",
     },
@@ -16470,7 +16563,7 @@ def _efficient_memory_schema(name, schema):
             "maxItems": 4,
         }
     elif name == "nap_context":
-        for key in ("paths", "node_ids", "uris"):
+        for key in ("shortcuts", "paths", "node_ids", "uris"):
             if key in properties:
                 properties[key] = {
                     **properties[key],
@@ -16930,6 +17023,7 @@ def all_tools():
         if canonical_name == "nap_context":
             item["description"] = (
                 "Read a bounded title-only neighborhood around one or more nodes. "
+                "Seeds may be project-defined @shortcuts, paths, node IDs, or nap:// URIs. "
                 "Supports depth 0-3, incoming/outgoing/both traversal, relation filters, "
                 "explicit budgets, stable missing/cross-project seed diagnostics, and "
                 "local-index/server fallback without fetching bodies."
@@ -17076,11 +17170,136 @@ def lint_memory(args):
     return {"ok": not warnings, "checked": len(result.get("items", [])), "warnings": warnings, "next_cursor": result.get("next_cursor")}
 
 
+def local_anchor_integrity():
+    """Return bounded, content-free integrity checks for locally indexed anchors."""
+    if not INDEX_PATH.exists():
+        return {
+            "ok": True,
+            "status": "unavailable",
+            "source": "local_index",
+            "anchors_checked": 0,
+            "warnings": [
+                "Local memory index is unavailable; run nap reindex before auditing anchors."
+            ],
+        }
+    project_id = current_project_id()
+    if not project_id:
+        return {
+            "ok": True,
+            "status": "unavailable",
+            "source": "local_index",
+            "anchors_checked": 0,
+            "warnings": ["No project is configured, so anchor integrity was not audited."],
+        }
+    try:
+        with index_connect() as conn:
+            graph_state = local_graph_index_state(project_id, conn)
+            rows = conn.execute(
+                "SELECT node_id, full_path, node_type, aliases_json "
+                "FROM local_index_nodes WHERE project_id = ? AND archived = 0 "
+                "ORDER BY full_path",
+                (project_id,),
+            ).fetchall()
+            nodes_by_id = {row["node_id"]: row for row in rows}
+            nodes_by_path = {row["full_path"]: row for row in rows}
+            shortcut_targets = {}
+            anchors = []
+            for row in rows:
+                try:
+                    aliases = json.loads(row["aliases_json"] or "[]")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    aliases = []
+                shortcuts = sorted(
+                    f"@{alias[len(ANCHOR_SHORTCUT_PREFIX):]}"
+                    for alias in aliases
+                    if isinstance(alias, str) and alias.startswith(ANCHOR_SHORTCUT_PREFIX)
+                )
+                for shortcut in shortcuts:
+                    shortcut_targets.setdefault(shortcut, []).append(row["full_path"])
+                if shortcuts:
+                    anchors.append((row, shortcuts))
+
+            duplicate_shortcuts = [
+                {"shortcut": shortcut, "paths": paths}
+                for shortcut, paths in sorted(shortcut_targets.items())
+                if len(paths) > 1
+            ]
+            over_budget = []
+            broken_links = []
+            for row, shortcuts in anchors:
+                edges = conn.execute(
+                    "SELECT target_node_id, target_path, target_ref, relation "
+                    "FROM local_index_edges WHERE project_id = ? AND source_node_id = ? "
+                    "ORDER BY relation, target_ref",
+                    (project_id, row["node_id"]),
+                ).fetchall()
+                if len(edges) > ANCHOR_MAX_OUTGOING_EDGES:
+                    over_budget.append({
+                        "path": row["full_path"],
+                        "shortcuts": shortcuts,
+                        "outgoing_edges": len(edges),
+                        "maximum": ANCHOR_MAX_OUTGOING_EDGES,
+                    })
+                for edge in edges:
+                    target_exists = (
+                        edge["target_node_id"] in nodes_by_id
+                        if edge["target_node_id"]
+                        else edge["target_path"] in nodes_by_path
+                        if edge["target_path"]
+                        else False
+                    )
+                    if not target_exists:
+                        broken_links.append({
+                            "source": row["full_path"],
+                            "target": edge["target_ref"],
+                            "relation": edge["relation"],
+                        })
+            warnings = []
+            if not graph_state["graph_complete"]:
+                warnings.append(
+                    "The local graph projection is incomplete; run nap reindex or verify again in server mode."
+                )
+            if duplicate_shortcuts:
+                warnings.append("Duplicate active shortcut aliases must be removed; resolution fails closed.")
+            if over_budget:
+                warnings.append(
+                    f"Some anchors exceed the {ANCHOR_MAX_OUTGOING_EDGES}-edge navigation budget."
+                )
+            if broken_links:
+                warnings.append("Some anchor links do not resolve in the local graph projection.")
+            healthy = not (duplicate_shortcuts or over_budget or broken_links)
+            return {
+                "ok": healthy,
+                "status": "healthy" if healthy and graph_state["graph_complete"] else "warnings",
+                "source": "local_index",
+                "graph_complete": graph_state["graph_complete"],
+                "anchors_checked": len(anchors),
+                "shortcuts_defined": len(shortcut_targets),
+                "limits": {"max_outgoing_edges_per_anchor": ANCHOR_MAX_OUTGOING_EDGES},
+                "duplicate_shortcuts": duplicate_shortcuts,
+                "over_budget_anchors": over_budget,
+                "broken_anchor_links": broken_links,
+                "warnings": warnings,
+            }
+    except (OSError, sqlite3.Error) as exc:
+        return {
+            "ok": False,
+            "status": "error",
+            "source": "local_index",
+            "anchors_checked": 0,
+            "warnings": [
+                "Anchor integrity could not read the local index; run nap doctor after nap reindex."
+            ],
+            "error": safe_exception_payload(exc),
+        }
+
+
 def doctor(args):
     return {
         "ok": True,
         "auth": gateway_status(),
         "index": index_status(args),
+        "anchor_graph": local_anchor_integrity(),
         "contract": contract_profile({"include_tools": False}),
         "state_dir": state_dir_status_payload(),
     }

@@ -147,6 +147,34 @@ def test_node_by_path_returns_canonical_identity_uri(mod):
     assert "Path lookup is index/route resolution only" in result["warnings"][0]
 
 
+def test_node_by_path_resolves_project_anchor_shortcut(mod):
+    def fake_request(method, path, payload=None, **kwargs):
+        assert method == "GET"
+        assert path.endswith("/nodes/by-path?path=%40project")
+        return {
+            "identity": {
+                "node_id": "anchor-1",
+                "canonical_uri": "nap://napseer/project-1/anchor-1",
+                "project_id": "project-1",
+                "lookup_kind": "shortcut",
+                "lookup_value": "@project",
+                "legacy_full_path": "/routes/project/core",
+            },
+            "route": {
+                "id": "anchor-1",
+                "project_id": "project-1",
+                "full_path": "/routes/project/core",
+            },
+        }
+
+    mod.request_json = fake_request
+    result = mod.node_by_path({"shortcut": "@Project"})
+
+    assert result["identity"]["lookup_kind"] == "shortcut"
+    assert result["identity"]["lookup_value"] == "@project"
+    assert result["route"]["full_path"] == "/routes/project/core"
+
+
 def test_path_resolver_then_read_uses_node_id_route(mod):
     calls = []
 
@@ -270,7 +298,12 @@ def test_tools_include_node_by_path_descriptor(mod):
     assert "directly to nap_node_get" in discover_tool["description"]
 
     tool = next(item for item in mod.tools() if item["name"] == "nap_node_by_path")
-    assert tool["inputSchema"]["required"] == ["path"]
+    assert tool["inputSchema"].get("required") is None
+    assert tool["inputSchema"]["oneOf"] == [
+        {"required": ["path"]},
+        {"required": ["shortcut"]},
+    ]
+    assert "shortcut" in tool["inputSchema"]["properties"]
     assert "preview_chars" not in tool["inputSchema"]["properties"]
     assert "does not read full node content" in tool["description"]
 
