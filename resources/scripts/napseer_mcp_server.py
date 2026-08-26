@@ -5588,11 +5588,34 @@ def rpc_error(request_id, code, message, details=None):
     return {"jsonrpc": "2.0", "id": request_id, "error": error}
 
 
+def bounded_tool_item_preview(value):
+    if not isinstance(value, dict):
+        return value
+    safe_keys = (
+        "id",
+        "node_id",
+        "full_path",
+        "name",
+        "title",
+        "type",
+        "status",
+        "updated_at",
+        "depth",
+        "source",
+        "target",
+        "relation",
+    )
+    return {key: value[key] for key in safe_keys if key in value}
+
+
 def bounded_tool_text(value, is_error=False):
     if is_error:
         return json.dumps(value, indent=2)
     if not isinstance(value, dict):
         return json.dumps(value, ensure_ascii=False)
+    serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    if len(serialized.encode("utf-8")) <= 4096:
+        return serialized
     summary = {
         key: value[key]
         for key in (
@@ -5611,6 +5634,27 @@ def bounded_tool_text(value, is_error=False):
     for key in ("items", "nodes", "edges", "warnings", "frontier"):
         if isinstance(value.get(key), list):
             summary[f"{key}_count"] = len(value[key])
+    for key in ("items", "nodes", "edges"):
+        if isinstance(value.get(key), list):
+            summary[f"{key}_preview"] = [
+                bounded_tool_item_preview(item) for item in value[key][:5]
+            ]
+    if isinstance(value.get("warnings"), list):
+        summary["warnings"] = value["warnings"][:5]
+    if isinstance(value.get("frontier"), list):
+        summary["frontier_preview"] = value["frontier"][:5]
+    if isinstance(value.get("identity"), dict):
+        summary["identity"] = bounded_tool_item_preview(value["identity"])
+    if isinstance(value.get("route"), dict):
+        summary["route"] = bounded_tool_item_preview(value["route"])
+    if isinstance(value.get("content_text"), str):
+        content = value["content_text"]
+        summary["content_chars"] = len(content)
+        summary["content_lines"] = len(content.splitlines())
+        summary["content_preview"] = content[:800]
+        summary["content_truncated"] = len(content) > 800
+    if value.get("next_action"):
+        summary["next_action"] = value["next_action"]
     summary["structured_result"] = True
     return json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
 
@@ -12183,6 +12227,130 @@ def classify_memory_query(args):
     }
 
 
+CONTEXT_MAX_SEEDS = 10
+
+
+def context_project_label():
+    refresh_public_auth_state()
+    return str(
+        AUTH.get("project_name")
+        or AUTH.get("project_slug")
+        or current_project_id()
+        or "configured project"
+    )
+
+
+def context_seed_not_found(count=1):
+    noun = "seed" if count == 1 else "seeds"
+    return SafeToolError(
+        "context_seed_not_found",
+        f"nap_context could not find the requested {noun} in the active project "
+        f"'{context_project_label()}'. Run nap_whoami to verify the workspace binding, "
+        "then use nap_discover to obtain current node_id values. If memory changed "
+        "recently, retry nap_context with mode='server'.",
+        status=404,
+        service_code="not_found",
+    )
+
+
+def context_service_not_found(exc):
+    return isinstance(exc, SafeToolError) and (
+        exc.service_code == "not_found"
+        or exc.code == "context_seed_not_found"
+    )
+
+
+def context_view(args):
+    view = str(args.get("view") or "titles").strip().lower()
+    if view not in {"titles", "paths", "summary", "metadata"}:
+        raise SafeToolError(
+            "invalid_view",
+            "nap_context view must be titles, paths, summary, or metadata. "
+            "Read bodies separately with nap_node_get.",
+        )
+    return view
+
+
+def project_context_node(node, view):
+    if not isinstance(node, dict):
+        return node
+    keys_by_view = {
+        "titles": ("id", "full_path", "title", "status", "depth"),
+        "paths": ("id", "full_path", "type", "status", "updated_at", "depth"),
+        "summary": (
+            "id", "canonical_uri", "full_path", "name", "title", "type",
+            "status", "updated_at", "depth",
+        ),
+        "metadata": (
+            "id", "canonical_uri", "full_path", "type", "status", "updated_at", "depth",
+        ),
+    }
+    return {key: node[key] for key in keys_by_view[view] if key in node}
+
+
+def finalize_memory_context(args, result, requested_seed_ids):
+    result = dict(result or {})
+    view = context_view(args)
+    raw_nodes = list(result.get("nodes") or result.get("items") or [])
+    nodes = [project_context_node(node, view) for node in raw_nodes]
+    edges = list(result.get("edges") or [])
+    warnings = list(result.get("warnings") or [])
+    reasons = list(result.get("truncation_reasons") or [])
+    frontier = unique_preserve_order(result.get("frontier") or [])
+    max_frontier = max(1, min(int(args.get("max_per_level", 20)), 50))
+    if len(frontier) > max_frontier:
+        frontier = frontier[:max_frontier]
+        if "max_frontier" not in reasons:
+            reasons.append("max_frontier")
+
+    present_seed_ids = list(result.get("seed_node_ids") or [])
+    if not present_seed_ids:
+        returned_ids = {
+            str(node.get("id") or node.get("node_id") or "")
+            for node in raw_nodes
+            if isinstance(node, dict)
+        }
+        present_seed_ids = [
+            seed_id for seed_id in requested_seed_ids if seed_id in returned_ids
+        ]
+        result["seed_node_ids"] = present_seed_ids
+    missing_seed_ids = list(result.get("missing_seed_node_ids") or [])
+    if not missing_seed_ids:
+        missing_seed_ids = [
+            seed_id for seed_id in requested_seed_ids if seed_id not in present_seed_ids
+        ]
+    if missing_seed_ids:
+        warnings.append(
+            f"{len(missing_seed_ids)} requested seed node(s) were not found in the active project; "
+            "run nap_whoami and rediscover their current node_id values with nap_discover."
+        )
+    depth = max(0, min(int(args.get("depth", 1)), 3))
+    if depth > 0 and nodes and not edges:
+        warnings.append(
+            "No first-class graph links matched this neighborhood. Prose mentions are not traversed; "
+            "create a durable relationship with nap_ln when appropriate."
+        )
+
+    result["nodes"] = nodes
+    result["items"] = nodes
+    result["edges"] = edges
+    result["requested_seed_node_ids"] = list(requested_seed_ids)
+    result["missing_seed_node_ids"] = missing_seed_ids
+    result["frontier"] = frontier
+    result["truncation_reasons"] = reasons
+    result["truncated"] = bool(result.get("truncated") or reasons)
+    result["warnings"] = unique_preserve_order(warnings)
+    result["view"] = view
+    result["node_count"] = len(nodes)
+    result["edge_count"] = len(edges)
+    result["frontier_count"] = len(frontier)
+    result["next_action"] = (
+        "Use returned node IDs with nap_node_get to read selected bodies. "
+        "If expected relationships are absent, add first-class links with nap_ln."
+    )
+    return result
+
+
 def context_seed_ids(args, mode="hybrid"):
     node_ids = [str(value).strip() for value in (args.get("node_ids") or []) if str(value).strip()]
     if args.get("node_id"):
@@ -12191,7 +12359,15 @@ def context_seed_ids(args, mode="hybrid"):
     if args.get("uri"):
         uris.append(args["uri"])
     for uri in uris:
-        node_ids.append(parse_nap_node_uri(str(uri))["node_id"])
+        parsed = parse_nap_node_uri(str(uri))
+        configured_project_id = current_project_id()
+        if configured_project_id and parsed["project_id"] != configured_project_id:
+            raise SafeToolError(
+                "context_project_mismatch",
+                "A nap:// context seed belongs to a different project than the active workspace. "
+                "Run nap_whoami and use a URI or node_id from the configured project.",
+            )
+        node_ids.append(parsed["node_id"])
     paths = list(args.get("paths") or [])
     if args.get("path"):
         paths.append(args["path"])
@@ -12211,14 +12387,27 @@ def context_seed_ids(args, mode="hybrid"):
             node_ids.append(locally_resolved[path])
             continue
         if mode == "local":
-            raise RuntimeError("seed path is not present in the local memory index")
-        resolved = node_by_path({"path": path})
+            raise context_seed_not_found()
+        try:
+            resolved = node_by_path({"path": path})
+        except Exception as exc:
+            if context_service_not_found(exc):
+                raise context_seed_not_found() from exc
+            raise
         node_id = (resolved.get("identity") or {}).get("node_id")
         if node_id:
             node_ids.append(node_id)
+        else:
+            raise context_seed_not_found()
     node_ids = unique_preserve_order(node_ids)
     if not node_ids:
         raise RuntimeError("path, paths, node_id, node_ids, uri, or uris is required")
+    if len(node_ids) > CONTEXT_MAX_SEEDS:
+        raise SafeToolError(
+            "too_many_context_seeds",
+            f"nap_context accepts at most {CONTEXT_MAX_SEEDS} unique seeds per call; "
+            "split larger exploration into bounded calls.",
+        )
     return node_ids
 
 
@@ -12259,10 +12448,15 @@ def local_memory_context(args, seed_ids):
                 (project_id, path),
             ).fetchone()
 
-        seed_rows = [node_row(node_id=node_id) for node_id in seed_ids]
-        seed_rows = [row for row in seed_rows if row is not None]
+        seed_rows_by_id = {
+            node_id: node_row(node_id=node_id) for node_id in seed_ids
+        }
+        missing_seed_ids = [
+            node_id for node_id, row in seed_rows_by_id.items() if row is None
+        ]
+        seed_rows = [row for row in seed_rows_by_id.values() if row is not None]
         if not seed_rows:
-            raise RuntimeError("seed node is not present in the local memory index")
+            raise context_seed_not_found(len(missing_seed_ids))
         nodes = {}
         edges = []
         edge_keys = set()
@@ -12347,11 +12541,14 @@ def local_memory_context(args, seed_ids):
         warnings = []
         if not graph_state["graph_complete"]:
             warnings.append(
-                "Local graph index coverage is incomplete; run nap index sync before relying on local-only neighborhoods."
+                "Local graph index coverage is incomplete; use mode='hybrid' or mode='server' "
+                "until the managed local projection refresh completes."
             )
         return {
             "ok": True,
             "seed_node_ids": [row["node_id"] for row in seed_rows],
+            "requested_seed_node_ids": list(seed_ids),
+            "missing_seed_node_ids": missing_seed_ids,
             "nodes": list(nodes.values()),
             "items": list(nodes.values()),
             "edges": edges,
@@ -12369,6 +12566,7 @@ def local_memory_context(args, seed_ids):
 def server_memory_context(args, seed_ids):
     project_id = resolve_project_id(args)
     results = []
+    missing_seed_ids = []
     for node_id in seed_ids:
         query = {
             "depth": max(0, min(int(args.get("depth", 1)), 3)),
@@ -12379,15 +12577,25 @@ def server_memory_context(args, seed_ids):
         }
         if args.get("relations"):
             query["relations"] = ",".join(str(value) for value in args["relations"])
-        results.append(request_json(
-            "GET",
-            f"/v1/projects/{project_id}/nodes/{urllib.parse.quote(node_id, safe='')}/neighborhood?{rest_query_string(query)}",
-        ))
+        try:
+            results.append(request_json(
+                "GET",
+                f"/v1/projects/{project_id}/nodes/{urllib.parse.quote(node_id, safe='')}/neighborhood?{rest_query_string(query)}",
+            ))
+        except Exception as exc:
+            if context_service_not_found(exc):
+                missing_seed_ids.append(node_id)
+                continue
+            raise
+    if not results:
+        raise context_seed_not_found(len(missing_seed_ids) or len(seed_ids))
     if len(results) == 1:
         result = dict(results[0])
         result.setdefault("items", result.get("nodes") or [])
         result.setdefault("source", "server")
         result.setdefault("view", "titles")
+        result["requested_seed_node_ids"] = list(seed_ids)
+        result["missing_seed_node_ids"] = missing_seed_ids
         return result
     nodes = unique_nodes([node for result in results for node in result.get("nodes") or []])
     edges = unique_preserve_order(
@@ -12395,7 +12603,11 @@ def server_memory_context(args, seed_ids):
     )
     return {
         "ok": True,
-        "seed_node_ids": seed_ids,
+        "seed_node_ids": [
+            seed_id for seed_id in seed_ids if seed_id not in missing_seed_ids
+        ],
+        "requested_seed_node_ids": list(seed_ids),
+        "missing_seed_node_ids": missing_seed_ids,
         "nodes": nodes,
         "items": nodes,
         "edges": [json.loads(edge) for edge in edges],
@@ -12420,10 +12632,13 @@ def get_memory_context(args):
                 project_id = resolve_project_id(args)
                 graph_state = local_graph_index_state(project_id)
                 if not graph_state["graph_complete"]:
-                    raise RuntimeError(
-                        "local graph index coverage is incomplete; run nap index sync"
+                    raise SafeToolError(
+                        "local_graph_incomplete",
+                        "Local graph index coverage is incomplete; server fallback is required "
+                        "until the managed local projection refresh completes.",
                     )
-            return local_memory_context(args, seed_ids)
+            result = local_memory_context(args, seed_ids)
+            return finalize_memory_context(args, result, seed_ids)
         except Exception as exc:
             if mode == "local":
                 raise
@@ -12432,8 +12647,8 @@ def get_memory_context(args):
                 "Local index was unavailable or incomplete; server neighborhood was used."
             )
             result["local_fallback"] = safe_exception_payload(exc)
-            return result
-    return server_memory_context(args, seed_ids)
+            return finalize_memory_context(args, result, seed_ids)
+    return finalize_memory_context(args, server_memory_context(args, seed_ids), seed_ids)
 
 
 def find_related_nodes(args):
@@ -15859,6 +16074,8 @@ def safe_exception_payload(exc):
     }
     if isinstance(exc, SafeToolError) and exc.status is not None:
         payload["http_status"] = exc.status
+    if isinstance(exc, SafeToolError) and exc.service_code:
+        payload["service_code"] = exc.service_code
     return payload
 
 
@@ -16016,6 +16233,12 @@ def _efficient_memory_schema(name, schema):
             "maxItems": 4,
         }
     elif name == "nap_context":
+        for key in ("paths", "node_ids", "uris"):
+            if key in properties:
+                properties[key] = {
+                    **properties[key],
+                    "maxItems": CONTEXT_MAX_SEEDS,
+                }
         properties.update({
             "depth": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1},
             "direction": {
@@ -16039,6 +16262,7 @@ def _efficient_memory_schema(name, schema):
                 "type": "string",
                 "enum": ["titles", "paths", "summary", "metadata"],
                 "default": "titles",
+                "description": "Controls the compact node projection; bodies always require nap_node_get.",
             }
     elif name == "nap_node_get":
         properties["view"] = {
@@ -16470,7 +16694,8 @@ def all_tools():
             item["description"] = (
                 "Read a bounded title-only neighborhood around one or more nodes. "
                 "Supports depth 0-3, incoming/outgoing/both traversal, relation filters, "
-                "explicit budgets, and local-index/server fallback without fetching bodies."
+                "explicit budgets, stable missing/cross-project seed diagnostics, and "
+                "local-index/server fallback without fetching bodies."
             )
         if canonical_name == "nap_discover":
             item["description"] = (

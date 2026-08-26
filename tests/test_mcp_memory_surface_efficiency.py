@@ -2,6 +2,7 @@
 """Contract tests for the reduced, bounded agent-memory surface."""
 
 import importlib.util
+import json
 import pathlib
 import sys
 import tempfile
@@ -76,6 +77,9 @@ def test_context_and_node_read_schemas_are_bounded(mod):
     assert "relations" in context
     assert "max_edges" in context
     assert "max_per_level" in context
+    assert context["node_ids"]["maxItems"] == 10
+    assert context["paths"]["maxItems"] == 10
+    assert context["uris"]["maxItems"] == 10
 
     node_get = by_name["nap_node_get"]["inputSchema"]["properties"]
     assert node_get["view"]["enum"] == ["content", "outline", "edit"]
@@ -86,8 +90,45 @@ def test_tool_text_does_not_duplicate_large_structured_payload(mod):
     payload = {"ok": True, "items": [{"content_text": "x" * 20_000}]}
     result = mod.tool_result(payload)
     assert result["structuredContent"] == payload
-    assert len(result["content"][0]["text"]) < 200
+    assert len(result["content"][0]["text"]) < 2_000
     assert "20000" not in result["content"][0]["text"]
+
+
+def test_tool_text_keeps_small_structured_results_useful_for_text_only_clients(mod):
+    payload = {
+        "status": "current",
+        "full_path": "/docs/useful",
+        "view": "content",
+        "content_text": "A small useful body.",
+    }
+
+    result = mod.tool_result(payload)
+
+    assert json.loads(result["content"][0]["text"]) == payload
+
+
+def test_large_graph_text_fallback_contains_bounded_node_and_edge_previews(mod):
+    payload = {
+        "ok": True,
+        "nodes": [
+            {"id": f"node-{index}", "full_path": f"/docs/{index}", "title": f"Node {index}"}
+            for index in range(100)
+        ],
+        "edges": [
+            {"source": f"node-{index}", "target": f"node-{index + 1}", "relation": "references"}
+            for index in range(99)
+        ],
+        "warnings": ["Use first-class links."],
+    }
+
+    fallback = json.loads(mod.tool_result(payload)["content"][0]["text"])
+
+    assert fallback["nodes_count"] == 100
+    assert fallback["edges_count"] == 99
+    assert len(fallback["nodes_preview"]) == 5
+    assert len(fallback["edges_preview"]) == 5
+    assert fallback["warnings"] == ["Use first-class links."]
+    assert fallback["structured_result"] is True
 
 
 def test_local_context_returns_title_radius_without_node_bodies(mod):
@@ -124,6 +165,129 @@ def test_local_context_returns_title_radius_without_node_bodies(mod):
     ]
     assert "content_text" not in result["nodes"][0]
     assert result["source"] == "local_index"
+
+
+def test_local_context_reports_partial_and_total_missing_seeds_actionably(mod):
+    state = tempfile.TemporaryDirectory()
+    mod._surface_missing_seed_state = state
+    mod.AUTH_DIR = pathlib.Path(state.name)
+    mod.INDEX_PATH = mod.AUTH_DIR / "index.sqlite"
+    mod.INDEX_LOCK_PATH = mod.AUTH_DIR / "index.sqlite.lock"
+    mod.index_node({
+        "id": "root", "project_id": "project-1", "full_path": "/docs/root",
+        "folder_path": "/docs", "name": "root", "type": "note",
+        "metadata": {"title": "Root"}, "tags": [], "links": [],
+        "content_text": "body", "updated_at": "2026-08-16T12:00:00Z",
+    })
+
+    partial = mod.get_memory_context({
+        "node_ids": ["root", "missing"], "mode": "local", "depth": 0,
+    })
+
+    assert partial["requested_seed_node_ids"] == ["root", "missing"]
+    assert partial["seed_node_ids"] == ["root"]
+    assert partial["missing_seed_node_ids"] == ["missing"]
+    assert any("active project" in warning for warning in partial["warnings"])
+
+    with pytest.raises(mod.SafeToolError) as missing:
+        mod.get_memory_context({"node_id": "missing", "mode": "local"})
+    assert missing.value.code == "context_seed_not_found"
+    assert "nap_whoami" in missing.value.safe_message
+    assert "nap_discover" in missing.value.safe_message
+
+
+def test_context_translates_server_not_found_into_seed_diagnostic(mod):
+    def missing_request(*_args, **_kwargs):
+        raise mod.SafeToolError(
+            "http_404",
+            "Napseer GET request failed with HTTP 404.",
+            status=404,
+            service_code="not_found",
+        )
+
+    mod.request_json = missing_request
+
+    with pytest.raises(mod.SafeToolError) as missing:
+        mod.get_memory_context({"node_id": "missing", "mode": "server"})
+
+    assert missing.value.code == "context_seed_not_found"
+    assert missing.value.status == 404
+    assert mod.safe_exception_payload(missing.value)["service_code"] == "not_found"
+
+
+def test_context_rejects_cross_project_uri_before_graph_reads(mod):
+    with pytest.raises(mod.SafeToolError) as mismatch:
+        mod.get_memory_context({
+            "uri": "nap://other-project/project-2/node-1",
+            "mode": "server",
+        })
+
+    assert mismatch.value.code == "context_project_mismatch"
+    assert "nap_whoami" in mismatch.value.safe_message
+
+
+def test_local_context_projects_requested_view_and_bounds_frontier(mod):
+    state = tempfile.TemporaryDirectory()
+    mod._surface_view_state = state
+    mod.AUTH_DIR = pathlib.Path(state.name)
+    mod.INDEX_PATH = mod.AUTH_DIR / "index.sqlite"
+    mod.INDEX_LOCK_PATH = mod.AUTH_DIR / "index.sqlite.lock"
+    children = []
+    for index in range(5):
+        children.append({
+            "id": f"child-{index}", "project_id": "project-1",
+            "full_path": f"/docs/child-{index}", "folder_path": "/docs",
+            "name": f"child-{index}", "type": "note", "metadata": {},
+            "tags": [], "links": [], "content_text": "",
+            "updated_at": f"2026-08-16T12:0{index + 1}:00Z",
+        })
+    mod.index_node({
+        "id": "root", "project_id": "project-1", "full_path": "/docs/root",
+        "folder_path": "/docs", "name": "root", "type": "note",
+        "metadata": {"title": "Root"}, "tags": [],
+        "links": [
+            {"node_id": child["id"], "relation": "references"}
+            for child in children
+        ],
+        "content_text": "", "updated_at": "2026-08-16T12:00:00Z",
+    })
+    for child in children:
+        mod.index_node(child)
+
+    result = mod.get_memory_context({
+        "node_id": "root", "mode": "local", "depth": 1,
+        "max_nodes": 2, "max_per_level": 1, "view": "paths",
+    })
+
+    assert result["view"] == "paths"
+    assert "title" not in result["nodes"][0]
+    assert set(result["nodes"][0]) == {
+        "id", "full_path", "type", "status", "updated_at", "depth"
+    }
+    assert len(result["frontier"]) <= 1
+    assert "max_frontier" in result["truncation_reasons"]
+    assert result["node_count"] == 2
+    assert result["edge_count"] == 1
+
+
+def test_context_explains_empty_first_class_graph(mod):
+    state = tempfile.TemporaryDirectory()
+    mod._surface_empty_graph_state = state
+    mod.AUTH_DIR = pathlib.Path(state.name)
+    mod.INDEX_PATH = mod.AUTH_DIR / "index.sqlite"
+    mod.INDEX_LOCK_PATH = mod.AUTH_DIR / "index.sqlite.lock"
+    mod.index_node({
+        "id": "root", "project_id": "project-1", "full_path": "/docs/root",
+        "folder_path": "/docs", "name": "root", "type": "note",
+        "metadata": {"title": "Root"}, "tags": [], "links": [],
+        "content_text": "mentions /docs/other only in prose",
+        "updated_at": "2026-08-16T12:00:00Z",
+    })
+
+    result = mod.get_memory_context({"node_id": "root", "mode": "local", "depth": 1})
+
+    assert any("Prose mentions are not traversed" in warning for warning in result["warnings"])
+    assert "nap_ln" in result["next_action"]
 
 
 def test_hybrid_context_falls_back_until_local_graph_coverage_is_complete(mod):
