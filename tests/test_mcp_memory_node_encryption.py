@@ -194,8 +194,13 @@ def run():
             "precondition": {"revision": "r1", "read_fingerprint": "fp1"},
             "content_op": {"op": "replace_all", "content_text": "plaintext"},
         })
-    except RuntimeError as exc:
-        assert "cannot safely patch encrypted content or metadata" in str(exc)
+    except mod.SafeToolError as exc:
+        assert exc.code == "encrypted_patch_requires_full_replacement"
+        assert "cannot safely patch client-E2E encrypted content or metadata" in str(exc)
+        assert "nap_bulk" in str(exc)
+        assert "fresh read" in str(exc)
+        assert "nap_tee" not in str(exc)
+        assert "nap_patch" not in str(exc)
     else:
         raise AssertionError("nap_node_patch content updates must fail closed for encrypted projects")
 

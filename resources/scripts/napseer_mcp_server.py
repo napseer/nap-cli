@@ -9424,7 +9424,229 @@ def get_library_node(args):
     return decrypt_node_for_return(node, project_id=library_project_id)
 
 
+def _invalid_node_patch_arguments(message):
+    raise SafeToolError(
+        "invalid_arguments",
+        f"Invalid nap_node_patch arguments: {message} "
+        "Call nap_man with tool='nap_node_patch' for the canonical schema.",
+    )
+
+
+def _node_patch_object(value, field):
+    if not isinstance(value, dict):
+        _invalid_node_patch_arguments(f"{field} must be an object.")
+    return value
+
+
+def _node_patch_reject_unknown(value, allowed, field):
+    unknown = sorted(set(value) - set(allowed))
+    if unknown:
+        _invalid_node_patch_arguments(
+            f"{field} contains unsupported field(s): {', '.join(unknown)}."
+        )
+
+
+def _node_patch_string_list(value, field):
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        _invalid_node_patch_arguments(f"{field} must be an array of strings.")
+
+
+def _node_patch_positive_integer(value, field):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        _invalid_node_patch_arguments(f"{field} must be an integer greater than or equal to 1.")
+
+
+def _validate_node_patch_links(value, field):
+    if not isinstance(value, list):
+        _invalid_node_patch_arguments(f"{field} must be an array.")
+    for index, item in enumerate(value):
+        item_field = f"{field}[{index}]"
+        item = _node_patch_object(item, item_field)
+        _node_patch_reject_unknown(item, {"path", "relation"}, item_field)
+        if not isinstance(item.get("path"), str) or not item.get("path", "").strip():
+            _invalid_node_patch_arguments(f"{item_field}.path is required and must be a string.")
+        if "relation" in item and not isinstance(item["relation"], str):
+            _invalid_node_patch_arguments(f"{item_field}.relation must be a string.")
+
+
+def validate_node_patch_arguments(args):
+    args = _node_patch_object(args, "arguments")
+    allowed = {
+        "node_id",
+        "uri",
+        "mode",
+        "precondition",
+        "set",
+        "merge_metadata",
+        "remove_metadata_keys",
+        "link_ops",
+        "tag_ops",
+        "alias_ops",
+        "content_op",
+        "dry_run",
+        "idempotency_key",
+        "allow_dangling_links",
+    }
+    _node_patch_reject_unknown(args, allowed, "arguments")
+
+    if not any(isinstance(args.get(key), str) and args.get(key, "").strip() for key in ("node_id", "uri")):
+        _invalid_node_patch_arguments("one of node_id or uri is required.")
+    for key in ("node_id", "uri", "idempotency_key"):
+        if key in args and not isinstance(args[key], str):
+            _invalid_node_patch_arguments(f"{key} must be a string.")
+    for key in ("dry_run", "allow_dangling_links"):
+        if key in args and not isinstance(args[key], bool):
+            _invalid_node_patch_arguments(f"{key} must be a boolean.")
+
+    mode = args.get("mode", "object_patch")
+    if not isinstance(mode, str) or mode not in {"object_patch", "replace_editable_fields"}:
+        _invalid_node_patch_arguments(
+            "mode must be object_patch or replace_editable_fields."
+        )
+
+    precondition = args.get("precondition")
+    if precondition is not None:
+        precondition = _node_patch_object(precondition, "precondition")
+        _node_patch_reject_unknown(
+            precondition, {"revision", "read_fingerprint"}, "precondition"
+        )
+        for key in ("revision", "read_fingerprint"):
+            if key in precondition and not isinstance(precondition[key], str):
+                _invalid_node_patch_arguments(f"precondition.{key} must be a string.")
+    if not args.get("dry_run"):
+        if not isinstance(precondition, dict) or not all(
+            isinstance(precondition.get(key), str) and precondition.get(key, "").strip()
+            for key in ("revision", "read_fingerprint")
+        ):
+            _invalid_node_patch_arguments(
+                "precondition.revision and precondition.read_fingerprint are required."
+            )
+
+    set_fields = args.get("set")
+    if set_fields is not None:
+        set_fields = _node_patch_object(set_fields, "set")
+        _node_patch_reject_unknown(
+            set_fields, {"type", "metadata", "tags", "aliases", "links"}, "set"
+        )
+        if "type" in set_fields and not isinstance(set_fields["type"], str):
+            _invalid_node_patch_arguments("set.type must be a string.")
+        if "metadata" in set_fields and not isinstance(set_fields["metadata"], dict):
+            _invalid_node_patch_arguments("set.metadata must be an object.")
+        for key in ("tags", "aliases"):
+            if key in set_fields:
+                _node_patch_string_list(set_fields[key], f"set.{key}")
+        if "links" in set_fields:
+            _validate_node_patch_links(set_fields["links"], "set.links")
+
+    if "merge_metadata" in args and not isinstance(args["merge_metadata"], dict):
+        _invalid_node_patch_arguments("merge_metadata must be an object.")
+    if "remove_metadata_keys" in args:
+        _node_patch_string_list(args["remove_metadata_keys"], "remove_metadata_keys")
+
+    for field in ("tag_ops", "alias_ops"):
+        if field not in args:
+            continue
+        operations = _node_patch_object(args[field], field)
+        _node_patch_reject_unknown(operations, {"add", "remove", "set"}, field)
+        for operation, values in operations.items():
+            _node_patch_string_list(values, f"{field}.{operation}")
+
+    if "link_ops" in args:
+        link_ops = args["link_ops"]
+        if not isinstance(link_ops, list):
+            _invalid_node_patch_arguments("link_ops must be an array.")
+        for index, item in enumerate(link_ops):
+            field = f"link_ops[{index}]"
+            item = _node_patch_object(item, field)
+            operation = item.get("op")
+            if not isinstance(operation, str):
+                _invalid_node_patch_arguments(
+                    f"{field}.op must be add, remove, or set."
+                )
+            if operation in {"add", "remove"}:
+                _node_patch_reject_unknown(item, {"op", "path", "relation"}, field)
+                if not isinstance(item.get("path"), str) or not item.get("path", "").strip():
+                    _invalid_node_patch_arguments(f"{field}.path is required and must be a string.")
+                if "relation" in item and not isinstance(item["relation"], str):
+                    _invalid_node_patch_arguments(f"{field}.relation must be a string.")
+            elif operation == "set":
+                _node_patch_reject_unknown(item, {"op", "links"}, field)
+                if "links" not in item:
+                    _invalid_node_patch_arguments(f"{field}.links is required.")
+                _validate_node_patch_links(item.get("links"), f"{field}.links")
+            else:
+                _invalid_node_patch_arguments(
+                    f"{field}.op must be add, remove, or set."
+                )
+
+    if "content_op" in args:
+        content_op = _node_patch_object(args["content_op"], "content_op")
+        operation = content_op.get("op")
+        if not operation:
+            _invalid_node_patch_arguments(
+                "content_op.op is required; use 'op', not the legacy 'kind' field."
+            )
+        if not isinstance(operation, str):
+            _invalid_node_patch_arguments("content_op.op must be a string.")
+        shapes = {
+            "replace_all": ({"op", "content_text"}, {"content_text"}),
+            "replace_lines": (
+                {"op", "start_line", "end_line", "new_lines", "ends_with_newline"},
+                {"start_line", "end_line", "new_lines"},
+            ),
+            "insert_before": (
+                {"op", "line", "new_lines", "ends_with_newline"},
+                {"line", "new_lines"},
+            ),
+            "insert_after": (
+                {"op", "line", "new_lines", "ends_with_newline"},
+                {"line", "new_lines"},
+            ),
+            "delete_lines": (
+                {"op", "start_line", "end_line", "ends_with_newline"},
+                {"start_line", "end_line"},
+            ),
+        }
+        if operation not in shapes:
+            _invalid_node_patch_arguments(
+                "content_op.op must be replace_all, replace_lines, insert_before, "
+                "insert_after, or delete_lines."
+            )
+        allowed_fields, required_fields = shapes[operation]
+        _node_patch_reject_unknown(content_op, allowed_fields, "content_op")
+        missing = sorted(required_fields - set(content_op))
+        if missing:
+            _invalid_node_patch_arguments(
+                f"content_op is missing required field(s): {', '.join(missing)}."
+            )
+        if operation == "replace_all" and not isinstance(content_op["content_text"], str):
+            _invalid_node_patch_arguments("content_op.content_text must be a string.")
+        for key in ("start_line", "end_line", "line"):
+            if key in content_op:
+                _node_patch_positive_integer(content_op[key], f"content_op.{key}")
+        if "new_lines" in content_op:
+            _node_patch_string_list(content_op["new_lines"], "content_op.new_lines")
+        if "ends_with_newline" in content_op and not isinstance(
+            content_op["ends_with_newline"], bool
+        ):
+            _invalid_node_patch_arguments("content_op.ends_with_newline must be a boolean.")
+
+    if mode == "replace_editable_fields" and any(
+        key in args
+        for key in (
+            "merge_metadata",
+            "remove_metadata_keys",
+            "link_ops",
+            "tag_ops",
+            "alias_ops",
+            "content_op",
+        )
+    ):
+        _invalid_node_patch_arguments("replace_editable_fields mode accepts only set.")
+
+
 def guarded_node_patch(args):
+    validate_node_patch_arguments(args)
     project_id = resolve_project_id(args)
     existing = resolve_existing_node_ref(args, view="edit")
     node_id = existing["id"]
@@ -9435,8 +9657,13 @@ def guarded_node_patch(args):
     if project_memory_encryption_active(project_id):
         set_fields = args.get("set") if isinstance(args.get("set"), dict) else {}
         if args.get("content_op") or args.get("merge_metadata") or args.get("remove_metadata_keys") or "metadata" in set_fields:
-            raise RuntimeError(
-                "nap_node_patch cannot safely patch encrypted content or metadata; use nap_tee or nap_patch with replacement fields"
+            raise SafeToolError(
+                "encrypted_patch_requires_full_replacement",
+                "nap_node_patch cannot safely patch client-E2E encrypted content or metadata. "
+                "Read the complete current node with nap_node_get, then use nap_bulk with one "
+                "node_id/uri item containing the complete replacement content and metadata. "
+                "nap_bulk is a full replacement without patch preconditions; preserve every field "
+                "and write immediately from the fresh read."
             )
     payload = {"precondition": precondition}
     for key in [
@@ -15931,6 +16158,16 @@ TOOL_PROFILES = {
 }
 
 REMOVED_TOOL_REPLACEMENTS = {
+    "nap_tee": (
+        "Use nap_create_node for a new node. For an existing node, use "
+        "fingerprint-guarded nap_node_patch; use one-node nap_bulk only when a "
+        "fresh complete client-E2E full replacement is required."
+    ),
+    "nap_patch": (
+        "Use fingerprint-guarded nap_node_patch. For client-E2E content or metadata, "
+        "read the complete current node first and use one-node nap_bulk as an explicit "
+        "full replacement."
+    ),
     "nap_recent": "Use nap_discover without q and sort='updated_desc'.",
     "nap_find_related": "Use nap_context with direction='both' and depth=1.",
     "nap_backlinks": "Use nap_context with direction='incoming' and depth=1.",
@@ -16790,7 +17027,10 @@ def man_tool(args):
             "removed": True,
             "replacement": REMOVED_TOOL_REPLACEMENTS[name],
         }
-    raise RuntimeError(f"unknown tool: {name}")
+    raise SafeToolError(
+        "unknown_tool",
+        "Unknown or unavailable MCP tool. Use nap_apropos to discover the canonical surface.",
+    )
 
 
 def tree_memory(args):

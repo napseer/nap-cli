@@ -68,6 +68,67 @@ def test_pruned_and_profile_gated_calls_are_actionable(mod):
     assert "workflow" in gated.value.safe_message
 
 
+def test_removed_write_tools_and_unknown_manual_lookups_are_actionable(mod):
+    tee = mod.man_tool({"tool": "nap_tee"})
+    assert tee["removed"] is True
+    assert "nap_create_node" in tee["replacement"]
+    assert "nap_bulk" in tee["replacement"]
+
+    patch = mod.man_tool({"tool": "nap_patch"})
+    assert patch["removed"] is True
+    assert "nap_node_patch" in patch["replacement"]
+    assert "nap_bulk" in patch["replacement"]
+
+    for name in ("nap_tee", "nap_patch"):
+        with pytest.raises(mod.SafeToolError) as removed:
+            mod.call_tool_impl(name, {})
+        assert removed.value.code == "tool_removed"
+
+    with pytest.raises(mod.SafeToolError) as unknown:
+        mod.man_tool({"tool": "not_a_real_tool"})
+    assert unknown.value.code == "unknown_tool"
+    assert "nap_apropos" in unknown.value.safe_message
+
+
+def test_node_patch_rejects_malformed_arguments_before_project_or_node_reads(mod):
+    mod.resolve_project_id = lambda args: (_ for _ in ()).throw(
+        AssertionError("invalid arguments must fail before project resolution")
+    )
+    mod.get_node_by_id = lambda args: (_ for _ in ()).throw(
+        AssertionError("invalid arguments must fail before node reads")
+    )
+    base = {
+        "node_id": "node-1",
+        "precondition": {"revision": "r1", "read_fingerprint": "fp1"},
+    }
+
+    with pytest.raises(mod.SafeToolError) as legacy_metadata:
+        mod.guarded_node_patch({**base, "metadata_patch": {"set": {"status": "done"}}})
+    assert legacy_metadata.value.code == "invalid_arguments"
+    assert "metadata_patch" in legacy_metadata.value.safe_message
+
+    with pytest.raises(mod.SafeToolError) as legacy_content:
+        mod.guarded_node_patch({
+            **base,
+            "content_op": {"kind": "replace_all", "content_text": "updated"},
+        })
+    assert legacy_content.value.code == "invalid_arguments"
+    assert "use 'op'" in legacy_content.value.safe_message
+
+
+def test_node_patch_argument_validation_accepts_canonical_shapes(mod):
+    mod.validate_node_patch_arguments({
+        "node_id": "node-1",
+        "precondition": {"revision": "r1", "read_fingerprint": "fp1"},
+        "content_op": {"op": "replace_all", "content_text": "updated"},
+        "merge_metadata": {"status": "done"},
+        "tag_ops": {"add": ["verified"]},
+        "link_ops": [
+            {"op": "add", "path": "/plans/example", "relation": "implements"}
+        ],
+    })
+
+
 def test_context_and_node_read_schemas_are_bounded(mod):
     by_name = {tool["name"]: tool for tool in mod.all_tools()}
     context = by_name["nap_context"]["inputSchema"]["properties"]
