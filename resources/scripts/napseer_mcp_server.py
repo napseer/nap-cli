@@ -17760,6 +17760,17 @@ class McpRequestRuntime:
 
 def cli_main(argv):
     command = argv[1] if len(argv) > 1 else ""
+    if command == "reindex":
+        args = argv[2:]
+        validate_cli_options(
+            args,
+            value_options={"--limit"},
+            command_label="nap reindex",
+        )
+        print(json.dumps(reindex_project({
+            "limit": int(cli_option(args, "--limit", default="200")),
+        }), indent=2))
+        return
     if command == "configure":
         print(json.dumps(cli_configure_status(), indent=2))
         return

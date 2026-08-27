@@ -33,7 +33,7 @@ def test_root_help_exposes_only_canonical_commands(capsys):
     output = capsys.readouterr().out
     visible = [name for name, metadata in module.COMMAND_METADATA.items() if metadata["visible"]]
     assert visible == [name for name, _summary in module.CANONICAL_COMMANDS]
-    assert len(visible) == 10
+    assert len(visible) == 11
     for name in visible:
         assert f"  {name}" in output
     for hidden in ("chat", "plan", "lineage", "agent", "feedback", "where", "install"):
@@ -99,6 +99,24 @@ def test_init_and_auth_repair_normalize_to_existing_handlers(monkeypatch):
         ("project", ["init", "--slug", "demo"]),
         ("auth", ["repair"]),
     ]
+
+
+def test_reindex_routes_to_worker_and_has_side_effect_free_help(monkeypatch, capsys):
+    module = load_installer()
+    calls = []
+    monkeypatch.setattr(
+        module,
+        "run_wrapper",
+        lambda command, args: calls.append((command, args)) or 0,
+    )
+
+    assert module.main(["nap", "reindex", "--limit", "50"]) == 0
+    assert calls == [("reindex", ["--limit", "50"])]
+
+    calls.clear()
+    assert module.main(["nap", "reindex", "--help"]) == 0
+    assert calls == []
+    assert "Usage: nap reindex [--limit N]" in capsys.readouterr().out
 
 
 def test_update_does_not_overwrite_repository_source(monkeypatch, capsys):

@@ -6,6 +6,7 @@ Usage:
   nap init
   nap status
   nap doctor
+  nap reindex
   nap auth login
   nap project create
   nap project attach
@@ -84,6 +85,7 @@ CANONICAL_COMMANDS = (
     ("init", "Initialize Napseer in the current folder."),
     ("status", "Show concise account, project, and runtime state."),
     ("doctor", "Diagnose local setup without changing it."),
+    ("reindex", "Rebuild the current project's local memory index."),
     ("auth", "Authenticate an account or repair credentials."),
     ("project", "Create, attach, claim, or inspect a project."),
     ("mcp", "Install, update, inspect, or serve the local MCP runtime."),
@@ -96,6 +98,7 @@ COMMAND_METADATA = {
     "init": {"mutates": True, "visible": True},
     "status": {"mutates": False, "visible": True},
     "doctor": {"mutates": False, "visible": True},
+    "reindex": {"mutates": True, "visible": True},
     "auth": {"mutates": True, "visible": True},
     "project": {"mutates": True, "visible": True},
     "mcp": {"mutates": True, "visible": True},
@@ -1066,6 +1069,10 @@ def print_command_help(command):
             "Usage: nap doctor\n"
             "Run read-only checks and print exact repair commands."
         ),
+        "reindex": (
+            "Usage: nap reindex [--limit N]\n"
+            "Rebuild the current project's local search and graph index."
+        ),
         "auth": (
             "Usage: nap auth [status|login|repair]\n"
             "  login   Authenticate an account; does not select a project.\n"
@@ -1445,6 +1452,8 @@ def main(argv):
     if command == "doctor":
         print_json(doctor_status())
         return 0
+    if command == "reindex":
+        return run_wrapper("reindex", args)
     if command == "mcp":
         return handle_mcp(args)
     if command == "version":

@@ -36,6 +36,22 @@ def expect_unknown(mod, argv, expected_fragment):
         raise AssertionError(f"expected RuntimeError for {argv}")
 
 
+def test_reindex_cli_rebuilds_with_bounded_page_size():
+    mod = load_module()
+    calls = []
+    mod.reindex_project = lambda args: calls.append(dict(args)) or {
+        "indexed": 7,
+        "graph_complete": True,
+    }
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        mod.cli_main(["napseer_mcp_server.py", "reindex", "--limit", "50"])
+
+    assert calls == [{"limit": 50}]
+    assert '"indexed": 7' in output.getvalue()
+
+
 def test_auth_login_rejects_history_expansion_tail_before_browser():
     mod = load_module()
     mod.operator_account_login = lambda _args: (_ for _ in ()).throw(
