@@ -88,12 +88,14 @@ def test_successful_create_transitions_local_state_to_project_mode():
     mod = load_module()
     configure_account_state(mod, mod.OPERATOR_ACCOUNT_OAUTH_SCOPE)
     saves = []
+    locators = []
     mod.request_json = lambda method, path, payload=None: {
         "id": PROJECT_ID,
         "slug": payload["slug"],
         "name": payload["name"],
     }
     mod.save_auth = lambda updates: saves.append(dict(updates))
+    mod.write_project_locator = lambda project: locators.append(dict(project))
 
     project, status, _message = mod.create_project_with_state(project_args())
 
@@ -101,6 +103,7 @@ def test_successful_create_transitions_local_state_to_project_mode():
     assert project["id"] == PROJECT_ID
     assert saves[0]["project_id"] == PROJECT_ID
     assert saves[0]["account_mode"] == "operator_project"
+    assert locators == [project]
 
 
 def test_server_scope_denial_is_actionable():

@@ -23,6 +23,7 @@ SMOKES = [
     "test_project_attach_oauth.py",
     "test_project_encryption_enable_payload.py",
     "test_project_init_wizard.py",
+    "test_project_locator.py",
     "test_two_passphrase_boundary.py",
 ]
 

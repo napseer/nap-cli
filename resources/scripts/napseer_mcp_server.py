@@ -318,6 +318,9 @@ def send_telemetry_event_async(event, component, outcome="success", **fields):
 
 AUTH_DIR = local_state_dir()
 AUTH_PATH = pathlib.Path(os.environ.get("NAPSEER_AUTH_FILE", AUTH_DIR / "auth.json")).expanduser().resolve()
+PROJECT_LOCATOR_SCHEMA = "napseer.project.v1"
+PROJECT_LOCATOR_FILENAME = "project.json"
+PROJECT_LOCATOR_FIELDS = {"schema", "base_url", "project_id", "project_slug"}
 GATEWAY_AUTH_PATH = AUTH_DIR / "gateway-auth.json"
 VAULT_PATH = AUTH_DIR / "vault.json"
 LOCAL_VAULT_KEY_PATH = AUTH_DIR / "vault.local-key"
@@ -857,6 +860,210 @@ def write_public_auth(data):
         atomic_write_auth_file(public)
 
 
+def project_locator_path():
+    """Return the repository-visible project locator beside private auth state."""
+    return AUTH_DIR / PROJECT_LOCATOR_FILENAME
+
+
+def validate_project_locator(data):
+    if not isinstance(data, dict):
+        raise SafeToolError(
+            "project_locator_invalid",
+            ".napseer/project.json must contain one JSON object.",
+        )
+    if set(data) != PROJECT_LOCATOR_FIELDS:
+        raise SafeToolError(
+            "project_locator_invalid",
+            ".napseer/project.json has unsupported or missing fields. Regenerate it with a current nap CLI.",
+        )
+    if data.get("schema") != PROJECT_LOCATOR_SCHEMA:
+        raise SafeToolError(
+            "project_locator_schema_unsupported",
+            ".napseer/project.json uses an unsupported schema. Update nap before attaching this repository.",
+        )
+
+    raw_base_url = str(data.get("base_url") or "").strip().rstrip("/")
+    parsed = urllib.parse.urlparse(raw_base_url)
+    loopback = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    if (
+        parsed.scheme not in ({"https"} if not loopback else {"http", "https"})
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise SafeToolError(
+            "project_locator_invalid",
+            ".napseer/project.json base_url must be an HTTPS origin (HTTP is allowed only for loopback development).",
+        )
+
+    try:
+        project_id = str(uuid.UUID(str(data.get("project_id") or "")))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise SafeToolError(
+            "project_locator_invalid",
+            ".napseer/project.json project_id must be a UUID.",
+        ) from exc
+
+    project_slug = str(data.get("project_slug") or "").strip().lower()
+    if (
+        not project_slug
+        or len(project_slug) > 64
+        or not re.fullmatch(r"[a-z0-9._]+(?:-[a-z0-9._]+)*", project_slug)
+    ):
+        raise SafeToolError(
+            "project_locator_invalid",
+            ".napseer/project.json project_slug is invalid.",
+        )
+
+    return {
+        "schema": PROJECT_LOCATOR_SCHEMA,
+        "base_url": raw_base_url,
+        "project_id": project_id,
+        "project_slug": project_slug,
+    }
+
+
+def load_project_locator():
+    path = project_locator_path()
+    if not path.exists():
+        return None
+    if path.is_symlink():
+        raise SafeToolError(
+            "project_locator_invalid",
+            ".napseer/project.json must be a regular file, not a symlink.",
+        )
+    try:
+        if path.stat().st_size > 4096:
+            raise ValueError("project locator is too large")
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except SafeToolError:
+        raise
+    except Exception as exc:
+        raise SafeToolError(
+            "project_locator_invalid",
+            ".napseer/project.json could not be read as bounded JSON.",
+        ) from exc
+    return validate_project_locator(data)
+
+
+def require_project_locator_service(locator):
+    if locator and locator["base_url"] != str(BASE_URL or "").rstrip("/"):
+        raise SafeToolError(
+            "project_locator_service_mismatch",
+            "This repository names a different Napseer service. Verify the repository, then set NAPSEER_BASE_URL explicitly before attaching.",
+        )
+
+
+def project_locator_status(locator=None):
+    locator = load_project_locator() if locator is None else locator
+    if not locator:
+        return {
+            "declared": False,
+            "path": str(project_locator_path()),
+            "matches_local_auth": None,
+        }
+    configured_project_id = str(DEFAULT_PROJECT_ID or "")
+    return {
+        "declared": True,
+        "path": str(project_locator_path()),
+        **locator,
+        "matches_local_auth": (
+            locator["project_id"] == configured_project_id
+            if configured_project_id
+            else None
+        ),
+    }
+
+
+def ensure_project_locator_ignore_policy():
+    state_dir = project_locator_path().parent
+    if state_dir.is_symlink():
+        raise SafeToolError(
+            "project_locator_invalid",
+            "The repository .napseer directory must not be a symlink when writing project identity.",
+        )
+    state_dir.mkdir(parents=True, exist_ok=True)
+    nested_ignore = state_dir / ".gitignore"
+    if nested_ignore.is_symlink():
+        raise SafeToolError(
+            "project_locator_invalid",
+            ".napseer/.gitignore must be a regular file, not a symlink.",
+        )
+    nested_lines = []
+    if nested_ignore.exists():
+        nested_lines = nested_ignore.read_text(encoding="utf-8").splitlines()
+    if "*" not in nested_lines:
+        nested_lines.insert(0, "*")
+    for exception in ("!.gitignore", f"!{PROJECT_LOCATOR_FILENAME}"):
+        if exception not in nested_lines:
+            nested_lines.append(exception)
+    nested_ignore.write_text("\n".join(nested_lines) + "\n", encoding="utf-8")
+
+    repository_root = state_dir.parent
+    root_ignore = repository_root / ".gitignore"
+    if root_ignore.is_symlink():
+        raise SafeToolError(
+            "project_locator_invalid",
+            "The repository .gitignore must be a regular file, not a symlink.",
+        )
+    root_lines = root_ignore.read_text(encoding="utf-8").splitlines() if root_ignore.exists() else []
+    root_lines = [line for line in root_lines if line not in {"/.napseer/", ".napseer/"}]
+    managed_lines = (
+        "/.napseer/*",
+        "!/.napseer/.gitignore",
+        f"!/.napseer/{PROJECT_LOCATOR_FILENAME}",
+    )
+    for line in managed_lines:
+        if line not in root_lines:
+            root_lines.append(line)
+    root_ignore.write_text("\n".join(root_lines) + "\n", encoding="utf-8")
+
+
+def write_project_locator(project, *, base_url=None):
+    project = project if isinstance(project, dict) else {}
+    desired = validate_project_locator(
+        {
+            "schema": PROJECT_LOCATOR_SCHEMA,
+            "base_url": base_url or BASE_URL,
+            "project_id": project.get("id") or project.get("project_id"),
+            "project_slug": project.get("slug") or project.get("project_slug"),
+        }
+    )
+    existing = load_project_locator()
+    if existing and (
+        existing["base_url"] != desired["base_url"]
+        or existing["project_id"] != desired["project_id"]
+    ):
+        raise SafeToolError(
+            "project_locator_mismatch",
+            "Local project credentials do not match the committed .napseer/project.json locator. Attach the declared project or intentionally update the locator before continuing.",
+        )
+
+    ensure_project_locator_ignore_policy()
+    path = project_locator_path()
+    if path.is_symlink():
+        raise SafeToolError(
+            "project_locator_invalid",
+            ".napseer/project.json must be a regular file, not a symlink.",
+        )
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        temporary.write_text(json.dumps(desired, indent=2) + "\n", encoding="utf-8")
+        chmod_best_effort(temporary, 0o644)
+        os.replace(temporary, path)
+        chmod_best_effort(path, 0o644)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    return project_locator_status(desired)
+
+
 def read_vault(passphrase, return_key=False):
     envelope = json.loads(VAULT_PATH.read_text(encoding="utf-8"))
     if envelope.get("schema") != VAULT_SCHEMA:
@@ -1200,10 +1407,21 @@ def gateway_lock():
 
 
 def gateway_status():
+    locator = load_project_locator()
+    require_project_locator_service(locator)
     unlocked = gateway_is_unlocked()
     remote_enabled = gateway_remote_enabled_value(unlocked)
     listener_ready = bool(remote_enabled and GATEWAY_LISTENER_CONNECTED)
-    if not DEFAULT_PROJECT_ID or not TOKEN:
+    locator_mismatch = bool(
+        locator and DEFAULT_PROJECT_ID and str(DEFAULT_PROJECT_ID) != locator["project_id"]
+    )
+    if locator_mismatch:
+        status = "project_locator_mismatch"
+        message = "Local project credentials do not match the committed project locator."
+    elif (not DEFAULT_PROJECT_ID or not TOKEN) and locator:
+        status = "project_access_required"
+        message = "This repository declares a project but needs local access; run nap project attach."
+    elif not DEFAULT_PROJECT_ID or not TOKEN:
         status = "not_configured"
         message = "No project/token is configured for this directory."
     elif not vault_exists():
@@ -1237,6 +1455,7 @@ def gateway_status():
         "project_slug": AUTH.get("project_slug"),
         "project_name": AUTH.get("project_name"),
         "project_configured": bool(DEFAULT_PROJECT_ID),
+        "project_locator": project_locator_status(locator),
         "agent_id": AUTH.get("agent_id"),
         "worker_id": AUTH.get("worker_id"),
         "token_expires_at": TOKEN_EXPIRES_AT,
@@ -5542,7 +5761,9 @@ Subcommands:
   attach                    Attach this directory to an existing
       [--no-browser]         project you own. Opens a browser for the
       [--timeout SECONDS]    Keycloak loopback login, then lets you pick
-                            the project from a list.
+                            the project from a list. If this repository
+                            commits .napseer/project.json, attachment is
+                            constrained to that exact project.
 
   claim                     Claim an anonymous project (or link this
       [--no-browser]         directory to your operator account) via
@@ -5564,9 +5785,11 @@ Subcommands:
 First-time flow:
   1. From a fresh project directory, run `nap project init`.
      The CLI will create a new project for you and write the
-     worker bearer to ./.napseer/auth.json.
+     worker bearer to ./.napseer/auth.json. It also writes the
+     non-secret ./.napseer/project.json locator for Git.
   2. To attach a directory to a project you already own, run
-     `nap project attach` and sign in via the browser.
+     `nap project attach` and sign in via the browser. A cloned
+     repository with a locator will never auto-create a duplicate.
   3. To check what is attached, run `nap project status`.
 """
 
@@ -7898,6 +8121,8 @@ def oauth_loopback_authorize(args):
     }
     if args.get("claim_token"):
         authorization_payload["claim_token"] = args["claim_token"]
+    if args.get("project_id_hint"):
+        authorization_payload["project_id_hint"] = args["project_id_hint"]
     authorization = request_json(
         "POST",
         "/v1/oauth/native/authorizations",
@@ -8000,14 +8225,22 @@ def operator_account_login(args=None):
 
 def operator_project_attach(args=None):
     args = args or {}
+    locator = load_project_locator()
+    require_project_locator_service(locator)
     result = oauth_loopback_authorize({
         **args,
         "flow": "local_operator_access",
         "scope": args.get("scope") or LOCAL_PROJECT_OAUTH_SCOPE,
+        "project_id_hint": locator["project_id"] if locator else None,
     })
     project_id = result.get("project_id")
     if not project_id:
         raise RuntimeError("OAuth authorization did not return a selected project_id")
+    if locator and str(project_id) != locator["project_id"]:
+        raise SafeToolError(
+            "project_locator_mismatch",
+            "OAuth selected a different project than the committed .napseer/project.json locator; local credentials were not changed.",
+        )
     token_expires_at = iso_timestamp_after_seconds(int(result.get("expires_in") or 0))
     replace_public_auth_state(
         {
@@ -8032,6 +8265,13 @@ def operator_project_attach(args=None):
         })
     except Exception:
         project = None
+    if project:
+        write_project_locator(project, base_url=result.get("api_base_url") or BASE_URL)
+    elif not locator:
+        raise SafeToolError(
+            "project_locator_sync_failed",
+            "Project access was stored, but public project metadata could not be fetched for .napseer/project.json. Retry `nap project init` when the service is reachable.",
+        )
     return {
         "status": "attached",
         "mode": "operator_project",
@@ -8039,6 +8279,7 @@ def operator_project_attach(args=None):
         "base_url": result.get("api_base_url") or BASE_URL,
         "project_id": project_id,
         "project": project,
+        "project_locator": project_locator_status(locator if project is None else None),
         "scope": result.get("scope"),
         "token_expires_at": token_expires_at,
         "message": "OAuth2 PKCE project token and selected project stored in this directory's Napseer auth state.",
@@ -8116,9 +8357,7 @@ def _refresh_public_auth_state_locked():
 def ensure_local_files():
     AUTH_DIR.mkdir(exist_ok=True)
     chmod_best_effort(AUTH_DIR, 0o700)
-    gitignore = AUTH_DIR / ".gitignore"
-    if not gitignore.exists():
-        gitignore.write_text("*\n!.gitignore\n", encoding="utf-8")
+    ensure_project_locator_ignore_policy()
     key_path = pathlib.Path(AUTH["ssh_key_path"] or DEFAULT_KEY_PATH).expanduser()
     public_key_path = pathlib.Path(str(key_path) + ".pub")
     if not key_path.exists():
@@ -8490,7 +8729,19 @@ def resolve_project_id(args):
         if AUTH_PATH.exists() or not DEFAULT_PROJECT_ID:
             refresh_public_auth_state()
         project_id = DEFAULT_PROJECT_ID
+        locator = load_project_locator()
+        require_project_locator_service(locator)
+        if project_id and locator and str(project_id) != locator["project_id"]:
+            raise SafeToolError(
+                "project_locator_mismatch",
+                "Local project credentials do not match the committed .napseer/project.json locator. Run `nap project status` and attach the declared project.",
+            )
         if not project_id:
+            if locator:
+                raise SafeToolError(
+                    "project_access_required",
+                    "This repository already declares a Napseer project and will not create a duplicate anonymous project. Run `nap project attach`; if the project is still anonymous, claim it from a machine that retains its enrollment identity, then retry here.",
+                )
             slug = default_project_slug()
             try:
                 initialized = bootstrap_project(
@@ -8570,6 +8821,7 @@ def create_project_with_state(args):
     if AUTH.get("account_mode") == "operator_account":
         auth_updates["account_mode"] = "operator_project"
     save_auth(auth_updates)
+    write_project_locator(project)
     try:
         register_project_signing_key({"label": "local-project-key"})
     except Exception:
@@ -8764,6 +9016,13 @@ def looks_like_service_bootstrap_token(value):
 
 
 def cli_project_create(args):
+    locator = load_project_locator()
+    require_project_locator_service(locator)
+    if locator:
+        raise SafeToolError(
+            "project_locator_exists",
+            "This repository already declares a Napseer project in .napseer/project.json. Run `nap project attach` instead of creating a second project; update the committed locator intentionally if this repository is being rebound.",
+        )
     positionals = cli_positionals(args)
     slug = cli_option(args, "--slug", default=positionals[0] if positionals else default_project_slug())
     name = cli_option(args, "--name", default=default_project_name(slug))
@@ -8795,10 +9054,37 @@ def cli_project_init(args):
     slug = cli_option(args, "--slug", default=positionals[0] if positionals else default_project_slug())
     name = cli_option(args, "--name", default=default_project_name(slug))
     description = cli_option(args, "--description", default="")
+    locator = load_project_locator()
+    require_project_locator_service(locator)
 
     already_initialized = bool(TOKEN) and bool(DEFAULT_PROJECT_ID)
     if already_initialized:
-        existing_slug = load_public_auth_file().get("project_slug") or ""
+        if locator and str(DEFAULT_PROJECT_ID) != locator["project_id"]:
+            raise SafeToolError(
+                "project_locator_mismatch",
+                "Local project credentials do not match the committed .napseer/project.json locator. Run `nap project status` and attach the declared project.",
+            )
+        existing_slug = load_public_auth_file().get("project_slug") or (locator or {}).get("project_slug") or ""
+        if not existing_slug:
+            try:
+                project = request_json("GET", f"/v1/projects/{DEFAULT_PROJECT_ID}")
+                existing_slug = str(project.get("slug") or "")
+                save_auth_file_credentials(
+                    {
+                        "project_slug": existing_slug,
+                        "project_name": project.get("name"),
+                        "project_encryption_state": project.get("encryption_state"),
+                    }
+                )
+            except Exception as exc:
+                raise SafeToolError(
+                    "project_locator_sync_failed",
+                    "The attached project is missing public slug metadata needed for .napseer/project.json. Retry `nap project init` when the service is reachable.",
+                ) from exc
+        locator_result = write_project_locator(
+            {"id": DEFAULT_PROJECT_ID, "slug": existing_slug},
+            base_url=(locator or {}).get("base_url") or BASE_URL,
+        )
         return {
             "status": "already_initialized",
             "message": (
@@ -8808,6 +9094,21 @@ def cli_project_init(args):
             "project_id": DEFAULT_PROJECT_ID,
             "project_slug": existing_slug,
             "auth_path": str(AUTH_PATH),
+            "project_locator": locator_result,
+        }
+
+    if locator:
+        return {
+            "status": "project_access_required",
+            "message": (
+                "This repository already declares a Napseer project and will not create a duplicate anonymous project. "
+                "Run `nap project attach`. If the project is still anonymous, claim it from a machine that retains its enrollment identity, then retry here."
+            ),
+            "project_id": locator["project_id"],
+            "project_slug": locator["project_slug"],
+            "auth_path": str(AUTH_PATH),
+            "project_locator": project_locator_status(locator),
+            "next": {"attach_project": "nap project attach"},
         }
 
     steps = []
@@ -8847,6 +9148,7 @@ def cli_project_init(args):
             ),
             "steps": steps,
             "auth_path": str(AUTH_PATH),
+            "project_locator": project_locator_status(),
         }
 
     steps.append({"step": "create_project", "status": "skipped", "reason": "project already configured"})
@@ -8855,6 +9157,7 @@ def cli_project_init(args):
         "message": "Folder initialized; existing project kept.",
         "project_id": DEFAULT_PROJECT_ID,
         "auth_path": str(AUTH_PATH),
+        "project_locator": project_locator_status(),
         "steps": steps,
     }
 
@@ -9110,10 +9413,15 @@ def cli_project_claim(args):
 
 
 def cli_configure_status():
+    locator = load_project_locator()
+    require_project_locator_service(locator)
     project_configured = bool(DEFAULT_PROJECT_ID)
+    locator_mismatch = bool(
+        locator and project_configured and str(DEFAULT_PROJECT_ID) != locator["project_id"]
+    )
     account_only = AUTH.get("account_mode") == "operator_account" and not project_configured
     encryption = {"state": "plaintext", "updated_at": ""}
-    if project_configured:
+    if project_configured and not locator_mismatch:
         try:
             refresh_current_project_metadata()
             encryption = project_encryption_status({})
@@ -9128,10 +9436,22 @@ def cli_configure_status():
             else:
                 encryption = {"state": AUTH.get("project_encryption_state") or "unknown", "updated_at": ""}
     return {
-        "status": "configured" if project_configured else "not_configured",
-        "message": (
-            "Project is configured for this directory."
+        "status": (
+            "project_locator_mismatch"
+            if locator_mismatch
+            else "configured"
             if project_configured
+            else "project_access_required"
+            if locator
+            else "not_configured"
+        ),
+        "message": (
+            "Local project credentials do not match the committed .napseer/project.json locator. Attach the declared project before continuing."
+            if locator_mismatch
+            else "Project is configured for this directory."
+            if project_configured
+            else "This repository declares a Napseer project but has no local credentials. Run `nap project attach`; request access or claim the anonymous project from its enrolled machine if needed."
+            if locator
             else (
                 "Account authenticated; no project is attached. Run `nap project attach` "
                 "for an existing project or `nap project create` for a new one."
@@ -9147,6 +9467,7 @@ def cli_configure_status():
         "project_configured": project_configured,
         "project_id": DEFAULT_PROJECT_ID or "",
         "project_slug": load_public_auth_file().get("project_slug", ""),
+        "project_locator": project_locator_status(locator),
         "encryption_state": encryption.get("state") or "unknown",
         "encryption_updated_at": encryption.get("updated_at") or "",
         "token_expires_at": TOKEN_EXPIRES_AT,
@@ -13394,6 +13715,12 @@ def claim_account(args):
             "claimed_at": iso_now(),
         }
     )
+    current = load_public_auth_file()
+    if current.get("project_id") and current.get("project_slug"):
+        write_project_locator(
+            {"id": current["project_id"], "slug": current["project_slug"]},
+            base_url=current.get("base_url") or BASE_URL,
+        )
     return {
         "claim_url": claim["claim_url"],
         "expires_at": claim["expires_at"],

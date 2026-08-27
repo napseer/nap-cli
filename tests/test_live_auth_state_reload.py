@@ -15,6 +15,8 @@ def load_module():
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(module)
+    module.load_project_locator = lambda: None
+    module.require_project_locator_service = lambda _locator: None
     return module
 
 

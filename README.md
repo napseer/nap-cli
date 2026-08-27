@@ -28,6 +28,10 @@ Current state:
 - Operator OAuth credentials remain in `.napseer/auth.json`. A repaired local
   gateway uses a separate `.napseer/gateway-auth.json` worker identity, so
   relay token renewal cannot rotate or overwrite the operator/MCP session.
+- `.napseer/project.json` is the commit-safe project locator. It contains only
+  the schema, API origin, project UUID, and slug; it never contains tokens,
+  account or worker identity, encryption state, keys, passphrases, or claim
+  links. A fresh clone uses it to attach the intended project.
 - CLI terminal and schedule operations call the running gateway's
   loopback-only, CSRF-protected control API. PTYs therefore live in the daemon
   instead of disappearing when a CLI subprocess exits.
@@ -70,6 +74,13 @@ authentication. Authentication through `nap project claim` is required only
 after the anonymous account reaches its service limit (currently one project
 or 100 stored nodes), or when its durable local enrollment identity is no
 longer recoverable.
+
+A cloned repository that already commits `.napseer/project.json` is not a new
+workspace: `nap init` and project-scoped MCP tools fail closed instead of
+creating a duplicate anonymous project. Run `nap project attach`; the OAuth
+approval is constrained to the locator's project after normal server-side
+access validation. If that project is still anonymous, claim it from a machine
+that retains its enrollment identity, then attach from the new computer.
 
 In Bash, run commands as `nap update`, `nap auth login`, and so on. A leading
 `!` is shell history expansion: `!nap update` replays the most recent command
