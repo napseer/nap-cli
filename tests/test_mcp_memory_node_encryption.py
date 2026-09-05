@@ -393,9 +393,9 @@ def run():
     assert patch_body["encrypted_content_envelope"]["aad_subject"] == "node_id:node-1"
 
     bulk_writes = []
-    mod.acquire_project_lock = lambda args: {"id": "lock-1", "lease_token": "lease-1"}
+    mod.acquire_project_lock = lambda args, **kwargs: {"id": "lock-1", "lease_token": "lease-1"}
     mod.lock_headers = lambda lock: {"X-Lock": lock["id"]}
-    mod.release_project_lock = lambda args: None
+    mod.release_project_lock = lambda args, **kwargs: None
     mod.try_get_node_by_path = lambda path, allow_agent=False: None
     mod.request_json = lambda method, path, payload=None, **kwargs: bulk_writes.append((method, path, payload, kwargs)) or {
         "id": "node-bulk",

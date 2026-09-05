@@ -8,8 +8,8 @@ session. This supervisor owns those client-facing pipes while treating
 - valid requests are forwarded without head-of-line blocking and responses
   are correlated by JSON-RPC request id;
 - notifications never create client-facing responses;
-- cancellation releases the matching pending request and forwards the
-  notification to the worker;
+- cancellation stops waiting for a result but retains unfinished work until
+  the worker acknowledges cleanup, with bounded grace before termination;
 - a worker exit fails every affected in-flight request once and never replays
   it automatically;
 - a replaced worker, or an explicitly configured runtime dependency behind a
@@ -26,10 +26,12 @@ import json
 import os
 import pathlib
 import queue
+import select
 import signal
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import BinaryIO, Callable
 
@@ -54,11 +56,19 @@ MAX_IN_FLIGHT_REQUESTS = max(
     int(os.environ.get("NAPSEER_MCP_MAX_IN_FLIGHT_REQUESTS", "32")),
 )
 WORKER_RESTARTED_ERROR = -32098
+REQUEST_REJECTED_ERROR = -32097
+CANCEL_GRACE_SECONDS = max(1, int(os.environ.get("NAPSEER_MCP_CANCEL_GRACE_SECONDS", "10")))
+WRITE_TIMEOUT_SECONDS = max(1, int(os.environ.get("NAPSEER_MCP_WRITE_TIMEOUT_SECONDS", "5")))
+REQUEST_FINISHED = "notifications/napseer/requestFinished"
 _CANCELLED = object()
 
 
 class WorkerUnavailable(RuntimeError):
     """The replaceable MCP worker could not complete a request."""
+
+
+class RequestRejected(WorkerUnavailable):
+    """The request was not sent to the worker and cannot have executed."""
 
 
 def source_identity(path: pathlib.Path) -> tuple[int, int, int]:
@@ -112,16 +122,16 @@ def cancelled_request_id(message: bytes):
     return True, params.get("requestId")
 
 
-def worker_error(message: bytes) -> bytes:
+def worker_error(message: bytes, *, rejected=False) -> bytes:
     payload = {
         "jsonrpc": "2.0",
         "id": request_id(message),
         "error": {
-            "code": WORKER_RESTARTED_ERROR,
+            "code": REQUEST_REJECTED_ERROR if rejected else WORKER_RESTARTED_ERROR,
             "message": (
                 "Napseer MCP could not complete this request. The outcome may be "
                 "uncertain; inspect state before retrying a mutation."
-            ),
+            ) if not rejected else "Napseer MCP is busy or this request id is still active. This request was not started; retry later.",
         },
     }
     return json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
@@ -133,6 +143,8 @@ class PendingRequest:
     key: str
     generation: int
     response: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=1))
+    cancelled: bool = False
+    cancel_timer: threading.Timer | None = None
 
 
 class Worker:
@@ -156,7 +168,7 @@ class Worker:
 
     def _discard_stderr(self, stream: BinaryIO) -> None:
         try:
-            for _line in stream:
+            while stream.read(4096):
                 pass
         finally:
             stream.close()
@@ -180,6 +192,8 @@ class Worker:
                 if pending.generation != generation:
                     continue
                 self._pending.pop(key, None)
+                if pending.cancel_timer is not None:
+                    pending.cancel_timer.cancel()
                 failed.append(pending)
         for pending in failed:
             self._signal(pending, error)
@@ -189,18 +203,32 @@ class Worker:
         if payload is None:
             return False
         normalized = response if response.endswith(b"\n") else response + b"\n"
+        if payload.get("method") == REQUEST_FINISHED:
+            params = payload.get("params") or {}
+            if isinstance(params, dict) and "requestId" in params:
+                key = request_key(params["requestId"])
+                with self._pending_lock:
+                    pending = self._pending.get(key)
+                    if pending is not None and pending.generation == generation and pending.cancelled:
+                        self._pending.pop(key, None)
+                        if pending.cancel_timer is not None:
+                            pending.cancel_timer.cancel()
+            return True
         if "id" in payload:
             key = request_key(payload.get("id"))
             with self._pending_lock:
                 pending = self._pending.get(key)
                 if pending is not None and pending.generation == generation:
                     self._pending.pop(key, None)
+                    if pending.cancel_timer is not None:
+                        pending.cancel_timer.cancel()
                 else:
                     pending = None
             if pending is not None:
-                self._signal(pending, normalized)
+                if not pending.cancelled:
+                    self._signal(pending, normalized)
                 return True
-        if "method" in payload and self.unsolicited is not None:
+        if generation == self.generation and "method" in payload and self.unsolicited is not None:
             self.unsolicited(normalized)
         return True
 
@@ -240,12 +268,15 @@ class Worker:
         if process is None:
             return
         if process.poll() is None:
-            process.terminate()
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.wait()
+                process.wait(timeout=2)
         for stream in (process.stdin, process.stdout):
             if stream is not None:
                 try:
@@ -265,6 +296,7 @@ class Worker:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     bufsize=0,
+                    env={**os.environ, "NAPSEER_MCP_SUPERVISED": "1"},
                 )
             except (OSError, subprocess.SubprocessError) as exc:
                 raise WorkerUnavailable("unable to start Napseer MCP worker") from exc
@@ -275,6 +307,7 @@ class Worker:
             self.generation += 1
             generation = self.generation
             self.process = process
+            os.set_blocking(process.stdin.fileno(), False)
             self.identity = identity
             threading.Thread(
                 target=self._discard_stderr,
@@ -309,14 +342,30 @@ class Worker:
                 self.start()
 
     def _write(self, process: subprocess.Popen[bytes], message: bytes) -> None:
-        with self._stdin_lock:
+        deadline = time.monotonic() + WRITE_TIMEOUT_SECONDS
+        if not self._stdin_lock.acquire(timeout=WRITE_TIMEOUT_SECONDS):
+            raise WorkerUnavailable("Napseer MCP worker input timed out")
+        try:
             if self.process is not process or process.poll() is not None or process.stdin is None:
                 raise WorkerUnavailable("Napseer MCP worker is not running")
             try:
-                process.stdin.write(message if message.endswith(b"\n") else message + b"\n")
-                process.stdin.flush()
-            except (BrokenPipeError, OSError) as exc:
+                remaining = memoryview(message if message.endswith(b"\n") else message + b"\n")
+                while remaining:
+                    timeout = deadline - time.monotonic()
+                    if timeout <= 0 or self.process is not process:
+                        raise WorkerUnavailable("Napseer MCP worker input timed out")
+                    fd = process.stdin.fileno()
+                    if not select.select([], [fd], [], timeout)[1]:
+                        raise WorkerUnavailable("Napseer MCP worker input timed out")
+                    try:
+                        count = os.write(fd, remaining)
+                        remaining = remaining[count:]
+                    except BlockingIOError:
+                        continue
+            except (BrokenPipeError, OSError, ValueError) as exc:
                 raise WorkerUnavailable("Napseer MCP worker input closed") from exc
+        finally:
+            self._stdin_lock.release()
 
     def submit(self, message: bytes) -> PendingRequest | None:
         self.ensure_current()
@@ -326,16 +375,20 @@ class Worker:
         if process is None:
             raise WorkerUnavailable("Napseer MCP worker is not running")
         if is_notification(message):
-            self._write(process, message)
+            try:
+                self._write(process, message)
+            except WorkerUnavailable:
+                self.stop()
+                raise
             return None
 
         key = request_key(request_id(message))
         pending = PendingRequest(message=message, key=key, generation=generation)
         with self._pending_lock:
             if key in self._pending:
-                raise WorkerUnavailable("duplicate in-flight JSON-RPC request id")
+                raise RequestRejected("duplicate in-flight JSON-RPC request id")
             if len(self._pending) >= MAX_IN_FLIGHT_REQUESTS:
-                raise WorkerUnavailable("too many in-flight Napseer MCP requests")
+                raise RequestRejected("too many unfinished Napseer MCP requests")
             self._pending[key] = pending
         try:
             self._write(process, message)
@@ -343,26 +396,54 @@ class Worker:
             with self._pending_lock:
                 if self._pending.get(key) is pending:
                     self._pending.pop(key, None)
+            # A partial write has an uncertain outcome and corrupts framing.
+            # Stop this generation rather than appending another request to it.
+            self.stop()
             raise
         return pending
 
-    def cancel(self, value) -> bool:
+    def cancel(self, value, *, expected: PendingRequest | None = None) -> bool:
         key = request_key(value)
         with self._pending_lock:
             pending = self._pending.get(key)
+            if expected is not None and pending is not expected:
+                return False
             if pending is None or request_method(pending.message) == "initialize":
                 return False
-            self._pending.pop(key, None)
+            if pending.cancelled:
+                return True
+            pending.cancelled = True
+            pending.cancel_timer = threading.Timer(CANCEL_GRACE_SECONDS, self._expire_cancelled, args=(pending,))
+            pending.cancel_timer.daemon = True
+            timer = pending.cancel_timer
         self._signal(pending, _CANCELLED)
+        timer.start()
+        process = self.process
+        if process is not None and pending.generation == self.generation:
+            try:
+                self._write(process, json.dumps({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                                "params": {"requestId": value}}).encode("utf-8"))
+            except WorkerUnavailable:
+                self._expire_cancelled(pending)
         return True
+
+    def _expire_cancelled(self, pending: PendingRequest) -> None:
+        with self._lifecycle_lock:
+            with self._pending_lock:
+                unfinished = self._pending.get(pending.key) is pending
+            if unfinished and pending.generation == self.generation:
+                self._stop_locked()
 
     def wait(self, pending: PendingRequest) -> bytes | None:
         try:
             result = pending.response.get(timeout=RESPONSE_TIMEOUT_SECONDS)
         except queue.Empty as exc:
-            with self._pending_lock:
-                if self._pending.get(pending.key) is pending:
-                    self._pending.pop(pending.key, None)
+            if request_method(pending.message) == "initialize":
+                # Initialize is not cancellable, but a stuck initialization
+                # must not permanently consume the worker generation.
+                self._expire_cancelled(pending)
+            else:
+                self.cancel(request_id(pending.message), expected=pending)
             raise WorkerUnavailable("Napseer MCP worker response timed out") from exc
         if result is _CANCELLED:
             return None
@@ -416,16 +497,12 @@ def supervise() -> int:
             cancelled, value = cancelled_request_id(message)
             if cancelled:
                 worker.cancel(value)
-                try:
-                    worker.submit(message)
-                except WorkerUnavailable:
-                    pass
                 continue
             try:
                 pending = worker.submit(message)
-            except WorkerUnavailable:
+            except WorkerUnavailable as exc:
                 if not is_notification(message):
-                    emit(worker_error(message))
+                    emit(worker_error(message, rejected=isinstance(exc, RequestRejected)))
                 continue
             if pending is not None:
                 waiters.submit(finish, message, pending)

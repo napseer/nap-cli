@@ -586,6 +586,9 @@ MCP_MUTATION_LOCK = threading.RLock()
 MCP_STDOUT_LOCK = threading.Lock()
 MCP_REQUEST_LOCAL = threading.local()
 MCP_MAX_WORKERS = max(2, int(os.environ.get("NAPSEER_MCP_MAX_WORKERS", "8")))
+MCP_MAX_IN_FLIGHT_REQUESTS = max(2, int(os.environ.get("NAPSEER_MCP_MAX_IN_FLIGHT_REQUESTS", "32")))
+MCP_SUPERVISED = os.environ.get("NAPSEER_MCP_SUPERVISED") == "1"
+MCP_REQUEST_FINISHED = "notifications/napseer/requestFinished"
 MCP_BATCH_MAX_ACTIONS = 32
 MCP_BATCH_MAX_PARALLEL = max(
     1,
@@ -6334,8 +6337,11 @@ def raise_if_mcp_request_cancelled():
         raise SafeToolError("request_cancelled", "The MCP request was cancelled.")
 
 
-def request_json(method, path, payload=None, token_required=True, retry_auth=True, extra_headers=None):
-    raise_if_mcp_request_cancelled()
+def request_json(method, path, payload=None, token_required=True, retry_auth=True, extra_headers=None,
+                 *, cancellation_sensitive=True, preserve_response_on_cancel=False, timeout_seconds=None):
+    if cancellation_sensitive:
+        raise_if_mcp_request_cancelled()
+    timeout = HTTP_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
     if token_required:
         # `nap project attach` may run in a separate process while this MCP
         # server stays alive. Reload the project auth file before building
@@ -6353,19 +6359,21 @@ def request_json(method, path, payload=None, token_required=True, retry_auth=Tru
     request_token = TOKEN
     request = urllib.request.Request(f"{BASE_URL}{path}", data=body, headers=headers, method=method)
     try:
-        with api_urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+        with api_urlopen(request, timeout=timeout) as response:
             text = response.read().decode("utf-8")
-            raise_if_mcp_request_cancelled()
+            if cancellation_sensitive and not preserve_response_on_cancel:
+                raise_if_mcp_request_cancelled()
             return json.loads(text) if text else {}
     except (TimeoutError, socket.timeout) as exc:
         raise SafeToolError(
             "request_timeout",
-            f"Napseer request timed out after {HTTP_TIMEOUT_SECONDS}s.",
+            f"Napseer request timed out after {timeout}s.",
         ) from exc
     except urllib.error.HTTPError as exc:
         error_body = exc.read(65536).decode("utf-8", errors="replace")
         exc.close()
-        raise_if_mcp_request_cancelled()
+        if cancellation_sensitive:
+            raise_if_mcp_request_cancelled()
         if exc.code == 401 and token_required and retry_auth:
             try:
                 # The attach flow may have completed after this request was
@@ -6380,11 +6388,16 @@ def request_json(method, path, payload=None, token_required=True, retry_auth=Tru
                         token_required=True,
                         retry_auth=False,
                         extra_headers=extra_headers,
+                        cancellation_sensitive=cancellation_sensitive,
+                        preserve_response_on_cancel=preserve_response_on_cancel,
+                        timeout_seconds=timeout_seconds,
                     )
                 renew_auth(stale_token=request_token)
             except Exception as renew_exc:
                 raise safe_auth_refresh_error() from renew_exc
-            return request_json(method, path, payload, token_required=True, retry_auth=False, extra_headers=extra_headers)
+            return request_json(method, path, payload, token_required=True, retry_auth=False,
+                                extra_headers=extra_headers, cancellation_sensitive=cancellation_sensitive,
+                                preserve_response_on_cancel=preserve_response_on_cancel, timeout_seconds=timeout_seconds)
         raise safe_http_error(
             exc,
             operation=f"{method} request",
@@ -6447,9 +6460,9 @@ def lock_headers(lock):
     }
 
 
-def acquire_project_lock(args=None):
+def acquire_project_lock(args=None, *, project_id=None):
     args = args or {}
-    project_id = resolve_project_id(args)
+    project_id = project_id or resolve_project_id(args)
     payload = {
         "scope_type": args.get("scope_type", "project"),
         "scope_key": args.get("scope_key", "*"),
@@ -6457,7 +6470,16 @@ def acquire_project_lock(args=None):
         "holder_label": args.get("holder_label") or AUTH.get("worker_name") or "local MCP",
         "ttl_seconds": int(args.get("ttl_seconds", 600)),
     }
-    return request_json("POST", f"/v1/projects/{project_id}/locks", payload)
+    # Retain the lease even if cancellation arrives while the server grants it;
+    # otherwise the caller loses the only information needed to release it.
+    lock = request_json("POST", f"/v1/projects/{project_id}/locks", payload,
+                        preserve_response_on_cancel=True)
+    try:
+        raise_if_mcp_request_cancelled()
+    except SafeToolError:
+        cleanup_project_lock(project_id, lock)
+        raise
+    return lock
 
 
 def renew_project_lock(args):
@@ -6474,8 +6496,8 @@ def renew_project_lock(args):
     )
 
 
-def release_project_lock(args):
-    project_id = resolve_project_id(args)
+def release_project_lock(args, *, cleanup=False):
+    project_id = args["project_id"] if cleanup else resolve_project_id(args)
     lock_id = args.get("lock_id")
     lease_token = args.get("lease_token")
     if not lock_id or not lease_token:
@@ -6485,6 +6507,9 @@ def release_project_lock(args):
         f"/v1/projects/{project_id}/locks/{lock_id}",
         payload=None,
         extra_headers={"X-Napseer-Lock-Token": lease_token},
+        cancellation_sensitive=not cleanup,
+        retry_auth=not cleanup,
+        timeout_seconds=5 if cleanup else None,
     )
 
 
@@ -6493,21 +6518,31 @@ def list_project_locks(args):
     return request_json("GET", f"/v1/projects/{project_id}/locks")
 
 
-def with_project_lock(args, operation):
-    lock = acquire_project_lock(args)
+def with_project_lock(args, operation, *, project_id=None):
+    project_id = project_id or resolve_project_id(args)
+    lock = acquire_project_lock(args, project_id=project_id)
     try:
+        raise_if_mcp_request_cancelled()
         return operation(lock_headers(lock))
     finally:
-        try:
-            release_project_lock({"lock_id": lock["id"], "lease_token": lock["lease_token"], "project_id": args.get("project_id")})
-        except Exception:
-            pass
+        cleanup_project_lock(project_id, lock)
+
+
+def cleanup_project_lock(project_id, lock):
+    try:
+        release_project_lock({"lock_id": lock["id"], "lease_token": lock["lease_token"],
+                              "project_id": project_id}, cleanup=True)
+    except Exception:
+        # Cleanup cannot erase the original outcome. The server lease still
+        # bounds recovery if transport/auth prevents this single release attempt.
+        pass
 
 
 def request_project_write(method, path, payload, project_id, purpose, scope_type="project", scope_key="*"):
     return with_project_lock(
         {"project_id": project_id, "scope_type": scope_type, "scope_key": scope_key, "purpose": purpose},
         lambda headers: request_json(method, path, payload, extra_headers=headers),
+        project_id=project_id,
     )
 
 
@@ -13424,7 +13459,7 @@ def move_folder(args):
             planned.append({"from": node.get("full_path"), "to_folder": next_folder})
         links_rewritten = sum(len(item["references_to_rewrite"]) for item in reference_plan)
         return {"ok": True, "changed": False, "dry_run": True, "moved": len(planned), "from_folder": from_folder, "to_folder": to_folder, "items": planned, "reference_plan": reference_plan, "links_rewritten": links_rewritten}
-    lock = acquire_project_lock({"scope_type": "project", "scope_key": "*", "purpose": f"move folder {from_folder} to {to_folder}"})
+    lock = acquire_project_lock({"scope_type": "project", "scope_key": "*", "purpose": f"move folder {from_folder} to {to_folder}"}, project_id=project_id)
     updated = []
     try:
         headers = lock_headers(lock)
@@ -13436,10 +13471,7 @@ def move_folder(args):
             index_node(saved)
             updated.append(node_write_reference(saved))
     finally:
-        try:
-            release_project_lock({"lock_id": lock["id"], "lease_token": lock["lease_token"]})
-        except Exception:
-            pass
+        cleanup_project_lock(project_id, lock)
     links_rewritten = sum(len(item["references_to_rewrite"]) for item in reference_plan)
     return {"ok": True, "changed": bool(updated), "dry_run": False, "moved": len(updated), "from_folder": from_folder, "to_folder": to_folder, "paths": [item.get("path") for item in updated if item.get("path")], "items": updated, "reference_plan": reference_plan, "links_rewritten": links_rewritten}
 
@@ -13452,7 +13484,7 @@ def bulk_upsert_nodes(args):
     if args.get("dry_run"):
         paths = [normalize_node_path(item.get("path")) for item in nodes if item.get("path")]
         return {"ok": True, "changed": False, "dry_run": True, "count": len(paths), "paths": paths, "items": []}
-    lock = acquire_project_lock({"scope_type": "project", "scope_key": "*", "purpose": args.get("purpose", "bulk upsert nodes")})
+    lock = acquire_project_lock({"scope_type": "project", "scope_key": "*", "purpose": args.get("purpose", "bulk upsert nodes")}, project_id=project_id)
     results = []
     try:
         headers = lock_headers(lock)
@@ -13478,10 +13510,7 @@ def bulk_upsert_nodes(args):
             node = decrypt_node_for_return(saved, project_id=project_id)
             results.append({"created": created, **node_write_reference(node)})
     finally:
-        try:
-            release_project_lock({"lock_id": lock["id"], "lease_token": lock["lease_token"]})
-        except Exception:
-            pass
+        cleanup_project_lock(project_id, lock)
     return {"ok": True, "changed": bool(results), "dry_run": False, "count": len(results), "paths": [item.get("path") for item in results if item.get("path")], "items": results}
 
 
@@ -16842,6 +16871,18 @@ def contract_profile(args=None):
         },
         "core": sorted(CORE_TOOL_NAMES),
     }
+    profile["request_lifecycle"] = {
+        "max_unfinished_requests": MCP_MAX_IN_FLIGHT_REQUESTS,
+        "max_workers": MCP_MAX_WORKERS,
+        "supervised": MCP_SUPERVISED,
+        "cancellation": "cooperative; unfinished work remains admitted until cleanup completes",
+        "queued_mutations": "cancelled work does not start",
+        "replay": "never automatic; inspect authoritative state after an uncertain outcome",
+        "rejected_error_code": -32097,
+        "uncertain_error_code": -32098,
+        "cleanup": "one lock release attempt against the original project, without auth replay",
+        "recovery_owner": "stdio supervisor bounds response waits, cancellation grace, and worker replacement",
+    }
     return profile
 
 
@@ -17918,6 +17959,7 @@ def call_tool(name, args):
     started_at = time.time()
     tool_name = telemetry_safe_text(name, 96)
     try:
+        raise_if_mcp_request_cancelled()
         if name == "nap_batch":
             # Batch validates its complete graph first, overlaps only reads,
             # and acquires the mutation lock around each write barrier.
@@ -17929,6 +17971,7 @@ def call_tool(name, args):
             # auth/index state. Keep their execution order explicit while
             # allowing independent reads to proceed concurrently.
             with MCP_MUTATION_LOCK:
+                raise_if_mcp_request_cancelled()
                 result = call_tool_impl(name, args)
         send_telemetry_event_async(
             "mcp_tool_call",
@@ -17954,6 +17997,10 @@ def call_tool(name, args):
 
 
 def handle(message):
+    if "id" not in message:
+        # Only requests may execute tools. Unknown/extension notifications are
+        # one-way and must never invoke a mutation without an acknowledgement.
+        return None
     request_id = message.get("id")
     method = message.get("method")
     if method == "initialize":
@@ -18001,12 +18048,14 @@ class McpRequestState:
 class McpRequestRuntime:
     """Bounded concurrent request dispatcher for the stdio worker."""
 
-    def __init__(self, handler=handle, sender=send, max_workers=MCP_MAX_WORKERS):
+    def __init__(self, handler=handle, sender=send, max_workers=MCP_MAX_WORKERS,
+                 max_in_flight=MCP_MAX_IN_FLIGHT_REQUESTS):
         self.handler = handler
         self.sender = sender
         self._lock = threading.Lock()
         self._requests = {}
         self._closed = False
+        self._max_in_flight = max(2, int(max_in_flight))
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=max(2, int(max_workers)),
             thread_name_prefix="napseer-mcp-tool",
@@ -18019,19 +18068,30 @@ class McpRequestRuntime:
     def _execute(self, key, state):
         MCP_REQUEST_LOCAL.cancelled = state.cancelled
         try:
+            raise_if_mcp_request_cancelled()
             response = self.handler(state.message)
         except Exception:
             response = rpc_error(state.message.get("id"), -32603, "Internal error")
         finally:
             with self._lock:
+                cancelled = state.cancelled.is_set()
                 if self._requests.get(key) is state:
                     self._requests.pop(key, None)
             try:
                 del MCP_REQUEST_LOCAL.cancelled
             except AttributeError:
                 pass
-        if response is not None and not state.cancelled.is_set():
+        if cancelled:
+            self._notify_finished(state)
+        elif response is not None:
             self.sender(response)
+
+    def _notify_finished(self, state):
+        if MCP_SUPERVISED:
+            # Private worker-to-supervisor acknowledgement, after handler
+            # cleanup. It is consumed locally and never reaches the MCP client.
+            self.sender({"jsonrpc": "2.0", "method": MCP_REQUEST_FINISHED,
+                         "params": {"requestId": state.message.get("id")}})
 
     def cancel(self, request_id):
         key = self._key(request_id)
@@ -18040,10 +18100,10 @@ class McpRequestRuntime:
             if state is None or state.message.get("method") == "initialize":
                 return False
             state.cancelled.set()
-            future = state.future
-            if future is not None and future.cancel():
-                self._requests.pop(key, None)
-            return True
+            # Keep queued work admitted until the executor consumes it. Future
+            # cancellation alone leaves its work item in an unbounded queue,
+            # allowing a cancel/submit loop to defeat the admission limit.
+        return True
 
     def dispatch(self, message):
         if not isinstance(message, dict):
@@ -18059,7 +18119,8 @@ class McpRequestRuntime:
             # handled before the next request is accepted. Any accidental
             # handler return value is discarded because notifications never
             # receive responses.
-            self.handler(message)
+            if message.get("method") == "notifications/initialized":
+                self.handler(message)
             return None
 
         key = self._key(message.get("id"))
@@ -18069,6 +18130,10 @@ class McpRequestRuntime:
                 return None
             if key in self._requests:
                 self.sender(rpc_error(message.get("id"), -32600, "Duplicate in-flight request id"))
+                return None
+            if len(self._requests) >= self._max_in_flight:
+                self.sender(rpc_error(message.get("id"), -32097,
+                                      "Napseer MCP is busy; this request was not started. Retry later."))
                 return None
             self._requests[key] = state
             state.future = self._executor.submit(self._execute, key, state)

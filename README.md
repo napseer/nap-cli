@@ -56,6 +56,24 @@ replaceable runtime, set `NAPSEER_MCP_WORKER_WATCH_PATHS` to the
 after any watched runtime is atomically replaced, preserving the same bounded,
 non-replaying request lifecycle used for direct workers.
 
+MCP admits at most 32 unfinished requests by default, including cancelled work
+that is still cleaning up. `-32097` means a request was rejected before
+execution; retry after capacity is available. `-32098` means the result
+is uncertain: inspect current state before retrying a mutation. Cancellation
+prevents queued mutations from starting and attempts to release acquired locks.
+It cannot undo a mutation already accepted by the API.
+
+The supervisor waits up to 60 seconds for a response, then requests cancellation.
+After 10 seconds without a cleanup acknowledgement, it terminates the worker and
+fails affected requests without replay. Worker input writes have a five-second
+deadline. Override these limits with `NAPSEER_MCP_RESPONSE_TIMEOUT_SECONDS`,
+`NAPSEER_MCP_CANCEL_GRACE_SECONDS`, `NAPSEER_MCP_WRITE_TIMEOUT_SECONDS`, and
+`NAPSEER_MCP_MAX_IN_FLIGHT_REQUESTS`. New source loads only after unfinished work
+has drained. `nap_contract` exposes the runtime's request lifecycle contract.
+These process recovery guarantees require the supervisor; the direct worker is
+for isolated protocol debugging. An already-running older supervisor needs a
+client reconnect after updating.
+
 The public operator surface is intentionally small:
 
 ```text

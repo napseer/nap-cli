@@ -75,6 +75,10 @@ class SupervisorClient:
         worker_path: pathlib.Path,
         project_root: pathlib.Path | None = None,
         watch_paths: tuple[pathlib.Path, ...] = (),
+        response_timeout: int = 5,
+        cancel_grace: int = 5,
+        max_in_flight: int = 32,
+        write_timeout: int = 5,
     ):
         environment = os.environ.copy()
         environment["NAPSEER_MCP_WORKER_PATH"] = str(worker_path)
@@ -82,7 +86,10 @@ class SupervisorClient:
             environment["NAPSEER_MCP_WORKER_WATCH_PATHS"] = os.pathsep.join(
                 str(path) for path in watch_paths
             )
-        environment["NAPSEER_MCP_RESPONSE_TIMEOUT_SECONDS"] = "5"
+        environment["NAPSEER_MCP_RESPONSE_TIMEOUT_SECONDS"] = str(response_timeout)
+        environment["NAPSEER_MCP_CANCEL_GRACE_SECONDS"] = str(cancel_grace)
+        environment["NAPSEER_MCP_MAX_IN_FLIGHT_REQUESTS"] = str(max_in_flight)
+        environment["NAPSEER_MCP_WRITE_TIMEOUT_SECONDS"] = str(write_timeout)
         environment["NAPSEER_TELEMETRY"] = "0"
         if project_root is not None:
             environment["NAPSEER_PROJECT_ROOT"] = str(project_root)
@@ -92,6 +99,7 @@ class SupervisorClient:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=environment,
+            bufsize=0,
         )
 
     def request(self, request_id: int, method: str, params=None):
@@ -319,5 +327,203 @@ def test_worker_crash_returns_error_without_closing_transport(tmp_path):
         assert failed["error"]["code"] == -32098
         assert recovered["result"]["version"] == 1
         assert client.process.poll() is None
+    finally:
+        client.close()
+
+
+def write_lifecycle_worker(path, version=1):
+    # The actual worker dispatcher owns cancellation/completion; the handler
+    # supplies deterministic slow and uncooperative work without credentials.
+    path.write_text(f'''import json, os, pathlib, runpy, sys, time
+sys.path.insert(0, {str(REAL_WORKER.parent)!r})
+mod = runpy.run_path({str(REAL_WORKER)!r})
+root = pathlib.Path({str(path.parent)!r})
+def handle(message):
+    name = (message.get("params") or {{}}).get("name")
+    if name in ("slow", "stuck"):
+        (root / (str(message["id"]) + ".started")).write_text("started")
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if name == "slow":
+                    mod["raise_if_mcp_request_cancelled"]()
+                time.sleep(0.01)
+        finally:
+            time.sleep(0.3)
+            (root / (str(message["id"]) + ".cleaned")).write_text("cleaned")
+    return mod["rpc_result"](message.get("id"), {{"pid": os.getpid(), "version": {version}}})
+runtime = mod["McpRequestRuntime"](handler=handle)
+try:
+    for line in sys.stdin:
+        runtime.dispatch(json.loads(line))
+finally:
+    runtime.close()
+''')
+
+
+def wait_for_path(path, timeout=3):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.01)
+    raise AssertionError("worker did not reach the expected lifecycle boundary")
+
+
+def test_cancelled_work_counts_until_cleanup_before_source_replacement(tmp_path):
+    worker_path = tmp_path / "worker.py"
+    write_lifecycle_worker(worker_path)
+    client = SupervisorClient(worker_path, project_root=tmp_path)
+    try:
+        client.send(1, "tools/call", {"name": "slow"})
+        wait_for_path(tmp_path / "1.started")
+        client.notify("notifications/cancelled", {"requestId": 1})
+        write_lifecycle_worker(worker_path, version=2)
+        during_cleanup = client.request(2, "tools/list")
+        assert during_cleanup["result"]["version"] == 1
+        wait_for_path(tmp_path / "1.cleaned")
+        time.sleep(0.05)
+        after_cleanup = client.request(3, "tools/list")
+        assert after_cleanup["result"]["version"] == 2
+        assert after_cleanup["result"]["pid"] != during_cleanup["result"]["pid"]
+    finally:
+        client.close()
+
+
+def test_timeout_cancels_work_and_keeps_transport_usable(tmp_path):
+    worker_path = tmp_path / "worker.py"
+    write_lifecycle_worker(worker_path)
+    client = SupervisorClient(worker_path, project_root=tmp_path, response_timeout=1)
+    try:
+        before = client.request(1, "tools/list")
+        failed = client.request(2, "tools/call", {"name": "slow"})
+        assert failed["error"]["code"] == -32098
+        wait_for_path(tmp_path / "2.cleaned")
+        recovered = client.request(3, "tools/list")
+        assert recovered["result"]["pid"] == before["result"]["pid"]
+    finally:
+        client.close()
+
+
+def test_cancelled_work_cannot_bypass_admission_limit(tmp_path):
+    worker_path = tmp_path / "worker.py"
+    write_lifecycle_worker(worker_path)
+    client = SupervisorClient(worker_path, project_root=tmp_path, max_in_flight=2)
+    try:
+        client.send(1, "tools/call", {"name": "stuck"})
+        wait_for_path(tmp_path / "1.started")
+        client.notify("notifications/cancelled", {"requestId": 1})
+        client.send(2, "tools/call", {"name": "stuck"})
+        wait_for_path(tmp_path / "2.started")
+        client.send(3, "tools/call", {"name": "stuck"})
+        rejected = client.receive(timeout=1)
+        assert rejected["id"] == 3
+        assert rejected["error"]["code"] == -32097
+        assert not (tmp_path / "3.started").exists()
+    finally:
+        client.close()
+
+
+def test_uncooperative_timeout_restarts_worker_with_no_replay(tmp_path):
+    worker_path = tmp_path / "worker.py"
+    write_lifecycle_worker(worker_path)
+    client = SupervisorClient(worker_path, project_root=tmp_path,
+                              response_timeout=1, cancel_grace=1)
+    try:
+        before = client.request(1, "tools/list")
+        failed = client.request(2, "tools/call", {"name": "stuck"})
+        assert failed["error"]["code"] == -32098
+        time.sleep(1.3)
+        recovered = client.request(3, "tools/list")
+        assert recovered["result"]["pid"] != before["result"]["pid"]
+        assert not (tmp_path / "2.cleaned").exists()
+        assert client.process.poll() is None
+    finally:
+        client.close()
+
+
+def test_reused_id_is_rejected_until_cancelled_request_finishes(tmp_path):
+    worker_path = tmp_path / "worker.py"
+    write_lifecycle_worker(worker_path)
+    client = SupervisorClient(worker_path, project_root=tmp_path)
+    try:
+        client.send(1, "tools/call", {"name": "slow"})
+        wait_for_path(tmp_path / "1.started")
+        client.notify("notifications/cancelled", {"requestId": 1})
+        rejected = client.request(1, "tools/list")
+        assert rejected["error"]["code"] == -32097
+        wait_for_path(tmp_path / "1.cleaned")
+        time.sleep(0.05)
+        assert client.request(1, "tools/list")["result"]["version"] == 1
+    finally:
+        client.close()
+
+
+def test_blocked_worker_stdin_has_a_deadline_and_recovers(tmp_path):
+    worker_path = tmp_path / "worker.py"
+    worker_path.write_text("import time\ntime.sleep(60)\n")
+    client = SupervisorClient(worker_path, project_root=tmp_path, write_timeout=1)
+    try:
+        client.send(1, "tools/call", {"name": "large", "arguments": {"data": "x" * 262144}})
+        failed = client.receive(timeout=3)
+        assert failed["error"]["code"] == -32098
+        write_worker(worker_path, 2)
+        assert client.request(2, "tools/list")["result"]["version"] == 2
+    finally:
+        client.close()
+
+
+def test_eof_stops_worker_with_unfinished_requests(tmp_path):
+    worker_path = tmp_path / "worker.py"
+    write_lifecycle_worker(worker_path)
+    client = SupervisorClient(worker_path, project_root=tmp_path)
+    try:
+        worker_pid = client.request(1, "tools/list")["result"]["pid"]
+        client.send(2, "tools/call", {"name": "stuck"})
+        wait_for_path(tmp_path / "2.started")
+        client.close()
+        assert client.process.returncode == 0
+        try:
+            os.kill(worker_pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise AssertionError("worker survived supervisor EOF")
+    finally:
+        client.close()
+
+
+def test_initialize_timeout_retires_uncancellable_worker(tmp_path):
+    worker_path = tmp_path / "worker.py"
+    worker_path.write_text('''import json, os, sys, time
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        time.sleep(10)
+    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"pid": os.getpid()}}), flush=True)
+''')
+    client = SupervisorClient(worker_path, project_root=tmp_path, response_timeout=1)
+    try:
+        before = client.request(1, "tools/list")
+        failed = client.request(2, "initialize")
+        assert failed["error"]["code"] == -32098
+        recovered = client.request(3, "tools/list")
+        assert recovered["result"]["pid"] != before["result"]["pid"]
+    finally:
+        client.close()
+
+
+def test_real_worker_contract_exposes_recovery_without_private_notifications(tmp_path, monkeypatch):
+    monkeypatch.setenv("NAPSEER_TOOL_PROFILES", "maintenance")
+    client = SupervisorClient(REAL_WORKER, project_root=tmp_path)
+    try:
+        assert "result" in client.request(1, "initialize")
+        response = client.request(2, "tools/call", {"name": "nap_contract", "arguments": {}})
+        contract = response["result"]["structuredContent"]["request_lifecycle"]
+        assert contract["max_unfinished_requests"] == 32
+        assert contract["supervised"] is True
+        assert contract["rejected_error_code"] == -32097
+        assert contract["uncertain_error_code"] == -32098
+        assert not (tmp_path / ".napseer").exists()
     finally:
         client.close()

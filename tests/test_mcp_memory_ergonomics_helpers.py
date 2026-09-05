@@ -463,9 +463,9 @@ def test_tee_and_bulk_create_by_path_update_by_identity(mod):
         "content_text": payload.get("content_text", existing["content_text"]),
     }
     mod.index_node = lambda node: None
-    mod.acquire_project_lock = lambda args: {"id": "lock-1", "lease_token": "lease-1"}
+    mod.acquire_project_lock = lambda args, **kwargs: {"id": "lock-1", "lease_token": "lease-1"}
     mod.lock_headers = lambda lock: {"X-Lock": lock["id"]}
-    mod.release_project_lock = lambda args: None
+    mod.release_project_lock = lambda args, **kwargs: None
     mod.request_json = lambda method, path, payload=None, **kwargs: writes.append((method, path, payload, ())) or {
         **existing,
         "content_text": payload.get("content_text", existing["content_text"]) if payload else existing["content_text"],

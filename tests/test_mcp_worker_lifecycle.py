@@ -4,6 +4,8 @@ import sys
 import threading
 import time
 
+import pytest
+
 
 def load_module():
     script_path = (
@@ -242,3 +244,160 @@ def test_auth_renewal_reuses_token_refreshed_by_another_request(monkeypatch):
         "refresh_expires_at": "later",
         "project_id": "project-1",
     }
+
+
+def test_tool_call_notification_cannot_execute_a_mutation(monkeypatch):
+    mod = load_module()
+    calls = []
+    monkeypatch.setattr(mod, "call_tool", lambda *args: calls.append(args))
+    assert mod.handle({"jsonrpc": "2.0", "method": "tools/call", "params": {
+        "name": "nap_create_node", "arguments": {"name": "unacknowledged"},
+    }}) is None
+    assert calls == []
+
+
+def test_worker_admission_is_bounded_and_recovers():
+    mod = load_module()
+    release = threading.Event()
+    emitted = []
+    executed = []
+
+    def handler(message):
+        executed.append(message["id"])
+        release.wait(2)
+        return mod.rpc_result(message["id"], {"ok": True})
+
+    runtime = mod.McpRequestRuntime(handler=handler, sender=emitted.append,
+                                    max_workers=2, max_in_flight=2)
+    try:
+        for request_id in (1, 2, 3):
+            runtime.dispatch({"jsonrpc": "2.0", "id": request_id, "method": "tools/call"})
+        wait_until(lambda: any(item["id"] == 3 for item in emitted))
+        rejection = next(item for item in emitted if item["id"] == 3)
+        assert rejection["error"]["code"] == -32097
+        assert 3 not in executed
+        release.set()
+        wait_until(lambda: len(emitted) == 3)
+        runtime.dispatch({"jsonrpc": "2.0", "id": 4, "method": "tools/call"})
+        wait_until(lambda: any(item["id"] == 4 for item in emitted))
+    finally:
+        release.set()
+        runtime.close()
+
+
+def test_cancelled_mutation_waiting_for_lock_never_starts(monkeypatch):
+    mod = load_module()
+    cancelled = threading.Event()
+    waiting = threading.Event()
+    calls = []
+    errors = []
+    monkeypatch.setattr(mod, "call_tool_impl", lambda *args: calls.append(args))
+    monkeypatch.setattr(mod, "send_telemetry_event_async", lambda *a, **kw: None)
+
+    def run():
+        mod.MCP_REQUEST_LOCAL.cancelled = cancelled
+        waiting.set()
+        try:
+            mod.call_tool("nap_create_node", {})
+        except mod.SafeToolError as exc:
+            errors.append(exc)
+
+    with mod.MCP_MUTATION_LOCK:
+        thread = threading.Thread(target=run)
+        thread.start()
+        assert waiting.wait(1)
+        cancelled.set()
+    thread.join(2)
+    assert not thread.is_alive()
+    assert calls == []
+    assert len(errors) == 1
+
+
+def test_cancelled_queue_entries_remain_bounded_until_consumed():
+    mod = load_module()
+    release = threading.Event()
+    executed = []
+    emitted = []
+
+    def handler(message):
+        executed.append(message["id"])
+        release.wait(2)
+        return mod.rpc_result(message["id"], {"ok": True})
+
+    runtime = mod.McpRequestRuntime(handler=handler, sender=emitted.append,
+                                    max_workers=2, max_in_flight=3)
+    try:
+        for request_id in (1, 2, 3):
+            runtime.dispatch({"id": request_id, "method": "tools/call"})
+        wait_until(lambda: len(executed) == 2)
+        runtime.cancel(3)
+        runtime.dispatch({"id": 4, "method": "tools/call"})
+        wait_until(lambda: any(item["id"] == 4 for item in emitted))
+        assert emitted[0]["error"]["code"] == -32097
+        release.set()
+        wait_until(lambda: len(emitted) == 3)
+        assert executed == [1, 2]
+    finally:
+        release.set()
+        runtime.close()
+
+
+@pytest.mark.parametrize("cancel_at", ["acquire", "operation"])
+def test_cancelled_write_releases_its_original_project_lock(tmp_path, monkeypatch, cancel_at):
+    import http.server
+    import json
+
+    monkeypatch.setenv("NAPSEER_PROJECT_ROOT", str(tmp_path))
+    mod = load_module()
+    cancelled = threading.Event()
+    requests = []
+    mutation_ran = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            requests.append(("POST", self.path))
+            if cancel_at == "acquire":
+                cancelled.set()
+            body = json.dumps({"id": "lock-test", "lease_token": "synthetic-lease"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_DELETE(self):
+            requests.append(("DELETE", self.path))
+            self.send_response(204)
+            self.end_headers()
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    mod.BASE_URL = f"http://127.0.0.1:{server.server_port}"
+    mod.TOKEN = "synthetic-access"
+    mod.DEFAULT_PROJECT_ID = "original-project"
+    monkeypatch.setattr(mod, "refresh_public_auth_state", lambda: None)
+    mod.MCP_REQUEST_LOCAL.cancelled = cancelled
+
+    def operation(_headers):
+        mutation_ran.append(True)
+        mod.DEFAULT_PROJECT_ID = "different-project"
+        cancelled.set()
+        mod.raise_if_mcp_request_cancelled()
+
+    try:
+        with pytest.raises(mod.SafeToolError):
+            mod.with_project_lock({}, operation)
+        assert requests == [
+            ("POST", "/v1/projects/original-project/locks"),
+            ("DELETE", "/v1/projects/original-project/locks/lock-test"),
+        ]
+        assert mutation_ran == ([] if cancel_at == "acquire" else [True])
+    finally:
+        del mod.MCP_REQUEST_LOCAL.cancelled
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
