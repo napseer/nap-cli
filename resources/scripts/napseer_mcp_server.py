@@ -5790,14 +5790,16 @@ Subcommands:
   help                      Show this help.
 
 First-time flow:
-  1. From a fresh project directory, run `nap project init`.
-     The CLI will create a new project for you and write the
-     worker bearer to ./.napseer/auth.json. It also writes the
-     non-secret ./.napseer/project.json locator for Git.
-  2. To attach a directory to a project you already own, run
-     `nap project attach` and sign in via the browser. A cloned
+  1. Run `nap auth login` to configure your shared account session
+     in your OS user data folder. For delegated access, configure
+     `nap auth api-key --env VARIABLE_NAME` instead.
+  2. From your project directory, run `nap init`. It uses the
+     committed ./.napseer/project.json locator when present, or
+     creates a project owned by your configured account.
+  3. To attach a directory to a project you already own, run
+     `nap project attach`. A cloned
      repository with a locator will never auto-create a duplicate.
-  3. To check what is attached, run `nap project status`.
+  4. To check what is attached, run `nap project status`.
 """
 
 
@@ -14924,7 +14926,7 @@ def raw_tools():
         },
         {
             "name": "nap_update_self",
-            "description": "Update this local MCP wrapper file from Napseer's hosted script directory. Requires confirm='update'. Does not modify ./.napseer/auth.json.",
+            "description": "Update the local runtime from Napseer's hosted script directory. Requires confirm='update'. Preserves credentials and project locators.",
             "inputSchema": {
                 "type": "object",
                 "required": ["confirm"],
@@ -15505,7 +15507,7 @@ def raw_tools():
         },
         {
             "name": "nap_project_create",
-            "description": "Create a Napseer project and store it as the current project in ./.napseer/auth.json.",
+            "description": "Create a Napseer project owned by the configured account and select it locally. Credentials remain in the configured credential store; repository state records project selection.",
             "inputSchema": {
                 "type": "object",
                 "required": ["slug", "name"],
@@ -16044,7 +16046,7 @@ def raw_tools():
         },
         {
             "name": "nap_claim_account",
-            "description": "Start the login/claim flow for the current anonymous account and update ./.napseer/auth.json when the loopback callback completes.",
+            "description": "Claim an existing legacy anonymous project through the browser and update its selected credential store when the loopback callback completes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
