@@ -1464,6 +1464,10 @@ def version_status():
 
 def main(argv):
     invoked_as_nap = pathlib.Path(argv[0]).name in {"nap", "nap.cmd"}
+    # The published /install endpoint is executed as `python3 -`. Keep that
+    # bootstrap separate from the removed operator-facing `nap install` alias.
+    if len(argv) == 1 and not invoked_as_nap:
+        return handle_mcp(["install"])
     command = argv[1] if len(argv) > 1 else ("help" if invoked_as_nap else "install")
     args = argv[2:]
     if command in HELP_TOKENS:
