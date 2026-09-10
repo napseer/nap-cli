@@ -43,6 +43,7 @@ SCRIPT_NAMES = (
     "napseer_mcp_server.py",
     "napseer_mcp_supervisor.py",
     "napseer_spake2.py",
+    "napseer_credentials.py",
     "terminal_init.py",
     "terminal_protocol.py",
     "terminal_pty_manager.py",
@@ -57,6 +58,7 @@ LOCAL_HOST = "127.0.0.1"
 DEFAULT_GATEWAY_PORT = os.environ.get("NAPSEER_GATEWAY_PORT")
 RUNTIME_SCRIPT_NAMES = (
     "napseer_spake2.py",
+    "napseer_credentials.py",
     "terminal_init.py",
     "terminal_protocol.py",
     "terminal_pty_manager.py",
@@ -64,15 +66,18 @@ RUNTIME_SCRIPT_NAMES = (
     "napseer_mcp_supervisor.py",
 )
 MAX_SERVICE_LOG_BYTES = int(os.environ.get("NAPSEER_MAX_SERVICE_LOG_BYTES", str(5 * 1024 * 1024)))
-CLI_RELEASE_VERSION = "0.2.2"
-CLI_DISTRIBUTION_CONTRACT_VERSION = "2026-08-01"
-CLI_MINIMUM_CONTRACT_VERSION = "2026-05-19"
+CLI_RELEASE_VERSION = "0.3.0"
+CLI_DISTRIBUTION_CONTRACT_VERSION = "2026-09-10"
+# Older installers have a fixed asset list and would omit the credentials module.
+# Reject them before activation; the published bootstrap performs the upgrade.
+CLI_MINIMUM_CONTRACT_VERSION = "2026-09-10"
 CLI_BUNDLE_SCHEMA_VERSION = "napseer.cli.bundle.v1"
 INSTALL_PATHS = {
     "nap_install.py": "nap_install.py",
     "napseer_mcp_server.py": "napseer_mcp_server.py",
     "napseer_mcp_supervisor.py": "napseer_mcp_supervisor.py",
     "napseer_spake2.py": "napseer_spake2.py",
+    "napseer_credentials.py": "napseer_credentials.py",
     "terminal_init.py": "terminal/__init__.py",
     "terminal_protocol.py": "terminal/protocol.py",
     "terminal_pty_manager.py": "terminal/pty_manager.py",
@@ -88,6 +93,8 @@ CANONICAL_COMMANDS = (
     ("reindex", "Rebuild the current project's local memory index."),
     ("auth", "Authenticate an account or repair credentials."),
     ("project", "Create, attach, claim, or inspect a project."),
+    ("files", "List, upload, download, or archive project files."),
+    ("export", "Export project documentation and files to a new ZIP archive."),
     ("mcp", "Install, update, inspect, or serve the local MCP runtime."),
     ("gateway", "Set up and operate the local gateway."),
     ("update", "Update the installed CLI and runtime bundle."),
@@ -101,6 +108,8 @@ COMMAND_METADATA = {
     "reindex": {"mutates": True, "visible": True},
     "auth": {"mutates": True, "visible": True},
     "project": {"mutates": True, "visible": True},
+    "files": {"mutates": True, "visible": True},
+    "export": {"mutates": True, "visible": True},
     "mcp": {"mutates": True, "visible": True},
     "gateway": {"mutates": True, "visible": True},
     "update": {"mutates": True, "visible": True},
@@ -503,6 +512,7 @@ def activate_release(release_dir):
         "napseer_mcp_server.py",
         "napseer_mcp_supervisor.py",
         "napseer_spake2.py",
+        "napseer_credentials.py",
     ):
         path = INSTALL_DIR / filename
         preserve_legacy_path(path)
@@ -632,11 +642,15 @@ def cwd_state_dir():
 
 def state_dir_status():
     preferred = preferred_state_dir()
+    from napseer_credentials import CredentialStore
+    try: auth_path, credential_source = CredentialStore(preferred).selected()
+    except RuntimeError: auth_path, credential_source = CredentialStore(preferred).user, "invalid_selection"
     return {
+        "credential_source": credential_source,
         "active_state_dir": str(preferred),
-        "active_auth_path": str(preferred / "auth.json"),
+        "active_auth_path": str(auth_path),
         "state_dir": str(preferred),
-        "auth_path": str(preferred / "auth.json"),
+        "auth_path": str(auth_path),
         "state_dir_exists": preferred.exists(),
         "state_dir_message": (
             ".napseer directory is active."
@@ -1077,8 +1091,17 @@ def print_command_help(command):
             "Usage: nap auth [status|login|repair]\n"
             "  login   Authenticate an account; does not select a project.\n"
             "  status  Show credential state without credential values.\n"
-            "  repair  Recover failed automatic credential renewal."
+            "  repair  Recover failed automatic credential renewal.\n"
+            "  logout [--project]  Revoke the selected login.\n"
+            "  login --project    Store a separate project login in user data.\n"
+            "  migrate            Move legacy project credentials into user data.\n"
+            "  use-user           Explicitly select the general login for this folder.\n"
+            "  api-key --env NAME Configure project access from a named environment variable.\n"
+            "  keys list|create|revoke  Manage named, expiring delegated access."
+
         ),
+        "files": "Usage: nap files list|upload|download|archive [--path FILE] [--id UUID] [--node-id UUID] [--cursor CURSOR] [--limit N]",
+        "export": "Usage: nap export --path NEW_ARCHIVE.zip\nExports active project nodes and files; refuses changes during export or an existing destination.",
         "project": (
             "Usage: nap project [init|create|attach|claim|status|encryption]\n"
             "  init    Initialize a fresh folder (same workflow as `nap init`).\n"
@@ -1342,11 +1365,14 @@ def doctor_status():
     auth_path = pathlib.Path(state["active_auth_path"])
     auth = {}
     auth_error = None
-    if auth_path.exists():
-        try:
-            auth = json.loads(auth_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            auth_error = "auth file is unreadable or invalid JSON"
+    try:
+        from napseer_credentials import CredentialStore, read_json
+        store=CredentialStore(preferred_state_dir())
+        auth=store.read()
+        locator=read_json(preferred_state_dir()/"project.json")
+        if not auth.get("project_id"): auth["project_id"]=locator.get("project_id")
+    except RuntimeError:
+        auth_error="credential state is unreadable; run nap auth login or inspect the selected override"
     missing = runtime_assets_missing()
     issues = []
     setup = []
@@ -1355,13 +1381,13 @@ def doctor_status():
     elif not auth_path.exists():
         setup.append({
             "code": "project_not_initialized",
-            "message": "current folder is not initialized; anonymous setup is available without login",
-            "next": "nap init or invoke a project-scoped MCP tool",
+            "message": "current folder is not initialized; configure a user login with nap auth login",
+            "next": "nap auth login",
         })
     elif not auth.get("project_id"):
         setup.append({
             "code": "project_not_configured",
-            "message": "no project is configured for this folder; anonymous setup is available without login",
+            "message": "no project is configured for this folder; nap init uses the configured user login",
             "next": "nap init",
         })
     if missing:
@@ -1466,6 +1492,8 @@ def main(argv):
         return 0
     if command == "gateway":
         return handle_gateway(args)
+    if command in {"files", "export"}:
+        return run_wrapper(command, args)
     if command == "status":
         return run_wrapper("configure", args)
     if command == "project":
@@ -1478,7 +1506,7 @@ def main(argv):
         if args and args[0] in {"login", "login-local", "operator-login"}:
             validate_cli_options(
                 args[1:],
-                flags={"--no-browser"},
+                flags={"--no-browser", "--project"},
                 value_options={
                     "--frontend-url",
                     "--api-base-url",

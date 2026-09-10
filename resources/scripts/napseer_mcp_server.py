@@ -4,20 +4,11 @@
 Run this on the agent machine. It keeps Napseer credentials local and exposes
 MCP tools over stdin/stdout. The wrapper calls Napseer REST underneath.
 
-Default credential file:
-  ./.napseer/auth.json
+Default credentials: OS user data directory / napseer/credentials/default.json.
+Project selection: .napseer/project.json (identity only).
+Explicit project credentials: nap auth login --project.
+Environment credentials: NAPSEER_API_KEY or NAPSEER_TOKEN; never printed.
 
-Environment overrides:
-  NAPSEER_TOKEN=<bearer token>
-  NAPSEER_BASE_URL=https://api.napseer.com
-  NAPSEER_PROJECT_ID=<default project uuid>
-
-auth.json shape:
-  {
-    "base_url": "https://api.napseer.com",
-    "token": "np_...",
-    "project_id": "PROJECT_UUID"
-  }
 """
 
 import json
@@ -55,6 +46,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 _SCRIPT_DIR = pathlib.Path(__file__).parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
+
+from napseer_credentials import CredentialStore, credential_lock, CredentialError
+
+class SafeToolError(RuntimeError):
+    def __init__(self, code, message, *, status=None, service_code=None):
+        super().__init__(message)
+        self.code = str(code)
+        self.safe_message = str(message)
+        self.status = status
+        self.service_code = str(service_code or "")
+
 
 DISCOVERY_VIEWS = {"titles", "paths", "summary", "metadata", "full"}
 PUBLIC_DISCOVERY_VIEWS = DISCOVERY_VIEWS - {"full"}
@@ -334,7 +336,7 @@ INDEX_LOCK_PATH = AUTH_DIR / "index.lock"
 DEFAULT_KEY_PATH = AUTH_DIR / "id_ed25519"
 SCRIPT_PATH = pathlib.Path(__file__).resolve()
 SCRIPT_NAME = SCRIPT_PATH.name
-SCRIPT_DEPENDENCY_NAMES = ("napseer_spake2.py",)
+SCRIPT_DEPENDENCY_NAMES = ("napseer_spake2.py", "napseer_credentials.py")
 CONTRACT_VERSION = "napseer.mcp.contract.v1"
 TELEMETRY_DISABLED_VALUES = {"0", "false", "no", "off", "disabled"}
 TELEMETRY_ALLOWED_FIELDS = {
@@ -416,6 +418,8 @@ LOCAL_UI_ASSETS = {
 # END GENERATED LOCAL UI ASSETS
 
 PUBLIC_AUTH_KEYS = {
+    "logged_out",
+    "credential_kind",
     "base_url",
     "account_id",
     "project_id",
@@ -823,35 +827,17 @@ def vault_exists():
     return VAULT_PATH.exists()
 
 
+def credential_store():
+    return CredentialStore(AUTH_DIR, AUTH_PATH)
+
+
 def load_public_auth_file():
     with AUTH_STATE_LOCK:
-        if not AUTH_PATH.exists():
-            return {}
-        try:
-            data = json.loads(AUTH_PATH.read_text(encoding="utf-8"))
-        except Exception as exc:
-            raise RuntimeError(f"failed to read {AUTH_PATH}: {exc}") from exc
-        if not isinstance(data, dict):
-            raise RuntimeError(f"{AUTH_PATH} must contain a JSON object")
-        return data
+        return credential_store().read()
 
 
 def atomic_write_auth_file(data):
-    AUTH_PATH.parent.mkdir(exist_ok=True)
-    chmod_best_effort(AUTH_PATH.parent, 0o700)
-    temporary = AUTH_PATH.with_name(
-        f".{AUTH_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
-    try:
-        temporary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        chmod_best_effort(temporary, 0o600)
-        os.replace(temporary, AUTH_PATH)
-        chmod_best_effort(AUTH_PATH, 0o600)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+    credential_store().write(data)
 
 
 def write_public_auth(data):
@@ -5685,15 +5671,28 @@ def start_gateway_relay_thread():
         ).start()
 
 
-def load_auth(public_override=None, secret_override=None):
+def load_auth(public_override=None, secret_override=None, *, read_locator=True):
     data = public_override if public_override is not None else load_public_auth_file()
     secrets_map = secret_override or {}
     merged = {**data, **secrets_map}
+    env_token = os.environ.get("NAPSEER_API_KEY") or os.environ.get("NAPSEER_TOKEN")
+    if env_token:
+        # An explicit credential is a separate authority, never a refresh hint
+        # for the stored user session.
+        merged.update(token=env_token, refresh_token=None, token_expires_at=None,
+                      refresh_expires_at=None, account_mode="api_key" if env_token.startswith("npk_") else "environment")
+    elif merged.get("logged_out"):
+        merged.update(token=None, access_token=None, refresh_token=None)
+    if read_locator and not merged.get("project_id"):
+        locator = load_project_locator()
+        if locator:
+            merged.update(project_id=locator["project_id"], project_slug=locator["project_slug"])
+
     return {
         "base_url": os.environ.get("NAPSEER_BASE_URL") or merged.get("base_url") or "https://api.napseer.com",
         "account_id": os.environ.get("NAPSEER_ACCOUNT_ID") or merged.get("account_id") or merged.get("claimed_account_id"),
-        "token": os.environ.get("NAPSEER_TOKEN") or merged.get("token") or merged.get("access_token"),
-        "refresh_token": os.environ.get("NAPSEER_REFRESH_TOKEN") or merged.get("refresh_token"),
+        "token": env_token or merged.get("token") or merged.get("access_token"),
+        "refresh_token": (os.environ.get("NAPSEER_REFRESH_TOKEN") if env_token else merged.get("refresh_token")),
         "token_expires_at": merged.get("token_expires_at"),
         "refresh_expires_at": merged.get("refresh_expires_at"),
         "local_auth_secret": os.environ.get("NAPSEER_LOCAL_AUTH_SECRET") or merged.get("local_auth_secret"),
@@ -5719,7 +5718,12 @@ def load_auth(public_override=None, secret_override=None):
     }
 
 
-AUTH = load_auth()
+try:
+    AUTH = load_auth()
+except (CredentialError, SafeToolError):
+    # Keep login/help/MCP discovery available for recovery. Authenticated calls
+    # reread the original state and return its error; they never use a fallback.
+    AUTH = load_auth(public_override={}, read_locator=False)
 BASE_URL = AUTH["base_url"].rstrip("/")
 TOKEN = AUTH["token"]
 LOCAL_AUTH_SECRET = AUTH.get("local_auth_secret")
@@ -5753,7 +5757,7 @@ Usage: nap project <subcommand> [...]
 
 Subcommands:
   init                      Initialize Napseer in this directory.
-                            Creates a new project (worker enrollment).
+                            Creates a project using your configured login.
                             Same as `nap project create` with no args.
 
   create [slug]             Create a new project for this directory.
@@ -6338,7 +6342,7 @@ def raise_if_mcp_request_cancelled():
 
 
 def request_json(method, path, payload=None, token_required=True, retry_auth=True, extra_headers=None,
-                 *, cancellation_sensitive=True, preserve_response_on_cancel=False, timeout_seconds=None):
+                 *, cancellation_sensitive=True, preserve_response_on_cancel=False, timeout_seconds=None, _raw_body=None, _binary_response=False, _base_url=None):
     if cancellation_sensitive:
         raise_if_mcp_request_cancelled()
     timeout = HTTP_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
@@ -6349,17 +6353,22 @@ def request_json(method, path, payload=None, token_required=True, retry_auth=Tru
         # replacement access and refresh tokens without a restart.
         refresh_public_auth_state()
     if token_required and not TOKEN:
-        raise RuntimeError("NAPSEER_TOKEN is required")
-    body = None if payload is None else json.dumps(payload).encode("utf-8")
+        raise SafeToolError("auth_required", "No login is configured. Run `nap auth login` or configure a project API key.")
+    body = _raw_body if _raw_body is not None else (None if payload is None else json.dumps(payload).encode("utf-8"))
     headers = {"Content-Type": "application/json", "User-Agent": "napseer-mcp-python/0.1"}
     if token_required:
         headers["Authorization"] = f"Bearer {TOKEN}"
     if extra_headers:
         headers.update(extra_headers)
     request_token = TOKEN
-    request = urllib.request.Request(f"{BASE_URL}{path}", data=body, headers=headers, method=method)
+    request = urllib.request.Request(f"{_base_url or BASE_URL}{path}", data=body, headers=headers, method=method)
     try:
         with api_urlopen(request, timeout=timeout) as response:
+            if _binary_response:
+                body = response.read(8*1024*1024+1)
+                if len(body)>8*1024*1024: raise SafeToolError("file_too_large", "Download exceeds the file size limit.")
+                if cancellation_sensitive: raise_if_mcp_request_cancelled()
+                return body
             text = response.read().decode("utf-8")
             if cancellation_sensitive and not preserve_response_on_cancel:
                 raise_if_mcp_request_cancelled()
@@ -6374,6 +6383,9 @@ def request_json(method, path, payload=None, token_required=True, retry_auth=Tru
         exc.close()
         if cancellation_sensitive:
             raise_if_mcp_request_cancelled()
+        mapped_error = safe_http_error(exc, operation=f"{method} request", body_text=error_body)
+        if mapped_error.service_code == "project_mismatch":
+            raise mapped_error from None
         if exc.code == 401 and token_required and retry_auth:
             try:
                 # The attach flow may have completed after this request was
@@ -6390,14 +6402,16 @@ def request_json(method, path, payload=None, token_required=True, retry_auth=Tru
                         extra_headers=extra_headers,
                         cancellation_sensitive=cancellation_sensitive,
                         preserve_response_on_cancel=preserve_response_on_cancel,
-                        timeout_seconds=timeout_seconds,
+                        timeout_seconds=timeout_seconds, _raw_body=_raw_body, _binary_response=_binary_response, _base_url=_base_url,
                     )
                 renew_auth(stale_token=request_token)
+            except SafeToolError:
+                raise
             except Exception as renew_exc:
-                raise safe_auth_refresh_error() from renew_exc
+                raise SafeToolError("auth_refresh_unavailable", "Login renewal could not reach a valid response. Credentials were preserved; retry when the service recovers.") from renew_exc
             return request_json(method, path, payload, token_required=True, retry_auth=False,
                                 extra_headers=extra_headers, cancellation_sensitive=cancellation_sensitive,
-                                preserve_response_on_cancel=preserve_response_on_cancel, timeout_seconds=timeout_seconds)
+                                preserve_response_on_cancel=preserve_response_on_cancel, timeout_seconds=timeout_seconds, _raw_body=_raw_body, _binary_response=_binary_response, _base_url=_base_url)
         raise safe_http_error(
             exc,
             operation=f"{method} request",
@@ -6422,17 +6436,17 @@ def rest_query_string(params):
     return urllib.parse.urlencode(normalized, doseq=True)
 
 
-def request_form_json(method, path, payload, token_required=False, extra_headers=None):
+def request_form_json(method, path, payload, token_required=False, extra_headers=None, _base_url=None):
     raise_if_mcp_request_cancelled()
     if token_required and not TOKEN:
-        raise RuntimeError("NAPSEER_TOKEN is required")
+        raise SafeToolError("auth_required", "No login is configured. Run `nap auth login` or configure a project API key.")
     body = urllib.parse.urlencode(payload).encode("utf-8")
     headers = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "napseer-mcp-python/0.1"}
     if token_required:
         headers["Authorization"] = f"Bearer {TOKEN}"
     if extra_headers:
         headers.update(extra_headers)
-    request = urllib.request.Request(f"{BASE_URL}{path}", data=body, headers=headers, method=method)
+    request = urllib.request.Request(f"{_base_url or BASE_URL}{path}", data=body, headers=headers, method=method)
     try:
         with api_urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             text = response.read().decode("utf-8")
@@ -7958,48 +7972,27 @@ def renew_anonymous_auth_with_ssh():
 
 
 def _renew_auth_locked():
-    oauth_refresh_error = None
-    if AUTH.get("account_mode") in {"operator_account", "operator_project", "claimed"} and REFRESH_TOKEN:
+    if AUTH.get("account_mode") in {"api_key", "environment"}:
+        raise SafeToolError("credential_rejected", "The configured credential was rejected. Check its scope, expiry and revocation; no alternate login was used.", status=401)
+    if AUTH.get("account_mode") in {"operator_account", "operator_project", "claimed"}:
+        if not REFRESH_TOKEN:
+            raise SafeToolError("auth_required", "This login cannot be renewed. Run `nap auth login`.", status=401)
         try:
-            refreshed = request_form_json(
-                "POST",
-                "/v1/oauth/token",
-                {
-                    "grant_type": "refresh_token",
-                    "client_id": AUTH.get("oauth_client_id") or "nap-cli",
-                    "code": REFRESH_TOKEN,
-                },
-                token_required=False,
-            )
-        except RuntimeError as exc:
-            oauth_refresh_error = exc
-            refreshed = None
-        if refreshed is not None:
-            updates = {
-                "base_url": BASE_URL,
-                "token": refreshed["access_token"],
-                "token_expires_at": iso_timestamp_after_seconds(int(refreshed.get("expires_in") or 0)),
-                "refresh_token": refreshed.get("refresh_token") or REFRESH_TOKEN,
-                "refresh_expires_at": refreshed.get("refresh_expires_at"),
-            }
-            if AUTH.get("account_mode") == "operator_account":
-                replace_public_auth_state(
-                    {**updates, "account_mode": "operator_account"},
-                    clear_keys=PROJECT_BINDING_AUTH_KEYS,
-                )
-            else:
-                save_auth(
-                    {
-                        **updates,
-                        "project_id": refreshed.get("project_id") or DEFAULT_PROJECT_ID,
-                    }
-                )
-            return {
-                "status": "renewed",
-                "method": "oauth_refresh",
-                "token_expires_at": TOKEN_EXPIRES_AT,
-                "project_id": DEFAULT_PROJECT_ID,
-            }
+            refreshed = request_form_json("POST", "/v1/oauth/token", {
+                "grant_type": "refresh_token", "client_id": AUTH.get("oauth_client_id") or "nap-cli",
+                "refresh_token": REFRESH_TOKEN,
+            }, token_required=False)
+        except SafeToolError as exc:
+            if exc.status in {400, 401}:
+                raise SafeToolError("auth_required", "The login grant is expired or revoked. Run `nap auth login`. Existing state was preserved.", status=401) from None
+            raise
+        updates = validated_oauth_credentials(refreshed)
+        updates["account_mode"] = AUTH.get("account_mode")
+        updates["oauth_scope"] = refreshed.get("scope") or AUTH.get("oauth_scope")
+        # Project selection remains local even for a general account login.
+        save_auth(updates)
+        return {"status": "renewed", "method": "oauth_refresh", "token_expires_at": TOKEN_EXPIRES_AT, "project_id": DEFAULT_PROJECT_ID}
+    oauth_refresh_error = None
 
     if REFRESH_TOKEN:
         try:
@@ -8056,8 +8049,10 @@ def renew_auth(stale_token=None):
     # before attempting a refresh. If another lane already replaced the token
     # that received a 401, reuse that state instead of rotating credentials a
     # second time.
-    with AUTH_RENEW_LOCK:
+    with AUTH_RENEW_LOCK, AUTH_STATE_LOCK, credential_store().transaction():
         refresh_public_auth_state()
+        if not TOKEN and not REFRESH_TOKEN:
+            raise SafeToolError("auth_required", "No renewable login is configured. Run `nap auth login`.", status=401)
         if stale_token is not None and TOKEN and TOKEN != stale_token:
             return {
                 "status": "already_renewed",
@@ -8137,49 +8132,58 @@ def oauth_loopback_authorize(args):
                 self.end_headers()
                 self.wfile.write(b"Missing OAuth authorization code.")
                 return
-            result_queue.put({"code": code})
+            try:
+                result_queue.put_nowait({"code": code})
+            except queue.Full:
+                self.send_response(409)
+                self.end_headers()
+                return
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(b"<html><body><h1>Napseer authorization complete</h1><p>You can close this tab.</p></body></html>")
 
     server = ReusableThreadingHTTPServer(("127.0.0.1", int(args.get("port", 0))), Handler)
-    redirect_uri = f"http://127.0.0.1:{server.server_address[1]}/oauth/callback"
-    authorization_payload = {
-        "client_id": args.get("client_id") or "nap-cli",
-        "redirect_uri": redirect_uri,
-        "state": state,
-        "code_challenge": oauth_code_challenge(verifier),
-        "code_challenge_method": "S256",
-        "scope": args["scope"],
-        "flow": args["flow"],
-    }
-    if args.get("claim_token"):
-        authorization_payload["claim_token"] = args["claim_token"]
-    if args.get("project_id_hint"):
-        authorization_payload["project_id_hint"] = args["project_id_hint"]
-    authorization = request_json(
-        "POST",
-        "/v1/oauth/native/authorizations",
-        authorization_payload,
-        token_required=False,
-    )
-    authorize_url = authorization.get("authorization_url")
-    if not authorize_url:
-        raise RuntimeError("OAuth authorization endpoint did not return authorization_url")
-
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    print(f"Open this Napseer authorization URL if the browser does not open: {authorize_url}", file=sys.stderr)
-    if args.get("open_browser", True):
-        webbrowser.open(authorize_url)
-
+    thread = None
     try:
-        result = result_queue.get(timeout=int(args.get("timeout_seconds", 300)))
-    except queue.Empty as exc:
-        raise RuntimeError("timed out waiting for OAuth loopback callback") from exc
+        redirect_uri = f"http://127.0.0.1:{server.server_address[1]}/oauth/callback"
+        authorization_payload = {
+            "client_id": args.get("client_id") or "nap-cli",
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "code_challenge": oauth_code_challenge(verifier),
+            "code_challenge_method": "S256",
+            "scope": args["scope"],
+            "flow": args["flow"],
+        }
+        if args.get("claim_token"):
+            authorization_payload["claim_token"] = args["claim_token"]
+        if args.get("project_id_hint"):
+            authorization_payload["project_id_hint"] = args["project_id_hint"]
+        authorization = request_json(
+            "POST",
+            "/v1/oauth/native/authorizations",
+            authorization_payload,
+            token_required=False, _base_url=api_base_url,
+        )
+        authorize_url = authorization.get("authorization_url")
+        if not authorize_url:
+            raise RuntimeError("OAuth authorization endpoint did not return authorization_url")
+
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        print(f"Open this Napseer authorization URL if the browser does not open: {authorize_url}", file=sys.stderr)
+        if args.get("open_browser", True):
+            webbrowser.open(authorize_url)
+
+        try:
+            result = result_queue.get(timeout=int(args.get("timeout_seconds", 300)))
+        except queue.Empty as exc:
+            raise RuntimeError("timed out waiting for OAuth loopback callback") from exc
     finally:
-        server.shutdown()
+        if thread is not None and thread.is_alive():
+            server.shutdown()
+            thread.join(timeout=2)
         server.server_close()
 
     token = request_form_json(
@@ -8192,7 +8196,7 @@ def oauth_loopback_authorize(args):
             "redirect_uri": redirect_uri,
             "code_verifier": verifier,
         },
-        token_required=False,
+        token_required=False, _base_url=api_base_url,
     )
     token["api_base_url"] = api_base_url
     token["authorization"] = authorization
@@ -8203,6 +8207,7 @@ LOCAL_PROJECT_OAUTH_SCOPE = (
     "openid profile email "
     "napseer.projects.read "
     "napseer.nodes.read napseer.nodes.write "
+    "napseer.files.read napseer.files.write napseer.operations.read napseer.operations.write "
     "napseer.locks.write "
     "napseer.schedules.read napseer.schedules.write "
     "napseer.agents.read napseer.agents.write "
@@ -8218,50 +8223,137 @@ LOCAL_PROJECT_OAUTH_SCOPE = (
 # remains narrower and receives a server-bound project token.
 OPERATOR_ACCOUNT_OAUTH_SCOPE = LOCAL_PROJECT_OAUTH_SCOPE.replace(
     "napseer.projects.read ",
-    "napseer.projects.read napseer.projects.write ",
+    "napseer.projects.read napseer.projects.write napseer.api_keys.manage ",
     1,
 )
 
 
+def validated_oauth_credentials(result):
+    if (not isinstance(result, dict)
+            or not isinstance(result.get("access_token"), str) or not result["access_token"]
+            or not isinstance(result.get("refresh_token"), str) or not result["refresh_token"]
+            or isinstance(result.get("expires_in"), bool)
+            or not isinstance(result.get("expires_in"), int) or result["expires_in"] <= 0):
+        raise SafeToolError("auth_response_invalid", "Napseer returned an incomplete login response. Existing credentials were preserved; retry when the service recovers.")
+    return {
+        "base_url": result.get("api_base_url") or BASE_URL,
+        "token": result["access_token"], "refresh_token": result["refresh_token"],
+        "token_expires_at": iso_timestamp_after_seconds(result["expires_in"]),
+        "refresh_expires_at": result.get("refresh_expires_at"),
+        "account_mode": "operator_account", "oauth_client_id": "nap-cli",
+        "oauth_scope": result.get("scope"),
+    }
+
+
 def operator_account_login(args=None):
     args = args or {}
-    result = oauth_loopback_authorize({
-        **args,
-        "flow": "operator_login",
-        "scope": args.get("scope") or OPERATOR_ACCOUNT_OAUTH_SCOPE,
-    })
-    token_expires_at = iso_timestamp_after_seconds(int(result.get("expires_in") or 0))
-    replace_public_auth_state(
-        {
-            "base_url": result.get("api_base_url") or BASE_URL,
-            "token": result.get("access_token"),
-            "refresh_token": result.get("refresh_token"),
-            "token_expires_at": token_expires_at,
-            "refresh_expires_at": result.get("refresh_expires_at"),
-            "account_mode": "operator_account",
-            "oauth_client_id": "nap-cli",
-            "oauth_scope": result.get("scope"),
-        },
-        clear_keys=PROJECT_BINDING_AUTH_KEYS,
-    )
-    return {
-        "status": "authenticated",
-        "mode": "operator_account",
-        "auth_path": str(AUTH_PATH),
-        "base_url": result.get("api_base_url") or BASE_URL,
-        "scope": result.get("scope"),
-        "token_expires_at": token_expires_at,
-        "message": (
-            "Account authenticated without a project binding. Run `nap project attach` "
-            "for an existing project or `nap project create` for a new one."
-        ),
-    }
+    if args.get("project"):
+        return operator_project_attach({**args, "project_login": True})
+    result = oauth_loopback_authorize({**args, "flow": "operator_login",
+        "scope": args.get("scope") or OPERATOR_ACCOUNT_OAUTH_SCOPE})
+    credentials = validated_oauth_credentials(result)
+    target = credential_store().login(credentials)
+    try: refresh_public_auth_state()
+    except (CredentialError, SafeToolError): pass  # Account login succeeded; a repository override still needs repair.
+    return {"status": "authenticated", "mode": "operator_account", "auth_path": str(target),
+        "base_url": credentials["base_url"], "token_expires_at": credentials["token_expires_at"],
+        "message": "Account login stored for this user. Run `nap project attach` for an existing project or `nap project create` for a new one. Explicit project credentials continue to take precedence."}
+
+
+
+def configure_api_key(args):
+    variable = args.get("env")
+    if not variable or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", variable):
+        raise SafeToolError("api_key_env_required", "Use --env with the name of an environment variable containing the API key.")
+    value = os.environ.get(variable, "")
+    if not value.startswith("npk_") or len(value) < 36:
+        raise SafeToolError("api_key_invalid", "The named environment variable does not contain a Napseer API key.")
+    locator = load_project_locator()
+    require_project_locator_service(locator)
+    credentials = {"base_url": BASE_URL, "token": value, "account_mode": "api_key"}
+    if locator:
+        credentials.update(project_id=locator["project_id"], project_slug=locator["project_slug"])
+    path = credential_store().login(credentials, project=True)
+    refresh_public_auth_state()
+    return {"status": "configured", "credential_source": "project", "auth_path": str(path),
+            "access_verified": False, "message": "API key stored in user data for this repository. Its permissions are checked by the next authenticated operation."}
+
+
+def cli_api_keys(args):
+    action = args[0] if args else "list"
+    if action == "list":
+        return request_json("GET", "/v1/api-keys")
+    if action == "revoke":
+        identifier = cli_option(args[1:], "--id", default="")
+        try:
+            identifier = str(uuid.UUID(identifier))
+        except ValueError:
+            raise SafeToolError("api_key_id_required", "Use --id with the key ID from `nap auth keys list`.") from None
+        return request_json("DELETE", f"/v1/api-keys/{identifier}")
+    if action == "create":
+        project_id = cli_option(args[1:], "--project-id", default=DEFAULT_PROJECT_ID)
+        if not project_id:
+            raise SafeToolError("project_required", "Select a project or provide --project-id before issuing a key.")
+        payload = {"name": cli_option(args[1:], "--name", default="Agent"), "project_id": project_id,
+                   "scopes": cli_option(args[1:], "--scopes", default="napseer.projects.read,napseer.nodes.read").split(","),
+                   "expires_in_days": int(cli_option(args[1:], "--days", default="30"))}
+        result = request_json("POST", "/v1/api-keys", payload)
+        key = result.pop("api_key", None)
+        if not key or not str(key).startswith("npk_"):
+            raise SafeToolError("api_key_response_invalid", "Key issuance returned an incomplete response. Inspect `nap auth keys list` before retrying.")
+        from napseer_credentials import atomic_json, user_data_dir
+        path = user_data_dir() / "credentials" / "issued" / f"{uuid.UUID(result['id'])}.json"
+        try:
+            atomic_json(path, {"base_url": BASE_URL, "token": key, "account_mode": "api_key", "project_id": project_id})
+        except Exception:
+            raise SafeToolError("api_key_storage_failed", "The key was issued but could not be stored. Revoke it with `nap auth keys revoke --id " + str(result["id"]) + "` before issuing another.") from None
+        return {**result, "credential_file": str(path), "message": "Key saved privately. Configure the agent with NAPSEER_AUTH_FILE pointing to this file; the key is not printed."}
+    raise SafeToolError("api_key_command_invalid", "Use `nap auth keys list`, `create --name NAME --project-id ID --scopes SCOPES --days DAYS`, or `revoke --id ID`.")
+
+
+def operator_logout(args=None):
+    args = args or {}
+    store = credential_store()
+    target = store.selected()[0] if args.get("project") else store.user
+    with AUTH_STATE_LOCK, credential_lock(target):
+        from napseer_credentials import read_json
+        previous = read_json(target)
+        remote_revoked = False
+        if previous.get("refresh_token"):
+            # Use captured issuer/credential; never another selected project's
+            # login. A failed revocation keeps credentials available for retry.
+            body = urllib.parse.urlencode({"token": previous["refresh_token"],
+                "client_id": previous.get("oauth_client_id") or "nap-cli"}).encode()
+            request = urllib.request.Request(previous["base_url"].rstrip("/") + "/v1/oauth/revoke",
+                data=body, headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+            try:
+                with api_urlopen(request, timeout=10) as response:
+                    response.read(1024)
+                remote_revoked = True
+            except Exception:
+                raise SafeToolError("logout_pending", "Session revocation could not be confirmed. Retry `nap auth logout` when the service is reachable; credentials were preserved.") from None
+        from napseer_credentials import atomic_json
+        atomic_json(target, {"base_url": previous.get("base_url"), "logged_out": True})
+        refresh_public_auth_state()
+    return {"status": "logged_out", "remote_revoked": remote_revoked, "auth_path": str(target)}
 
 
 def operator_project_attach(args=None):
     args = args or {}
     locator = load_project_locator()
     require_project_locator_service(locator)
+    try: refresh_public_auth_state()
+    except CredentialError:
+        if not args.get("project_login"): raise
+    selected_id = args.get("project_id") or (locator or {}).get("project_id")
+    if selected_id and TOKEN and AUTH.get("account_mode") == "operator_account" and not args.get("project_login"):
+        project = request_json("GET", f"/v1/projects/{selected_id}")
+        if locator and str(project.get("id")) != locator["project_id"]:
+            raise SafeToolError("project_locator_mismatch", "Selected project differs from the repository locator.")
+        save_auth_file_credentials({"project_id": project["id"], "project_slug": project["slug"], "project_name": project["name"]})
+        write_project_locator(project)
+        return {"status": "attached", "mode": "operator_account", "project_id": project["id"],
+                "message": "Project selected using the existing user login."}
     result = oauth_loopback_authorize({
         **args,
         "flow": "local_operator_access",
@@ -8276,21 +8368,11 @@ def operator_project_attach(args=None):
             "project_locator_mismatch",
             "OAuth selected a different project than the committed .napseer/project.json locator; local credentials were not changed.",
         )
-    token_expires_at = iso_timestamp_after_seconds(int(result.get("expires_in") or 0))
-    replace_public_auth_state(
-        {
-            "base_url": result.get("api_base_url") or BASE_URL,
-            "token": result.get("access_token"),
-            "refresh_token": result.get("refresh_token"),
-            "token_expires_at": token_expires_at,
-            "refresh_expires_at": result.get("refresh_expires_at"),
-            "project_id": project_id,
-            "account_mode": "operator_project",
-            "oauth_client_id": "nap-cli",
-            "oauth_scope": result.get("scope"),
-        },
-        clear_keys=WORKER_BINDING_AUTH_KEYS,
-    )
+    credentials = validated_oauth_credentials(result)
+    credentials.update(project_id=project_id, account_mode="operator_project")
+    target = credential_store().login(credentials, project=True)
+    token_expires_at = credentials["token_expires_at"]
+    refresh_public_auth_state()
     try:
         project = request_json("GET", f"/v1/projects/{project_id}")
         save_auth_file_credentials({
@@ -8310,19 +8392,19 @@ def operator_project_attach(args=None):
     return {
         "status": "attached",
         "mode": "operator_project",
-        "auth_path": str(AUTH_PATH),
+        "auth_path": str(target),
         "base_url": result.get("api_base_url") or BASE_URL,
         "project_id": project_id,
         "project": project,
         "project_locator": project_locator_status(locator if project is None else None),
         "scope": result.get("scope"),
         "token_expires_at": token_expires_at,
-        "message": "OAuth2 PKCE project token and selected project stored in this directory's Napseer auth state.",
+        "message": "Project credentials stored in this user's data folder; this repository keeps project identity only.",
     }
 
 
 def save_auth_file_credentials(updates):
-    with AUTH_STATE_LOCK:
+    with AUTH_STATE_LOCK, credential_store().transaction():
         return _save_auth_file_credentials_locked(updates)
 
 
@@ -8341,7 +8423,7 @@ def _save_auth_file_credentials_locked(updates):
 
 
 def save_auth(updates):
-    with AUTH_STATE_LOCK:
+    with AUTH_STATE_LOCK, credential_store().transaction():
         return _save_auth_locked(updates)
 
 
@@ -8410,46 +8492,8 @@ def ensure_local_files():
 
 def ensure_enrolled(args=None):
     if TOKEN:
-        return {"status": "already_enrolled", "token_expires_at": TOKEN_EXPIRES_AT}
-    args = args or {}
-    slug = str(args.get("slug") or pathlib.Path.cwd().name or "napseer-project")
-    worker_name = str(args.get("worker_name") or AUTH.get("worker_name") or f"{slug}-agent")
-    device_fingerprint = str(args.get("device_fingerprint") or AUTH.get("device_fingerprint") or socket.gethostname())
-    root_path = str(args.get("root_path") or AUTH.get("root_path") or pathlib.Path.cwd())
-    worker_capabilities = AUTH.get("worker_capabilities") or {"local_mcp": True, "mcp_wrapper": SCRIPT_NAME}
-    verified = request_json(
-        "POST",
-        "/v1/enrollment/token",
-        {
-            "worker_name": worker_name,
-            "device_fingerprint": device_fingerprint,
-            "root_path": root_path,
-            "worker_capabilities": worker_capabilities,
-        },
-        token_required=False,
-    )
-    save_auth(
-        {
-            "base_url": BASE_URL,
-            "token": verified["token"]["access_token"],
-            "refresh_token": verified["token"].get("refresh_token"),
-            "token_expires_at": verified["token"].get("expires_at"),
-            "refresh_expires_at": verified["token"].get("refresh_expires_at"),
-            "worker_id": verified["worker"]["id"],
-            "agent_id": verified["worker"]["agent_id"],
-            "worker_name": worker_name,
-            "device_fingerprint": device_fingerprint,
-            "root_path": root_path,
-            "worker_capabilities": worker_capabilities,
-            "account_mode": AUTH.get("account_mode") or "anonymous",
-        }
-    )
-    return {
-        "status": "enrolled",
-        "method": "token",
-        "token_expires_at": verified["token"].get("expires_at"),
-        "refresh_expires_at": verified["token"].get("refresh_expires_at"),
-    }
+        return {"status": "configured", "token_expires_at": TOKEN_EXPIRES_AT}
+    raise SafeToolError("auth_required", "Napseer has no configured login. Ask the user to run `nap auth login` or configure an API key. No account or project was created.")
 
 
 def gateway_service_preregister(args=None):
@@ -8761,7 +8805,7 @@ def resolve_project_id(args):
     with PROJECT_RESOLUTION_LOCK:
         # Reload here as well as in request_json so a long-running MCP worker
         # observes `nap project attach` performed by another process.
-        if AUTH_PATH.exists() or not DEFAULT_PROJECT_ID:
+        if credential_store().selected()[0].exists() or not DEFAULT_PROJECT_ID:
             refresh_public_auth_state()
         project_id = DEFAULT_PROJECT_ID
         locator = load_project_locator()
@@ -8777,30 +8821,35 @@ def resolve_project_id(args):
                     "project_access_required",
                     "This repository already declares a Napseer project and will not create a duplicate anonymous project. Run `nap project attach`; if the project is still anonymous, claim it from a machine that retains its enrollment identity, then retry here.",
                 )
-            slug = default_project_slug()
-            try:
-                initialized = bootstrap_project(
-                    {
-                        "slug": slug,
-                        "name": default_project_name(slug),
-                        "description": "Created automatically by the local Napseer MCP runtime.",
-                        "encryption": "standard",
-                    }
-                )
-            except SafeToolError:
-                raise
-            except Exception as exc:
-                raise SafeToolError(
-                    "project_bootstrap_failed",
-                    "This directory has no Napseer project and automatic anonymous setup failed. "
-                    "Run `nap doctor`, then retry; account login is not required unless an anonymous limit was reached.",
-                ) from exc
-            project_id = initialized.get("project_id") or DEFAULT_PROJECT_ID
-            if not project_id:
-                raise SafeToolError(
-                    "project_bootstrap_failed",
-                    "Automatic anonymous setup completed without selecting a project. Run `nap doctor` and retry.",
-                )
+            ensure_enrolled()
+            with credential_lock(AUTH_DIR / "bootstrap"):
+                refresh_public_auth_state()
+                if DEFAULT_PROJECT_ID or load_project_locator():
+                    return resolve_project_id(args)
+                slug = default_project_slug()
+                try:
+                    initialized = bootstrap_project(
+                        {
+                            "slug": slug,
+                            "name": default_project_name(slug),
+                            "description": "Created automatically by the local Napseer MCP runtime.",
+                            "encryption": "standard",
+                        }
+                    )
+                except SafeToolError:
+                    raise
+                except Exception as exc:
+                    raise SafeToolError(
+                        "project_bootstrap_failed",
+                        "This directory has no Napseer project and automatic project setup failed. "
+                        "Run `nap doctor`, then retry with your configured account.",
+                    ) from exc
+                project_id = initialized.get("project_id") or DEFAULT_PROJECT_ID
+                if not project_id:
+                    raise SafeToolError(
+                        "project_bootstrap_failed",
+                        "Automatic project setup completed without selecting a project. Run `nap doctor` and retry.",
+                    )
         return project_id
 
 
@@ -8846,15 +8895,11 @@ def create_project_with_state(args):
             raise
         status = "existing"
     auth_updates = {
-        "base_url": BASE_URL,
-        "token": TOKEN,
         "project_id": project["id"],
         "project_slug": project["slug"],
         "project_name": project["name"],
         "project_encryption_state": project.get("encryption_state") or "standard",
     }
-    if AUTH.get("account_mode") == "operator_account":
-        auth_updates["account_mode"] = "operator_project"
     save_auth(auth_updates)
     write_project_locator(project)
     try:
@@ -9077,9 +9122,9 @@ def cli_project_init(args):
     """First-time setup wizard for a fresh directory.
 
     Steps, in order, only running the ones that are needed:
-      1. SSH-key enroll this machine (anonymous) if no bearer token exists.
+      1. Require user-configured credentials; never enroll automatically.
       2. Create a project on the backend if none is configured for this folder.
-      3. Persist the resulting project/slug/name in ./.napseer/auth.json.
+      3. Persist repository identity separately from user credentials.
 
     No browser is opened. Use `nap project attach` to OAuth-attach a pre-existing
     project to a user account, or `nap project claim` to upgrade an anonymous
@@ -9177,8 +9222,7 @@ def cli_project_init(args):
             "status": "initialized",
             "message": (
                 f"Folder initialized. Project '{bootstrap['project']['slug']}' "
-                f"created and stored in {AUTH_PATH}. Next: `nap project attach` "
-                "to link it to your Napseer account, or `nap gateway configure` "
+                f"created under your configured account. Run `nap gateway configure` "
                 "to start a local gateway."
             ),
             "steps": steps,
@@ -9461,15 +9505,7 @@ def cli_configure_status():
             refresh_current_project_metadata()
             encryption = project_encryption_status({})
         except Exception:
-            if REFRESH_TOKEN:
-                try:
-                    renew_auth()
-                    project_configured = bool(DEFAULT_PROJECT_ID)
-                    encryption = project_encryption_status({}) if project_configured else {"state": "unknown", "updated_at": ""}
-                except Exception:
-                    encryption = {"state": AUTH.get("project_encryption_state") or "unknown", "updated_at": ""}
-            else:
-                encryption = {"state": AUTH.get("project_encryption_state") or "unknown", "updated_at": ""}
+            encryption = {"state": "unknown", "updated_at": ""}
     return {
         "status": (
             "project_locator_mismatch"
@@ -9496,7 +9532,8 @@ def cli_configure_status():
         ),
         "cwd": str(pathlib.Path.cwd()),
         **state_dir_status_payload(),
-        "auth_path": str(AUTH_PATH),
+        "auth_path": str(credential_store().selected()[0]),
+        "credential_source": credential_store().selected()[1],
         "auth_configured": bool(TOKEN),
         "account_mode": AUTH.get("account_mode"),
         "project_configured": project_configured,
@@ -14618,8 +14655,133 @@ def kanban_workflow_tool_schemas():
     ]
 
 
+def coordination_file_tools():
+    string = {"type": "string"}
+    def spec(name, description, properties, required=()):
+        return {"name": name, "description": description, "inputSchema": {"type": "object", "properties": properties, "required": list(required), "additionalProperties": False}}
+    return [
+        spec("nap_operation_list", "Reconcile durable execution claims and outcomes after reconnect. Expired leases are reclaimable; pagination is explicit.", {"cursor": {"type":"integer"}, "limit": {"type":"integer","maximum":100}, "active_only":{"type":"boolean"}}),
+        spec("nap_operation", "Claim work with a unique UUID id, then heartbeat every minute. Read the id after an uncertain result. Expired claims cannot finish; claim anew. Heartbeat can link progress and blockers with evidence_node_id. Success requires evidence_node_id. This execution lease does not replace guarded node writes or authorize external actions.", {"action":{"enum":["claim","get","heartbeat","succeed","fail","cancel"]},"id":string,"node_id":string,"holder":string,"ttl_seconds":{"type":"integer","minimum":30,"maximum":900},"evidence_node_id":string}, ["action","id"]),
+        spec("nap_file_list", "List bounded file metadata and attachment identities; file bytes are never returned as tool text.", {"node_id":string,"cursor":string,"limit":{"type":"integer","maximum":100}}),
+        spec("nap_file_upload", "Upload a local regular file up to 8 MiB into project storage. Content-derived upload identity makes identical retries safe. Optional node_id attaches to a canonical document. End-to-end encrypted projects currently reject uploads.", {"local_path":string,"node_id":string,"id":string}, ["local_path"]),
+        spec("nap_file_download", "Download project bytes to a NEW local file after checking SHA-256 and size. Existing files are never overwritten.", {"id":string,"local_path":string}, ["id","local_path"]),
+        spec("nap_file_archive", "Archive a project file by immutable identity. Bytes remain in storage; active listings omit it.", {"id":string}, ["id"]),
+    ]
+
+
+def operation_tool(args):
+    project = resolve_project_id({})
+    identity = str(uuid.UUID(str(args["id"])))
+    root = f"/v1/projects/{project}/operations"
+    action = args["action"]
+    if action == "get":
+        return request_json("GET", f"{root}/{identity}")
+    if action == "claim":
+        return request_json("POST", root, {"id": identity, "node_id": args["node_id"], "holder": args["holder"], "ttl_seconds": args.get("ttl_seconds",300)})
+    if action not in {"heartbeat","succeed","fail","cancel"}:
+        raise SafeToolError("invalid_action", "Choose claim, get, heartbeat, succeed, fail or cancel.")
+    return request_json("POST", f"{root}/{identity}", {"action": action, "ttl_seconds": args.get("ttl_seconds",300), "evidence_node_id":args.get("evidence_node_id")})
+
+
+def export_project(args):
+    """A portable, checked active-project snapshot; never contains login data."""
+    import zipfile
+    destination = pathlib.Path(args["local_path"]).expanduser().absolute()
+    if destination.exists(): raise SafeToolError("destination_exists","Choose a new export path; existing files are preserved.")
+    project = resolve_project_id({})
+    root=f"/v1/projects/{project}"
+    deadline=time.monotonic()+300
+    def listing(path, view=None):
+        items=[];cursor=None
+        for _ in range(100):
+            if time.monotonic()>deadline: raise SafeToolError("export_timeout","Export deadline reached; no archive was published.")
+            page=request_json("GET",path+"?"+rest_query_string({"limit":100,"cursor":cursor,"view":view}))
+            items.extend(page["items"])
+            if len(items)>5000: raise SafeToolError("export_limit","This export exceeds 5000 records; use an operator database backup for this project.")
+            next_cursor=page.get("next_cursor")
+            if not next_cursor: return items
+            if next_cursor==cursor: raise SafeToolError("pagination_failed","Export pagination stopped advancing.")
+            cursor=next_cursor
+        raise SafeToolError("export_limit","Export page limit reached.")
+    nodes=listing(root+"/nodes","metadata")
+    files=listing(root+"/files")
+    identities={item["id"]:item.get("updated_at") for item in nodes}
+    file_ids={item["id"] for item in files}
+    if any(item.get("node_id") and item["node_id"] not in identities for item in files):
+        raise SafeToolError("export_attachment_missing","A file references an unavailable document. Restore that document or use a database backup before exporting.")
+    total=sum(item["size_bytes"] for item in files)
+    if total>512*1024*1024: raise SafeToolError("export_limit","File bytes exceed the 512 MiB export limit; use an operator database backup.")
+    temporary=None
+    try:
+        fd,temporary=tempfile.mkstemp(prefix=".napseer-export-",dir=destination.parent)
+        os.close(fd)
+        with zipfile.ZipFile(temporary,"w",compression=zipfile.ZIP_DEFLATED) as archive:
+            for item in nodes:
+                if time.monotonic()>deadline: raise SafeToolError("export_timeout","Export deadline reached; no archive was published.")
+                document=request_json("GET",root+"/nodes/"+str(uuid.UUID(item["id"]))+"?view=edit")
+                if document["updated_at"]!=identities[item["id"]]: raise SafeToolError("export_conflict","Documentation changed during export. Retry after current writes finish.")
+                archive.writestr(f"nodes/{item['id']}.json",json.dumps(document,ensure_ascii=False,indent=2))
+            for item in files:
+                if time.monotonic()>deadline: raise SafeToolError("export_timeout","Export deadline reached; no archive was published.")
+                identity=str(uuid.UUID(item["id"]))
+                body=request_json("GET",root+"/files/"+identity,_binary_response=True)
+                if len(body)!=item["size_bytes"] or hashlib.sha256(body).hexdigest()!=item["sha256"]: raise SafeToolError("file_integrity_failed","Export file integrity check failed; no archive was published.")
+                archive.writestr(f"files/{identity}",body)
+            # Refuse a mixed snapshot when records changed during pagination.
+            if identities!={item["id"]:item.get("updated_at") for item in listing(root+"/nodes","metadata")} or file_ids!={item["id"] for item in listing(root+"/files")}:
+                raise SafeToolError("export_conflict","Project changed during export. Retry after current writes finish.")
+            archive.writestr("manifest.json",json.dumps({"schema":"napseer.project-export.v1","project_id":project,"created_at":iso_now(),"scope":"active project nodes and files; cross-project links retained as references","nodes":nodes,"files":files},ensure_ascii=False,indent=2))
+        with open(temporary,"rb") as source: os.fsync(source.fileno())
+        os.link(temporary,destination)  # Atomic, and refuses an existing destination.
+    except OSError:
+        raise SafeToolError("export_destination_unavailable","Export could not be saved. Choose a new path in an existing writable directory.") from None
+    finally:
+        if temporary: pathlib.Path(temporary).unlink(missing_ok=True)
+    return {"status":"exported","project_id":project,"local_path":str(destination),"nodes":len(nodes),"files":len(files),"file_bytes":total}
+
+
+def file_tool(name, args):
+    import stat
+    project = resolve_project_id({})
+    root = f"/v1/projects/{project}/files"
+    if name == "nap_file_list":
+        return request_json("GET", root + "?" + rest_query_string({key:args.get(key) for key in ("node_id","cursor","limit")}))
+    if name == "nap_file_archive":
+        return request_json("DELETE", root + "/" + str(uuid.UUID(str(args["id"]))))
+    path = pathlib.Path(args["local_path"]).expanduser().absolute()
+    if name == "nap_file_upload":
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os,"O_NOFOLLOW",0) | getattr(os,"O_NONBLOCK",0))
+            with os.fdopen(fd,"rb") as source:
+                if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                    raise SafeToolError("invalid_file", "Choose a regular local file.")
+                body = source.read(8*1024*1024+1)
+        except OSError:
+            raise SafeToolError("file_unavailable", "The local file could not be read.") from None
+        if len(body)>8*1024*1024:
+            raise SafeToolError("file_too_large", "Files can be up to 8 MiB.")
+        digest=hashlib.sha256(body).hexdigest()
+        identity = str(uuid.UUID(str(args["id"]))) if args.get("id") else str(uuid.uuid5(uuid.UUID(project), f"{path.name}:{args.get('node_id','')}:{digest}"))
+        return request_json("POST",root+"?"+rest_query_string({"id":identity,"name":path.name,"node_id":args.get("node_id")}),extra_headers={"Content-Type":"application/octet-stream"},_raw_body=body)
+    identity = str(uuid.UUID(str(args["id"])))
+    found=request_json("GET",f"{root}/{identity}/metadata")
+    body=request_json("GET",f"{root}/{identity}",_binary_response=True)
+    if len(body)!=found["size_bytes"] or hashlib.sha256(body).hexdigest()!=found["sha256"]:
+        raise SafeToolError("file_integrity_failed","Downloaded file failed its size or SHA-256 check; no file was written.")
+    created=False
+    try:
+        with os.fdopen(os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600),"wb") as destination:
+            created=True
+            destination.write(body);destination.flush();os.fsync(destination.fileno())
+    except OSError:
+        if created: path.unlink(missing_ok=True)
+        raise SafeToolError("destination_unavailable","Choose a new file in an existing writable directory. Existing files were preserved.") from None
+    return {"id":identity,"local_path":str(path),"size_bytes":len(body),"sha256":found["sha256"]}
+
+
 def raw_tools():
     return [
+        *coordination_file_tools(),
         {
             "name": "nap_whoami",
             "description": "Show safe local gateway, vault, and project status. Does not reveal secrets.",
@@ -16056,6 +16218,7 @@ def tool_category(name):
 
 
 READ_ONLY_TOOLS = {
+    "nap_operation_list", "nap_file_list",
     "nap_whoami",
     "nap_gateway_status",
     "nap_chat_secret_status",
@@ -16107,6 +16270,7 @@ READ_ONLY_TOOLS = {
 }
 
 LOCAL_FILE_TOOLS = {
+    "nap_file_download",
     "nap_update_self",
     "nap_reindex_project",
     "nap_index_sync",
@@ -16275,6 +16439,13 @@ def contract_profile(args=None):
 
 
 CANONICAL_TOOL_NAMES = {
+    "nap_operation_list",
+    "nap_operation",
+    "nap_file_list",
+    "nap_file_upload",
+    "nap_file_download",
+    "nap_file_archive",
+
     # Contract and health.
     "nap_apropos",
     "nap_man",
@@ -16512,6 +16683,7 @@ TOOL_CATEGORIES.update(
         ],
         "project": ["nap_whoami", "nap_auth_refresh"],
         "memory": [
+            "nap_operation_list", "nap_operation", "nap_file_list", "nap_file_upload", "nap_file_download", "nap_file_archive",
             "nap_discover",
             "nap_context",
             "nap_node_by_path",
@@ -16574,6 +16746,13 @@ TOOL_CATEGORIES.update(
 )
 
 CORE_TOOL_NAMES = {
+    "nap_operation_list",
+    "nap_operation",
+    "nap_file_list",
+    "nap_file_upload",
+    "nap_file_download",
+    "nap_file_archive",
+
     "nap_apropos",
     "nap_man",
     "nap_doctor",
@@ -16673,13 +16852,6 @@ _base_contract_profile = contract_profile
 _base_tool_contract_metadata = tool_contract_metadata
 
 
-class SafeToolError(RuntimeError):
-    def __init__(self, code, message, *, status=None, service_code=None):
-        super().__init__(message)
-        self.code = str(code)
-        self.safe_message = str(message)
-        self.status = status
-        self.service_code = str(service_code or "")
 
 
 def safe_http_error(exc, *, operation="request", body_text=""):
@@ -16792,7 +16964,7 @@ WORKER_BINDING_AUTH_KEYS = {
 
 
 def replace_public_auth_state(updates, *, clear_keys=()):
-    with AUTH_STATE_LOCK:
+    with AUTH_STATE_LOCK, credential_store().transaction():
         current_public = load_public_auth_file()
         for key in clear_keys:
             current_public.pop(key, None)
@@ -16838,6 +17010,12 @@ def tool_auth_mode(name):
 
 def tool_contract_metadata(name):
     metadata = _base_tool_contract_metadata(name)
+    if name == "nap_operation":
+        metadata.update(lock_policy="atomic-execution-lease", idempotency="reconcile-same-run-id")
+    if name == "nap_file_upload":
+        metadata.update(lock_policy="immutable-file-id", idempotency="same-id-and-bytes")
+    if name == "nap_file_archive":
+        metadata.update(idempotency="safe")
     if name in {"nap_batch", "nap_plan_transition"}:
         metadata["dry_run_supported"] = True
     if name == "nap_batch":
@@ -17701,6 +17879,12 @@ def call_tool_impl(name, args):
             "invalid_view",
             "Full bodies are available only through nap_node_get after resolving a node identity.",
         )
+    if name == "nap_operation_list":
+        return request_json("GET", f"/v1/projects/{resolve_project_id({})}/operations?" + rest_query_string(args))
+    if name == "nap_operation":
+        return operation_tool(args)
+    if name in {"nap_file_list","nap_file_upload","nap_file_download","nap_file_archive"}:
+        return file_tool(name,args)
     if name == "nap_whoami":
         return gateway_status()
     if name == "nap_gateway_status":
@@ -18010,7 +18194,7 @@ def handle(message):
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": "napseer-local", "version": "0.1.6"},
-                "instructions": "Local authenticated MCP wrapper. It manages token and project_id from ./.napseer/auth.json; agents should not handle secrets or pass project ids for normal tools.",
+                "instructions": "Local authenticated MCP wrapper. It resolves user or project credentials and repository identity; agents should not handle secrets or pass project ids for normal tools.",
                 "napseer": {
                     "auth_path": str(AUTH_PATH),
                     "base_url": BASE_URL,
@@ -18163,6 +18347,20 @@ def cli_main(argv):
             "limit": int(cli_option(args, "--limit", default="200")),
         }), indent=2))
         return
+    if command == "export":
+        args=argv[2:]
+        validate_cli_options(args,value_options={"--path"},command_label="nap export")
+        path=cli_option(args,"--path")
+        if not path: raise SafeToolError("destination_required","Use nap export --path NEW_ARCHIVE.zip.")
+        print(json.dumps(export_project({"local_path":path}),indent=2)); return
+    if command == "files":
+        action = argv[2] if len(argv)>2 else "list"
+        args = argv[3:]
+        validate_cli_options(args, value_options={"--path","--id","--node-id","--cursor","--limit"}, command_label="nap files")
+        names={"list":"nap_file_list","upload":"nap_file_upload","download":"nap_file_download","archive":"nap_file_archive"}
+        if action not in names: raise SafeToolError("invalid_action","Use nap files list|upload|download|archive.")
+        payload={key:cli_option(args,flag) for key,flag in {"local_path":"--path","id":"--id","node_id":"--node-id","cursor":"--cursor","limit":"--limit"}.items() if cli_option(args,flag) is not None}
+        print(json.dumps(file_tool(names[action],payload),indent=2)); return
     if command == "configure":
         print(json.dumps(cli_configure_status(), indent=2))
         return
@@ -18195,18 +18393,27 @@ def cli_main(argv):
         if subcommand in {"help", "-h", "--help"} or cli_flag(args, "--help", "-h"):
             print("""Usage:
   nap auth status
-  nap auth login [--frontend-url URL] [--api-base-url URL] [--no-browser] [--timeout SECONDS]
+  nap auth login [--project] [--frontend-url URL] [--api-base-url URL] [--no-browser] [--timeout SECONDS]
   nap auth repair
+  nap auth logout [--project]
+  nap auth api-key --env VARIABLE_NAME
+  nap auth keys list|create|revoke
+  nap auth migrate                 Move legacy credentials to user data without broadening scope.
+  nap auth use-user                Explicitly use the general login in this repository.
 
 `login` signs in to the account only. It does not select a project.
 Use `nap project attach` for an existing project or `nap project create` for a new one.
 Refresh is automatic during authenticated calls; use `repair` only for recovery.
 `login-local` remains a hidden compatibility alias for `login`.""")
             return
+        if subcommand in {"use-user","migrate"}:
+            validate_cli_options(args, command_label=f"nap auth {subcommand}")
+            path = credential_store().use_user() if subcommand == "use-user" else credential_store().migrate()
+            print(json.dumps({"status":"configured","auth_path":str(path),"message":"Credential selection updated. Existing project identity is preserved."},indent=2)); return
         if subcommand in {"login", "login-local", "operator-login"}:
             validate_cli_options(
                 args,
-                flags={"--no-browser"},
+                flags={"--no-browser", "--project"},
                 value_options={
                     "--frontend-url",
                     "--api-base-url",
@@ -18218,12 +18425,23 @@ Refresh is automatic during authenticated calls; use `repair` only for recovery.
                 command_label="nap auth login",
             )
             print(json.dumps(operator_account_login({
+                "project": cli_flag(args, "--project"),
                 "frontend_url": cli_option(args, "--frontend-url", default=None),
                 "api_base_url": cli_option(args, "--api-base-url", "--base-url", default=None),
                 "open_browser": not cli_flag(args, "--no-browser"),
                 "timeout_seconds": int(cli_option(args, "--timeout", "--timeout-seconds", default="300")),
                 "port": cli_option(args, "--port", default=0),
             }), indent=2))
+            return
+        if subcommand == "api-key":
+            validate_cli_options(args, value_options={"--env"}, command_label="nap auth api-key")
+            print(json.dumps(configure_api_key({"env": cli_option(args, "--env")}), indent=2))
+            return
+        if subcommand == "keys":
+            print(json.dumps(cli_api_keys(args), indent=2))
+            return
+        if subcommand == "logout":
+            print(json.dumps(operator_logout({"project": cli_flag(args, "--project")}), indent=2))
             return
         if subcommand in {"refresh", "repair"}:
             print(json.dumps(renew_auth(), indent=2))
@@ -18241,6 +18459,7 @@ Refresh is automatic during authenticated calls; use `repair` only for recovery.
             return
         if subcommand == "attach":
             print(json.dumps(operator_project_attach({
+                "project_id": cli_option(argv[3:], "--project-id", default=None),
                 "frontend_url": cli_option(argv[3:], "--frontend-url", default=None),
                 "api_base_url": cli_option(argv[3:], "--api-base-url", "--base-url", default=None),
                 "open_browser": not cli_flag(argv[3:], "--no-browser"),

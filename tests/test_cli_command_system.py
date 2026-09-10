@@ -3,6 +3,7 @@ import hashlib
 import json
 import pathlib
 import time
+import sys
 import pytest
 
 
@@ -15,6 +16,8 @@ SCRIPT_PATH = (
 
 
 def load_installer():
+    if str(SCRIPT_PATH.parent) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_PATH.parent))
     spec = importlib.util.spec_from_file_location("nap_install_command_system_test", SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -33,7 +36,7 @@ def test_root_help_exposes_only_canonical_commands(capsys):
     output = capsys.readouterr().out
     visible = [name for name, metadata in module.COMMAND_METADATA.items() if metadata["visible"]]
     assert visible == [name for name, _summary in module.CANONICAL_COMMANDS]
-    assert len(visible) == 11
+    assert len(visible) == 13
     for name in visible:
         assert f"  {name}" in output
     for hidden in ("chat", "plan", "lineage", "agent", "feedback", "where", "install"):
@@ -436,7 +439,7 @@ def test_bundle_install_stages_validates_and_activates_atomically(tmp_path, monk
 
     result = module.install_assets()
 
-    assert result["cli_distribution"]["release_version"] == "0.2.2"
+    assert result["cli_distribution"]["release_version"] == module.CLI_RELEASE_VERSION
     assert (install_dir / "current").is_symlink()
     assert (install_dir / "current" / "bundle-manifest.json").is_file()
     assert (install_dir / "current" / "napseer_mcp_server.py").is_file()
@@ -493,10 +496,10 @@ def test_manifest_accepts_a_future_compatible_release():
     module = load_installer()
     manifest, _payloads = fake_bundle(module)
     manifest["release_version"] = "0.2.2"
-    manifest["contract"]["current"] = "2026-08-02"
+    manifest["contract"]["current"] = "2026-09-11"
     for item in manifest["items"]:
         item["version"] = "0.2.2"
-        item["contract_version"] = "2026-08-02"
+        item["contract_version"] = "2026-09-11"
 
     items = module.validated_manifest_items(manifest)
 
@@ -506,11 +509,11 @@ def test_manifest_accepts_a_future_compatible_release():
 def test_manifest_rejects_a_minimum_contract_newer_than_installer():
     module = load_installer()
     manifest, _payloads = fake_bundle(module)
-    manifest["contract"]["current"] = "2026-08-02"
-    manifest["contract"]["minimum_supported"] = "2026-08-02"
+    manifest["contract"]["current"] = "2026-09-11"
+    manifest["contract"]["minimum_supported"] = "2026-09-11"
     for item in manifest["items"]:
-        item["contract_version"] = "2026-08-02"
-        item["minimum_contract_version"] = "2026-08-02"
+        item["contract_version"] = "2026-09-11"
+        item["minimum_contract_version"] = "2026-09-11"
 
     try:
         module.validated_manifest_items(manifest)
@@ -518,6 +521,31 @@ def test_manifest_rejects_a_minimum_contract_newer_than_installer():
         assert "newer bootstrap installer" in str(exc)
     else:
         raise AssertionError("incompatible minimum contract must be rejected")
+
+
+def test_legacy_update_preserves_active_runtime_and_bootstrap_recovers(tmp_path, monkeypatch):
+    module = load_installer()
+    monkeypatch.setattr(module, "INSTALL_DIR", tmp_path / "install")
+    monkeypatch.setattr(module, "BIN_DIR", tmp_path / "bin")
+    manifest, payloads = fake_bundle(module)
+    previous = module.INSTALL_DIR / "releases" / "previous"
+    previous.mkdir(parents=True)
+    (previous / "nap_install.py").write_text("# existing release\n")
+    (module.INSTALL_DIR / "current").symlink_to(previous, target_is_directory=True)
+    credentials = module.INSTALL_DIR / "auth.json"
+    credentials.write_text('{"refresh_token":"synthetic-preserved"}')
+    monkeypatch.setattr(module, "bundle_manifest", lambda: manifest)
+    monkeypatch.setattr(module, "fetch_script", lambda name: payloads[name])
+    current_contract = module.CLI_DISTRIBUTION_CONTRACT_VERSION
+    monkeypatch.setattr(module, "CLI_DISTRIBUTION_CONTRACT_VERSION", "2026-08-01")
+    with pytest.raises(RuntimeError, match="newer bootstrap installer"):
+        module.main(["nap", "update"])
+    assert (module.INSTALL_DIR / "current").resolve() == previous
+    assert list((module.INSTALL_DIR / "releases").iterdir()) == [previous]
+    monkeypatch.setattr(module, "CLI_DISTRIBUTION_CONTRACT_VERSION", current_contract)
+    assert module.main(["nap_install.py", "mcp", "install"]) == 0
+    assert (module.INSTALL_DIR / "current" / "napseer_credentials.py").is_file()
+    assert credentials.read_text() == '{"refresh_token":"synthetic-preserved"}'
 
 
 def test_cli_log_compaction_preserves_live_writer_inode(tmp_path):

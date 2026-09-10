@@ -169,7 +169,8 @@ def test_attach_forwards_and_verifies_repository_project_hint():
         assert oauth_calls[0]["project_id_hint"] == PROJECT_ID
         assert result["project_id"] == PROJECT_ID
         assert result["project_locator"]["project_id"] == PROJECT_ID
-        assert saves[0]["project_id"] == PROJECT_ID
+        credentials = json.loads(pathlib.Path(result["auth_path"]).read_text())
+        assert credentials["project_id"] == PROJECT_ID
 
 
 if __name__ == "__main__":

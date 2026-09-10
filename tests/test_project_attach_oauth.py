@@ -2,6 +2,7 @@
 """Smoke-test existing-project OAuth attachment for folder bootstrap."""
 
 import importlib.util
+import json
 import pathlib
 import sys
 import tempfile
@@ -59,12 +60,12 @@ def run():
 
     result = mod.operator_project_attach({"open_browser": False})
 
+    saves.insert(0, json.loads(pathlib.Path(result["auth_path"]).read_text()))
     assert saves[0]["token"] == "oauth-token"
     assert saves[0]["refresh_token"] == "oauth-refresh-token"
     assert saves[0]["project_id"] == PROJECT_ID
     assert saves[0]["account_mode"] == "operator_project"
-    assert replacements[0] == mod.WORKER_BINDING_AUTH_KEYS
-    assert "project_id" not in replacements[0]
+    assert mod.WORKER_BINDING_AUTH_KEYS.isdisjoint(saves[0])
     assert "napseer.projects.read" in saves[0]["oauth_scope"]
     assert saves[1]["project_slug"] == "existing-project"
     assert result["project_id"] == PROJECT_ID
@@ -81,6 +82,7 @@ def run():
         "scope": args["scope"],
     }
     result = mod.operator_account_login({"open_browser": False})
+    saves.insert(0, json.loads(pathlib.Path(result["auth_path"]).read_text()))
     assert saves[0]["refresh_token"] == "account-refresh-token"
     assert saves[0]["account_mode"] == "operator_account"
     assert "project_id" not in saves[0]

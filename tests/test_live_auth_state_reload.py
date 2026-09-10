@@ -55,7 +55,7 @@ def run():
     mod.DEFAULT_PROJECT_ID = None
     assert mod.resolve_project_id({}) == "project-1"
 
-    current = {}
+    current = {"token": "configured-account", "account_mode": "operator_account"}
     mod.DEFAULT_PROJECT_ID = "stale-project"
     bootstrap_calls = []
 
@@ -75,7 +75,7 @@ def run():
         }
     ]
 
-    current = {}
+    current = {"token": "configured-account", "account_mode": "operator_account"}
     mod.DEFAULT_PROJECT_ID = None
 
     def limited_project(_args):

@@ -59,6 +59,7 @@ def test_account_login_requests_create_and_runtime_scopes():
 
     result = mod.operator_account_login({"open_browser": False})
 
+    saves.append(json.loads(pathlib.Path(result["auth_path"]).read_text()))
     requested = set(captured[0]["scope"].split())
     assert "napseer.projects.write" in requested
     assert set(mod.LOCAL_PROJECT_OAUTH_SCOPE.split()).issubset(requested)
@@ -84,7 +85,7 @@ def test_legacy_account_scope_fails_before_http_with_recovery():
     assert not requests
 
 
-def test_successful_create_transitions_local_state_to_project_mode():
+def test_successful_create_preserves_general_account_mode():
     mod = load_module()
     configure_account_state(mod, mod.OPERATOR_ACCOUNT_OAUTH_SCOPE)
     saves = []
@@ -102,7 +103,8 @@ def test_successful_create_transitions_local_state_to_project_mode():
     assert status == "created"
     assert project["id"] == PROJECT_ID
     assert saves[0]["project_id"] == PROJECT_ID
-    assert saves[0]["account_mode"] == "operator_project"
+    assert "account_mode" not in saves[0]
+    assert mod.AUTH["account_mode"] == "operator_account"
     assert locators == [project]
 
 
@@ -162,7 +164,7 @@ def test_anonymous_limits_are_actionable_without_exposing_response_details():
 if __name__ == "__main__":
     test_account_login_requests_create_and_runtime_scopes()
     test_legacy_account_scope_fails_before_http_with_recovery()
-    test_successful_create_transitions_local_state_to_project_mode()
+    test_successful_create_preserves_general_account_mode()
     test_server_scope_denial_is_actionable()
     test_anonymous_limits_are_actionable_without_exposing_response_details()
     print("ok: project create OAuth lifecycle passed")

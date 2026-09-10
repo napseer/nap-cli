@@ -25,9 +25,12 @@ Current state:
   `tools/list`, and authenticated read probe. They deliberately report an
   existing client connection as `not_observable`; a successful fresh probe
   does not claim that a previously opened Codex transport is connected.
-- Operator OAuth credentials remain in `.napseer/auth.json`. A repaired local
-  gateway uses a separate `.napseer/gateway-auth.json` worker identity, so
-  relay token renewal cannot rotate or overwrite the operator/MCP session.
+- `nap auth login` stores the shared account session in the user data folder
+  (`~/.local/share/napseer/auth.json` on Linux; platform user data directories
+  on macOS/Windows). `NAPSEER_USER_DATA_DIR` overrides that location.
+  `nap auth login --project` selects a local override. Legacy repository
+  credentials remain an explicit override until `nap auth migrate` moves them.
+  Gateway identities remain separate in `.napseer/gateway-auth.json`.
 - `.napseer/project.json` is the commit-safe project locator. It contains only
   the schema, API origin, project UUID, and slug; it never contains tokens,
   account or worker identity, encryption state, keys, passphrases, or claim
@@ -77,28 +80,36 @@ client reconnect after updating.
 The public operator surface is intentionally small:
 
 ```text
-nap init | status | doctor | auth | project | mcp | gateway | update | version | help
+nap init | status | doctor | auth | project | files | export | mcp | gateway | update | version | help
 ```
 
 Authentication has one recovery verb: `nap auth repair`. Normal refresh is
 automatic. `nap gateway repair` creates the separate worker identity once;
 `--replace` is required to replace an existing identity.
 
-Project-scoped MCP tools are zero-login by default. In a new workspace, the
-first such tool enrolls an anonymous worker and creates its first project
-automatically; `nap init` remains the explicit equivalent. Anonymous access
-and refresh-token or SSH-key recovery continue without operator
-authentication. Authentication through `nap project claim` is required only
-after the anonymous account reaches its service limit (currently one project
-or 100 stored nodes), or when its durable local enrollment identity is no
-longer recoverable.
+Agents start only after the user configures an account login or a delegated API
+key. With an account login, `nap init` creates a project owned by that account.
+A committed `.napseer/project.json` always selects the existing project; it
+never causes a replacement to be created. Concurrent refreshes share a bounded
+credential lock, while project overrides remain independent. Network failures
+preserve credentials and offer recovery through `nap auth repair`.
 
-A cloned repository that already commits `.napseer/project.json` is not a new
-workspace: `nap init` and project-scoped MCP tools fail closed instead of
-creating a duplicate anonymous project. Run `nap project attach`; the OAuth
-approval is constrained to the locator's project after normal server-side
-access validation. If that project is still anonymous, claim it from a machine
-that retains its enrollment identity, then attach from the new computer.
+`nap auth keys --help` describes scoped API key issuance;
+`nap auth api-key --env VARIABLE_NAME` installs a delegated key privately.
+Keys can expire or be revoked and cannot approve agent decisions. Use separate
+keys when agents need separate identities or permissions.
+
+Upgrading from 0.2.x to 0.3.0 requires the current bootstrap once because old
+installers have a fixed list of runtime files. `nap update` on those versions
+rejects the new bundle before changing the active installation. Run:
+
+```sh
+curl -fsSL https://api.napseer.com/install | python3 -
+```
+
+The bootstrap verifies every asset and switches the runtime atomically without
+changing credentials or project locators. Restart existing MCP client sessions
+after this upgrade; subsequent releases use `nap update` normally.
 
 In Bash, run commands as `nap update`, `nap auth login`, and so on. A leading
 `!` is shell history expansion: `!nap update` replays the most recent command
