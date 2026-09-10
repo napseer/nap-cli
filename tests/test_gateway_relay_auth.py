@@ -15,6 +15,8 @@ def load_module():
 
 def test_renew_auth_serializes_rotating_refresh_tokens():
     mod = load_module()
+    mod.TOKEN = "synthetic-configured-access"
+    mod.REFRESH_TOKEN = "synthetic-configured-refresh"
     active = 0
     maximum = 0
     guard = threading.Lock()

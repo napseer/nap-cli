@@ -4,6 +4,7 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def isolated_user_credentials(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("NAPSEER_USER_DATA_DIR", str(tmp_path / "user-data"))
-    for name in ("NAPSEER_API_KEY", "NAPSEER_TOKEN", "NAPSEER_REFRESH_TOKEN"):
+    for name in ("NAPSEER_API_KEY", "NAPSEER_TOKEN", "NAPSEER_REFRESH_TOKEN", "NAPSEER_AUTH_FILE", "NAPSEER_PROJECT_ROOT", "NAPSEER_PROJECT_ID", "NAPSEER_BASE_URL"):
         monkeypatch.delenv(name, raising=False)

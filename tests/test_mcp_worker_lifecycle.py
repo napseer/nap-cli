@@ -166,6 +166,7 @@ def test_mutating_tools_are_serialized_while_reads_can_overlap(monkeypatch):
 
 def test_concurrent_first_reads_share_one_project_bootstrap(tmp_path, monkeypatch):
     mod = load_module()
+    mod.TOKEN = "synthetic-configured-access"
     mod.AUTH_PATH = tmp_path / "missing-auth.json"
     mod.DEFAULT_PROJECT_ID = None
     monkeypatch.setattr(mod, "refresh_public_auth_state", lambda: None)
