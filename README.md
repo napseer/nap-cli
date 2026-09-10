@@ -26,7 +26,7 @@ Current state:
   existing client connection as `not_observable`; a successful fresh probe
   does not claim that a previously opened Codex transport is connected.
 - `nap auth login` stores the shared account session in the user data folder
-  (`~/.local/share/napseer/auth.json` on Linux; platform user data directories
+  (`~/.local/share/napseer/credentials/default.json` on Linux; platform user data directories
   on macOS/Windows). `NAPSEER_USER_DATA_DIR` overrides that location.
   `nap auth login --project` selects a local override. Legacy repository
   credentials remain an explicit override until `nap auth migrate` moves them.
