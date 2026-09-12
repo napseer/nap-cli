@@ -6880,130 +6880,138 @@ def compact_json_text(value):
     return json.dumps(value or [], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def index_node(node):
+def index_node(node, *, connection=None):
+    """Index one node, or join a caller-owned writer transaction during rebuild."""
     if not node or not node.get("id"):
         return
-    lock = index_file_lock()
-    try:
-        with index_connect() as conn:
-            tags = node.get("tags") or []
-            aliases = node.get("aliases") or []
-            links = node.get("links") or []
-            encrypted = node.get("encryption_state") == "encrypted"
-            backend_at_rest_decrypted = bool(node.get("at_rest_key_version_id")) and not node.get("encrypted_content_envelope")
-            standard_content_for_index = (not encrypted) or backend_at_rest_decrypted
-            metadata = (node.get("metadata") or {}) if standard_content_for_index and not node.get("encrypted_metadata_envelope") else {}
-            content_text = (node.get("content_text") or "") if standard_content_for_index else ""
-            title = (
-                node.get("title")
-                or metadata.get("title")
-                or node.get("name")
-                or pathlib.PurePosixPath(str(node.get("full_path") or "")).name
+    if connection is None:
+        lock = index_file_lock()
+        try:
+            conn = index_connect()
+            try:
+                with conn:
+                    return index_node(node, connection=conn)
+            finally:
+                conn.close()
+        finally:
+            release_index_file_lock(lock)
+    conn = connection
+    tags = node.get("tags") or []
+    aliases = node.get("aliases") or []
+    links = node.get("links") or []
+    encrypted = node.get("encryption_state") == "encrypted"
+    backend_at_rest_decrypted = bool(node.get("at_rest_key_version_id")) and not node.get("encrypted_content_envelope")
+    standard_content_for_index = (not encrypted) or backend_at_rest_decrypted
+    metadata = (node.get("metadata") or {}) if standard_content_for_index and not node.get("encrypted_metadata_envelope") else {}
+    content_text = (node.get("content_text") or "") if standard_content_for_index else ""
+    title = (
+        node.get("title")
+        or metadata.get("title")
+        or node.get("name")
+        or pathlib.PurePosixPath(str(node.get("full_path") or "")).name
+    )
+    status = node_status(node)
+    project_id = node.get("project_id") or DEFAULT_PROJECT_ID or ""
+    conn.execute(
+        """
+        INSERT INTO local_index_nodes (
+            node_id, project_id, full_path, name, folder_path, node_type,
+            tags_json, updated_at, indexed_at, title, status, archived, aliases_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(node_id) DO UPDATE SET
+            project_id = excluded.project_id,
+            full_path = excluded.full_path,
+            name = excluded.name,
+            folder_path = excluded.folder_path,
+            node_type = excluded.node_type,
+            tags_json = excluded.tags_json,
+            updated_at = excluded.updated_at,
+            indexed_at = excluded.indexed_at,
+            title = excluded.title,
+            status = excluded.status,
+            archived = excluded.archived,
+            aliases_json = excluded.aliases_json
+        """,
+        (
+            node["id"],
+            project_id,
+            node.get("full_path") or "",
+            node.get("name") or "",
+            node.get("folder_path"),
+            node.get("type") or "note",
+            compact_json_text(tags),
+            node.get("updated_at") or "",
+            iso_now(),
+            title,
+            status,
+            1 if node_archived(node) else 0,
+            compact_json_text(aliases),
+        ),
+    )
+    conn.execute(
+        "DELETE FROM local_index_edges WHERE project_id = ? AND source_node_id = ?",
+        (project_id, node["id"]),
+    )
+    conn.execute(
+        "DELETE FROM local_index_node_tags WHERE project_id = ? AND node_id = ?",
+        (project_id, node["id"]),
+    )
+    conn.executemany(
+        "INSERT OR IGNORE INTO local_index_node_tags (project_id, node_id, tag) VALUES (?, ?, ?)",
+        ((project_id, node["id"], str(tag)) for tag in tags if str(tag).strip()),
+    )
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        target_node_id = str(link.get("node_id") or "").strip() or None
+        target_path = str(link.get("path") or "").strip() or None
+        target_uri = str(link.get("uri") or "").strip() or None
+        target_ref = target_node_id or target_uri or target_path
+        if not target_ref:
+            continue
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO local_index_edges (
+                project_id, source_node_id, target_ref, target_node_id,
+                target_path, relation, updated_at, indexed_at
             )
-            status = node_status(node)
-            project_id = node.get("project_id") or DEFAULT_PROJECT_ID or ""
-            conn.execute(
-                """
-                INSERT INTO local_index_nodes (
-                    node_id, project_id, full_path, name, folder_path, node_type,
-                    tags_json, updated_at, indexed_at, title, status, archived, aliases_json
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(node_id) DO UPDATE SET
-                    project_id = excluded.project_id,
-                    full_path = excluded.full_path,
-                    name = excluded.name,
-                    folder_path = excluded.folder_path,
-                    node_type = excluded.node_type,
-                    tags_json = excluded.tags_json,
-                    updated_at = excluded.updated_at,
-                    indexed_at = excluded.indexed_at,
-                    title = excluded.title,
-                    status = excluded.status,
-                    archived = excluded.archived,
-                    aliases_json = excluded.aliases_json
-                """,
-                (
-                    node["id"],
-                    project_id,
-                    node.get("full_path") or "",
-                    node.get("name") or "",
-                    node.get("folder_path"),
-                    node.get("type") or "note",
-                    compact_json_text(tags),
-                    node.get("updated_at") or "",
-                    iso_now(),
-                    title,
-                    status,
-                    1 if node_archived(node) else 0,
-                    compact_json_text(aliases),
-                ),
-            )
-            conn.execute(
-                "DELETE FROM local_index_edges WHERE project_id = ? AND source_node_id = ?",
-                (project_id, node["id"]),
-            )
-            conn.execute(
-                "DELETE FROM local_index_node_tags WHERE project_id = ? AND node_id = ?",
-                (project_id, node["id"]),
-            )
-            conn.executemany(
-                "INSERT OR IGNORE INTO local_index_node_tags (project_id, node_id, tag) VALUES (?, ?, ?)",
-                ((project_id, node["id"], str(tag)) for tag in tags if str(tag).strip()),
-            )
-            for link in links:
-                if not isinstance(link, dict):
-                    continue
-                target_node_id = str(link.get("node_id") or "").strip() or None
-                target_path = str(link.get("path") or "").strip() or None
-                target_uri = str(link.get("uri") or "").strip() or None
-                target_ref = target_node_id or target_uri or target_path
-                if not target_ref:
-                    continue
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO local_index_edges (
-                        project_id, source_node_id, target_ref, target_node_id,
-                        target_path, relation, updated_at, indexed_at
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        project_id,
-                        node["id"],
-                        target_ref,
-                        target_node_id,
-                        target_path,
-                        str(link.get("relation") or "references"),
-                        node.get("updated_at") or "",
-                        iso_now(),
-                    ),
-                )
-            conn.execute("DELETE FROM local_index_fts WHERE node_id = ?", (node["id"],))
-            conn.execute(
-                """
-                INSERT INTO local_index_fts (
-                    node_id, project_id, full_path, name, folder_path, node_type,
-                    tags, aliases, links, metadata_text, content_text
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    node["id"],
-                    node.get("project_id") or DEFAULT_PROJECT_ID or "",
-                    node.get("full_path") or "",
-                    node.get("name") or "",
-                    node.get("folder_path") or "",
-                    node.get("type") or "note",
-                    " ".join(tags),
-                    " ".join(aliases),
-                    " ".join(flatten_index_values(links)),
-                    " ".join(flatten_index_values(metadata)),
-                    content_text,
-                ),
-            )
-    finally:
-        release_index_file_lock(lock)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project_id,
+                node["id"],
+                target_ref,
+                target_node_id,
+                target_path,
+                str(link.get("relation") or "references"),
+                node.get("updated_at") or "",
+                iso_now(),
+            ),
+        )
+    conn.execute("DELETE FROM local_index_fts WHERE node_id = ?", (node["id"],))
+    conn.execute(
+        """
+        INSERT INTO local_index_fts (
+            node_id, project_id, full_path, name, folder_path, node_type,
+            tags, aliases, links, metadata_text, content_text
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            node["id"],
+            node.get("project_id") or DEFAULT_PROJECT_ID or "",
+            node.get("full_path") or "",
+            node.get("name") or "",
+            node.get("folder_path") or "",
+            node.get("type") or "note",
+            " ".join(tags),
+            " ".join(aliases),
+            " ".join(flatten_index_values(links)),
+            " ".join(flatten_index_values(metadata)),
+            content_text,
+        ),
+    )
 
 
 def remove_indexed_node(node_id):
@@ -7582,33 +7590,77 @@ def search_local_index(args):
             }
 
 
+def validate_reindex_page(page, project_id, seen_cursors):
+    """Reject incomplete/malformed inventory before replacing a usable index."""
+    def invalid():
+        raise SafeToolError(
+            "invalid_index_response",
+            "Napseer returned an invalid index page. The previous index was preserved; "
+            "retry `nap reindex` when the service recovers.",
+        )
+
+    if not isinstance(page, dict) or not isinstance(page.get("items"), list):
+        invalid()
+    cursor = page.get("next_cursor")
+    if cursor is not None and (not isinstance(cursor, str) or not cursor.strip()):
+        invalid()
+    if cursor and cursor in seen_cursors:
+        invalid()
+    if page.get("has_more") is True and not cursor:
+        invalid()
+    for node in page["items"]:
+        if not isinstance(node, dict):
+            invalid()
+        if (not isinstance(node.get("id"), str) or not node["id"].strip()
+                or node.get("project_id") != project_id
+                or not isinstance(node.get("full_path"), str)
+                or not node["full_path"].startswith("/")
+                or parse_iso_datetime(node.get("updated_at")) is None):
+            invalid()
+    if cursor:
+        seen_cursors.add(cursor)
+    return filter_project_nodes(page["items"]), cursor
+
+
 def reindex_project(args):
     project_id = resolve_project_id(args)
     limit = max(1, min(int(args.get("limit", 200)), 200))
     nodes = []
     cursor = None
+    seen_cursors = set()
     while True:
+        raise_if_mcp_request_cancelled()
         query = {"limit": limit, "view": "full"}
         if cursor:
             query["cursor"] = cursor
         page = request_json("GET", f"/v1/projects/{project_id}/nodes?{rest_query_string(query)}")
-        nodes.extend(filter_project_nodes(page.get("items", [])))
-        cursor = page.get("next_cursor")
+        page_nodes, cursor = validate_reindex_page(page, project_id, seen_cursors)
+        nodes.extend(page_nodes)
         if not cursor:
             break
     lock = index_file_lock()
     try:
-        with index_connect() as conn:
-            set_local_graph_index_complete(project_id, False, conn)
-            conn.execute("DELETE FROM local_index_fts WHERE project_id = ?", (project_id,))
-            conn.execute("DELETE FROM local_index_edges WHERE project_id = ?", (project_id,))
-            conn.execute("DELETE FROM local_index_node_tags WHERE project_id = ?", (project_id,))
-            conn.execute("DELETE FROM local_index_nodes WHERE project_id = ?", (project_id,))
+        conn = index_connect()
+        try:
+            with conn:
+                # Readers retain the previous WAL snapshot until every node,
+                # edge, tag, FTS row and completeness flag commits together.
+                raise_if_mcp_request_cancelled()
+                conn.execute("BEGIN IMMEDIATE")
+                set_local_graph_index_complete(project_id, False, conn)
+                conn.execute("DELETE FROM local_index_fts WHERE project_id = ?", (project_id,))
+                conn.execute("DELETE FROM local_index_edges WHERE project_id = ?", (project_id,))
+                conn.execute("DELETE FROM local_index_node_tags WHERE project_id = ?", (project_id,))
+                conn.execute("DELETE FROM local_index_nodes WHERE project_id = ?", (project_id,))
+                for node in nodes:
+                    raise_if_mcp_request_cancelled()
+                    index_node(node, connection=conn)
+                raise_if_mcp_request_cancelled()
+                set_local_graph_index_complete(project_id, True, conn)
+        finally:
+            conn.close()
     finally:
         release_index_file_lock(lock)
-    for node in nodes:
-        index_node(node)
-    set_local_graph_index_complete(project_id, True)
     return {
         "project_id": project_id,
         "indexed": len(nodes),
